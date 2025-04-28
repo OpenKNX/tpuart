@@ -1,0 +1,12 @@
+{
+    "name": "TPUart",
+    "version": "0.0.1",
+    "description": "Common routines and helpers, used in OpenKNX projects",
+    "homepage": "https://openknx.de",
+    "authors": {
+        "name": "OpenKNX",
+        "email": "info@openknx.de",
+        "url": "https://openknx.de",
+        "maintainer": true
+    }
+}
