@@ -54,7 +54,7 @@ namespace TPUart
             int value = _interface->read();
             if (value == -1) continue; // Queu is empty
             if (value == 0) continue;  // TPUart send zeros at the beginning
-            Serial.printf("%02X", value);
+            // Serial.printf("%02X", value);
 
             // War direkt erfolgreich - Top
             if (value == U_RESET_IND) return true;
