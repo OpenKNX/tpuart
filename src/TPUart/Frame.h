@@ -18,7 +18,7 @@
 // Means that the frame is answered with L_DATA_CON if success the TP_FRAME_FLAG_ACK is also set
 #define TP_FRAME_FLAG_DATA_CON 0b01000000
 
-// Means that the frame should be filterd by the device
+// Means that the frame should be filtered by the device
 #define TP_FRAME_FLAG_FILTERED 0b00100000
 
 // // Means that the frame comes from the device itself
@@ -153,12 +153,12 @@ namespace TPUart
             return !(_data[0] & 0b100000);
         }
 
-        bool isFilterd()
+        bool isFiltered()
         {
             return _flags & TP_FRAME_FLAG_FILTERED;
         }
 
-        void setFilterd()
+        void setFiltered()
         {
             _flags |= TP_FRAME_FLAG_FILTERED;
         }
@@ -332,7 +332,7 @@ namespace TPUart
             result.push_back(isInvalid() ? 'I' : '_');     // Invalid
             result.push_back(isExtended() ? 'E' : '_');    // Extended
             result.push_back(isRepeated() ? 'R' : '_');    // Repeat
-            result.push_back(isFilterd() ? 'F' : '_');     // All ready received
+            result.push_back(isFiltered() ? 'F' : '_');     // All ready received
             result.push_back(isBusy() ? 'B' : '_');        // ACK + BUSY
             result.push_back(isNack() ? 'N' : '_');        // ACK + NACK
             result.push_back(isAck() ? 'A' : '_');         // ACK

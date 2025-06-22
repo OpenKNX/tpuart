@@ -132,7 +132,7 @@ namespace TPUart
             alreadFound = _repetitionFilter.check(frame);
             if (frame.isRepeated() && alreadFound)
             {
-                frame.setFilterd();
+                frame.setFiltered();
                 _statistics.incrementRxRepetitions();
             }
 
