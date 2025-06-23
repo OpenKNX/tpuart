@@ -53,7 +53,9 @@ namespace TPUart
         }
         _dll.rxUnlock();
 
+#ifdef TPUART_RX_TIMEOUT_DEBUG
         if (timeout) _dll.printError("TIMEOUT: %u %u", millis() - _lastReceivedTime, timeout);
+#endif
     }
 
     /*
