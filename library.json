@@ -1,6 +1,6 @@
 {
     "name": "TPUart",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "Datalink layer for TP-UART communication in KNX systems",
     "homepage": "https://openknx.de",
     "authors": [

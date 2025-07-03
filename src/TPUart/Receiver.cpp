@@ -29,6 +29,12 @@ namespace TPUart
         if (!_searchBuffer.timeout()) return;
         if (_searchBuffer.timeout() >= _awaitBytes) return;
 
+        if(_state == RX_FRAME_WAIT_ACKN)
+        {
+                _state = RX_FRAME_COMPLETE;
+                processCompleteFrame();
+                return;
+        }
         processSearchBufferInvalid(4);
     }
 
