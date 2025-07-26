@@ -53,7 +53,7 @@ namespace TPUart
             _data = (const char *)malloc(size);
             memcpy((char *)_data, data, size);
         }
-        Frame(const char *data, bool deleteData) : _data(data) , _deleteData(deleteData) {}
+        Frame(const char *data, bool deleteData) : _data(data), _deleteData(deleteData) {}
 
         ~Frame()
         {
@@ -128,7 +128,10 @@ namespace TPUart
             return _flags;
         }
 
-        char headerSize()
+        /*
+         * Include the all metadata at the beginning of the frame and the checksum at the end.
+         */
+        char metadataSize()
         {
             return isExtended() ? 9 : 8;
         }
@@ -163,9 +166,12 @@ namespace TPUart
             _flags |= TP_FRAME_FLAG_FILTERED;
         }
 
+        /*
+         * Returns the total size of the frame, including the metadata and apdu.
+         */
         unsigned short size()
         {
-            return headerSize() + payloadSize();
+            return metadataSize() + apduSize();
         }
 
         unsigned short source()
@@ -173,7 +179,7 @@ namespace TPUart
             return isExtended() ? (_data[2] << 8) + _data[3] : (_data[1] << 8) + _data[2];
         }
 
-        char payloadSize()
+        char apduSize()
         {
             return isExtended() ? _data[6] : _data[5] & 0b1111;
         }
@@ -332,7 +338,7 @@ namespace TPUart
             result.push_back(isInvalid() ? 'I' : '_');     // Invalid
             result.push_back(isExtended() ? 'E' : '_');    // Extended
             result.push_back(isRepeated() ? 'R' : '_');    // Repeat
-            result.push_back(isFiltered() ? 'F' : '_');     // All ready received
+            result.push_back(isFiltered() ? 'F' : '_');    // All ready received
             result.push_back(isBusy() ? 'B' : '_');        // ACK + BUSY
             result.push_back(isNack() ? 'N' : '_');        // ACK + NACK
             result.push_back(isAck() ? 'A' : '_');         // ACK
