@@ -50,7 +50,6 @@
 #define L_ACKN_NACK_MASK 0xC0
 #define L_DATA_CON 0x0B
 #define L_DATA_CON_MASK 0x7F
-#define SUCCESS 0x80
 
 // control services, device specific
 #define U_RESET_IND 0x03
