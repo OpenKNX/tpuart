@@ -62,7 +62,11 @@ namespace TPUart
                 .parity = UART_PARITY_EVEN,
                 .stop_bits = UART_STOP_BITS_1,
                 .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+#if defined(CONFIG_IDF_TARGET_ESP32C6) || defined(CONFIG_IDF_TARGET_ESP32H2)
+                .source_clk = UART_SCLK_DEFAULT,
+#else
                 .source_clk = UART_SCLK_APB,
+#endif
             };
 
             // UART-Konfiguration anwenden
@@ -73,7 +77,9 @@ namespace TPUart
             _running = true;
 
             if (_uart == UART_NUM_1) xTaskCreate(&ESP32::runTask, "uart_task1", TPUART_ESP32_TASK_STACK_SIZE, this, configMAX_PRIORITIES / 5 * 4, &_taskHandle);
+          #if SOC_UART_HP_NUM > 2 // UART2 exists
             if (_uart == UART_NUM_2) xTaskCreate(&ESP32::runTask, "uart_task2", TPUART_ESP32_TASK_STACK_SIZE, this, configMAX_PRIORITIES / 5 * 4, &_taskHandle);
+          #endif
         }
 
         void ESP32::end()
