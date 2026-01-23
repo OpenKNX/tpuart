@@ -62,11 +62,7 @@ namespace TPUart
                 .parity = UART_PARITY_EVEN,
                 .stop_bits = UART_STOP_BITS_1,
                 .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-#if defined(CONFIG_IDF_TARGET_ESP32C6) || defined(CONFIG_IDF_TARGET_ESP32H2)
-                .source_clk = UART_SCLK_DEFAULT,
-#else
-                .source_clk = UART_SCLK_APB,
-#endif
+                .source_clk = UART_SCLK_DEFAULT
             };
 
             // UART-Konfiguration anwenden
