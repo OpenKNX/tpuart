@@ -46,6 +46,11 @@ namespace TPUart
         unsigned long _busyMode = 0;
         unsigned long _requestStateTimer = 0;
         unsigned long _lastTryInitialize = 0;
+#ifdef TPUART_BCU_AUTORECONNECT
+        unsigned long _lastReconnectAttempt = 0; // BCU auto-reconnect: throttle the U_RESET_REQ poke
+        unsigned long _lastValidRx = 0;          // BCU auto-reconnect: last valid-protocol RX (liveness)
+        unsigned long _reconnectBackoff = 1000;  // BCU auto-reconnect: poke interval, 1s -> 30s while NCN absent
+#endif
         unsigned long _lastDiscardedMessage = 0;
         unsigned long _lastDiscardedBytes = 0;
         volatile size_t _rxFrameBufferEntries = 0;
@@ -114,6 +119,9 @@ namespace TPUart
         void begin(BcuType bcuType, Interface::Abstract *Interface);
         void end(bool deleteUart = true);
         void reset();
+#ifdef TPUART_BCU_DEBUG
+        void forceDisconnect(); // test hook (console "bcu dis"): force the terminal BCU_DISCONNECTED state
+#endif
         void process();
 
         void registerMessage(std::function<void(const char *, bool)> callback);

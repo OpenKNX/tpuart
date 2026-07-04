@@ -106,8 +106,109 @@ namespace TPUart
         if (_state != TX_AWAIT) return;
         // _last could be updated in parallel, so it must be temporarily stored
         const uint32_t time = _time;
+
+#ifdef TPUART_BCU_BACKSTOP
+        // Backstop for the RESIDUAL transient lost-CON: our own frame's bus-echo was NEVER
+        // matched (isTransmitted not set), so the isTransmitted-gated CON-rescue (Receiver.cpp EDIT3)
+        // cannot fire; the receiver is healthy and idle while the TX is stranded in TX_AWAIT -> only the
+        // 60s watchdog below recovers it. Cut that stall WITHOUT racing a late-but-valid CON: re-check
+        // under rxLock and require a genuinely quiet interface (a pending byte -- possibly the real CON --
+        // must be read via the normal path first), mirroring EDIT3. Throttle via a cooldown so a
+        // PERSISTENT fault degrades to the 60s cap instead of an indefinite fast-reset cadence.
+#ifndef TX_BACKSTOP_MS
+#define TX_BACKSTOP_MS 8000 // > worst-case legit CON latency (263B ext frame, 9600 baud, NCN 3+3 repeats)
+#endif
+#ifndef TX_BACKSTOP_COOLDOWN_MS
+#define TX_BACKSTOP_COOLDOWN_MS 30000 // after a fast reset, only the 60s cap may fire for this long
+#endif
+#ifndef TPUART_RX_TIMEOUT
+#define TPUART_RX_TIMEOUT 5 // mirror of Receiver.cpp (RX inter-byte / idle-bus quiet window, ms)
+#endif
+#ifndef TX_BACKSTOP_INVALID_MS
+#define TX_BACKSTOP_INVALID_MS 12000 // latched-_invalid on a quiet bus: longer window, give _invalid a chance to clear first
+#endif
+        if (millis() - time >= TX_BACKSTOP_MS &&
+            (_lastBackstopReset == 0 || millis() - _lastBackstopReset >= TX_BACKSTOP_COOLDOWN_MS))
+        {
+            bool doReset = false;
+            _dll.rxLock(true);
+            // Re-test everything under the lock: still stranded, receiver healthy-idle, bus quiet, and no
+            // byte pending (a pending byte may be the real CON -> let the normal path finalize first).
+            if (_state == TX_AWAIT &&
+                _dll._receiver._state == RX_IDLE &&
+                !_dll._receiver._invalid &&
+                !_dll._interface->available() &&
+                millis() - _dll._receiver._lastReceivedTime >= TPUART_RX_TIMEOUT)
+            {
+                doReset = true;
+            }
+            _dll.rxUnlock(); // MUST unlock before reset(): reset() re-takes rxLock (non-recursive on RP2040)
+
+            // Re-read _state after unlock -- if a late CON finalized us in the gap, skip the needless reset.
+            if (doReset && _state == TX_AWAIT)
+            {
+                _lastBackstopReset = millis();
+                _dll._statistics.incrementBcuResets();
+                _dll.printError("Watchdog: confirm lost (rx idle), fast reset.");
+                _dll.reset();
+                return;
+            }
+        }
+
+        // Latched-_invalid sub-case: after a bus-error storm the
+        // receiver latches _invalid; on a QUIET bus its clear-condition never triggers, so _invalid stays
+        // set -> the branch above (gated !_invalid) is blocked, the isTransmitted CON-rescue can't fire
+        // and even the 1Hz keep-alive probe is suppressed while _invalid. Only the 60s
+        // watchdog recovers. A latched _invalid that won't drain on a quiet bus IS the proof of a dead
+        // transmit -> force a real reset after a longer window (gives _invalid a chance to clear first).
+        // Separate `if` (not else-if) so it is evaluated even when the branch above ran-but-didn't-reset;
+        // the gates are mutually exclusive (_invalid vs !_invalid) so the two can never double-fire.
+        if (millis() - time >= TX_BACKSTOP_INVALID_MS &&
+            (_lastBackstopReset == 0 || millis() - _lastBackstopReset >= TX_BACKSTOP_COOLDOWN_MS))
+        {
+            bool doReset = false;
+            _dll.rxLock(true);
+            // Re-test under the lock: still stranded, receiver latched _invalid, bus genuinely quiet
+            // (a pending byte could still clear _invalid or be a late CON -> let the normal path run first).
+            if (_state == TX_AWAIT &&
+                _dll._receiver._invalid &&
+                !_dll._interface->available() &&
+                millis() - _dll._receiver._lastReceivedTime >= TPUART_RX_TIMEOUT)
+            {
+                doReset = true;
+            }
+            _dll.rxUnlock(); // MUST unlock before reset(): reset() re-takes rxLock (non-recursive on RP2040)
+
+            // Re-read _state after unlock -- if a late CON finalized us in the gap, skip the needless reset.
+            if (doReset && _state == TX_AWAIT)
+            {
+                _lastBackstopReset = millis();
+                _dll._statistics.incrementBcuResets();
+                _dll.printError("Watchdog: stuck _invalid (quiet bus), fast reset.");
+                _dll.reset();
+                return;
+            }
+        }
+#endif
+
         if (millis() - time < 60000) return;
 
+#ifdef TPUART_BCU_DEBUG
+        // Diagnostic dump at the moment the watchdog gives up: which lost-CON case stranded the TX?
+        //   rxState 5 (RX_FRAME_WAIT_ACKN) && rxTx=1 -> our echo WAS matched, the isTransmitted rescue
+        //                                               should have fired (=> bug in the rescue), while
+        //   rxTx=0 / rxState!=5            -> the echo was never matched (no signal the rescue can use).
+        // RxState: 0=IDLE 1=FRAME 2=DEST 3=SIZE 4=COMPLETE 5=WAIT_ACKN.
+        _dll.printError("WD reset: rxState=%u rxTx=%u rxInval=%u await=%u pos=%u sinceByte=%lu sinceDisc=%lu",
+                        (unsigned)_dll._receiver._state,
+                        (unsigned)_dll._receiver._searchBuffer.frame().isTransmitted(),
+                        (unsigned)_dll._receiver._invalid,
+                        (unsigned)_dll._receiver._awaitBytes,
+                        (unsigned)_dll._receiver._searchBuffer.position(),
+                        (unsigned long)(millis() - _dll._receiver._lastReceivedTime),
+                        (unsigned long)(millis() - _dll._receiver._lastDiscarded));
+#endif
+        _dll._statistics.incrementBcuResets();
         _dll.printError("Watchdog: Transmitter did not get confirm.");
         _dll.reset();
     }

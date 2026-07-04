@@ -15,6 +15,38 @@ namespace TPUart
     void Receiver::process()
     {
         processTimeout();
+
+        // Loop-driven recovery for the lost-CON-then-quiet-bus case. The byte-driven rescues in
+        // processCompleteFrame / processSearchBufferInvalid only fire when a UART byte arrives (they
+        // hang off pushSearchBuffer). But if our own TX echo is parked in RX_FRAME_WAIT_ACKN, its
+        // trailing L_DATA_CON is lost, and the bus then goes quiet (idle bus, or the terminal frame
+        // of a forwarding burst), no further byte arrives to pump the parser and only the 60s watchdog
+        // would act -> "Reset BCU". So on the loop tick -- where the watchdog also lives -- force the
+        // SAME completion the burst case uses, but ONLY for our own proven echo (structural gate).
+        if (_state == RX_FRAME_WAIT_ACKN
+            && millis() - _lastReceivedTime >= TPUART_RX_TIMEOUT
+            && _searchBuffer.frame().isTransmitted()
+            && _dll.getTransmitter().awaitResponse())
+        {
+            _dll.rxLock(true); // process() runs without rxLock; the processSearchBuffer* family needs it
+            // Re-check under the lock; require a genuinely idle interface (a pending byte -- possibly
+            // the real CON -- must be read first via the normal byte-driven path).
+            if (_state == RX_FRAME_WAIT_ACKN
+                && _searchBuffer.frame().isTransmitted()
+                && _dll.getTransmitter().awaitResponse()
+                && !_dll._interface->available()
+                && millis() - _lastReceivedTime >= TPUART_RX_TIMEOUT)
+            {
+#ifdef TPUART_BCU_DEBUG
+                _dll.printError("CONr: idleBus");
+#endif
+                // Marker at frameSize (< _awaitBytes == frameSize+1) routes processSearchBufferTimeout()
+                // into the RX_FRAME_WAIT_ACKN forced completion, which carries the finalize() below.
+                if (!_searchBuffer.timeout()) _searchBuffer.timeout(_searchBuffer.position());
+                processSearchBufferTimeout();
+            }
+            _dll.rxUnlock();
+        }
     }
 
     /*
@@ -132,6 +164,23 @@ namespace TPUart
     {
         if (_state == RX_FRAME_COMPLETE || _state == RX_FRAME_WAIT_ACKN)
         {
+            // ESP32 read-time-vs-arrival-time misparse can lose the trailing L_DATA_CON of our OWN
+            // transmitted frame's bus-echo (here: a timeout-forced completion from processSearchBuffer-
+            // Timeout, or an unrecognized acknowledge byte in processSearchBufferAcknowledge), stranding
+            // the Transmitter in TX_AWAIT until the 60s watchdog ("Reset BCU"). The echo was already
+            // matched on control+dest+source (processSearchBufferFrame -> setTransmitted), so the frame
+            // physically went out -> release the Transmitter now. Structural gate (isTransmitted, not a
+            // byte value) -> a foreign 0x0B/0x8B byte cannot fake a confirm. finalize() self-gates on
+            // TX_AWAIT, so this is an idempotent no-op on the normal CON path (already finalized at line 118).
+            // NOTE: no printError here -- this runs in the high-prio UART task (deep in the recursive
+            // parse path); logging from there overflowed the task stack. The rescue is silent; its
+            // effect is the absence of "Reset BCU". (EDIT 3 in process() logs from the main loop.)
+            if (_searchBuffer.frame().isTransmitted() && _dll.getTransmitter().awaitResponse())
+            {
+                _dll._statistics.incrementBcuConRescues(); // only genuine rescues (awaitResponse still set)
+                _dll.getTransmitter().finalize();
+            }
+
             unsigned short size = _searchBuffer.frame().size();
             if (!_dll.isMonitoring() && _dll._modeExtendedCRC) size += 2;
             if (acknowledge) size++; // Es hängt noch ein ACKN oder DATA_CON dran
@@ -169,6 +218,24 @@ namespace TPUart
 
         if (!sufficientlyBytes()) return;
 
+#ifdef TPUART_BCU_AUTORECONNECT
+        // Load-bearing for auto-reconnect: honour a reset indication UNCONDITIONALLY, before
+        // the _invalid sweep below. Otherwise a desynced/dribbling NCN keeps _invalid latched and the
+        // chip's U_RESET_IND (the only path back to BCU_CONNECTED) is discarded forever -> the BCU never
+        // reconnects. U_RESET_IND is a single unambiguous control byte, so bypassing the invalid-gate
+        // for it is safe and guarantees the U_RESET_REQ -> U_RESET_IND handshake always completes.
+        if (_searchBuffer.get(0) == U_RESET_IND)
+        {
+            _dll.receivedReset(); // sets _uReset + clears _invalid + BCU_CONNECTED
+            _invalid = false;
+            _searchBuffer.move(1);
+            _awaitBytes = 1;
+            _state = RX_IDLE;
+            processSearchBuffer(); // continue with any trailing bytes
+            return;
+        }
+#endif
+
         processSearchBufferAcknowledge();
         if (_searchBuffer.empty()) return;
 
@@ -186,6 +253,17 @@ namespace TPUart
 
     void Receiver::processSearchBufferInvalid(int x)
     {
+        // Same own-echo CON rescue for the discard-sweep exits (CRC-invalid echo at line ~298,
+        // non-WAIT_ACKN timeout at line ~38, _invalid burst at line ~179): isTransmitted() is still
+        // valid here because resetFlags() runs at the end of this function, so release the Transmitter
+        // before its trailing CON is swept into _discardedBytes. Structural gate -> nothing can be faked.
+        // NOTE: no printError here either -- UART-task context, see processCompleteFrame above.
+        if (_searchBuffer.frame().isTransmitted() && _dll.getTransmitter().awaitResponse())
+        {
+            _dll._statistics.incrementBcuConRescues(); // only genuine rescues (awaitResponse still set)
+            _dll.getTransmitter().finalize();
+        }
+
         while (_searchBuffer.position())
         {
             char value = _searchBuffer.get(0);

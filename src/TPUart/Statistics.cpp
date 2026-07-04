@@ -26,6 +26,8 @@ namespace TPUart
         _txOverflowFrameBuffer = 0;
         _rxControlBytes = 0;
         _rxRepetitions = 0;
+        // NOTE: _bcuResets/_bcuDisconnects/_bcuConRescues are intentionally NOT reset here — they must
+        // survive a BCU reset() to stay a meaningful lifetime score (see Statistics.h). Cleared on reboot.
     }
 
     void Statistics::incrementRxRepetitions(int increment /* = 1 */)
@@ -62,6 +64,48 @@ namespace TPUart
     {
         _txFrames += increment;
     }
+
+#ifdef TPUART_BCU_HEALTH
+    void Statistics::incrementBcuResets(int increment /* = 1 */)
+    {
+        _bcuResets += increment;
+    }
+
+    void Statistics::incrementBcuDisconnects(int increment /* = 1 */)
+    {
+        _bcuDisconnects += increment;
+    }
+
+    void Statistics::incrementBcuConRescues(int increment /* = 1 */)
+    {
+        _bcuConRescues += increment;
+    }
+
+    void Statistics::incrementBcuTempWarnings(int increment /* = 1 */)
+    {
+        _bcuTempWarnings += increment;
+    }
+
+    void Statistics::incrementBcuSlaveCollisions(int increment /* = 1 */)
+    {
+        _bcuSlaveCollisions += increment;
+    }
+
+    void Statistics::incrementBcuReceiveErrors(int increment /* = 1 */)
+    {
+        _bcuReceiveErrors += increment;
+    }
+
+    void Statistics::incrementBcuTransmitErrors(int increment /* = 1 */)
+    {
+        _bcuTransmitErrors += increment;
+    }
+
+    void Statistics::incrementBcuProtocolErrors(int increment /* = 1 */)
+    {
+        _bcuProtocolErrors += increment;
+    }
+#endif
 
     void Statistics::incrementRxFrames(int increment /* = 1 */)
     {
@@ -172,6 +216,48 @@ namespace TPUart
     {
         return _rxUartOverflow;
     }
+
+#ifdef TPUART_BCU_HEALTH
+    unsigned int Statistics::getBcuResets()
+    {
+        return _bcuResets;
+    }
+
+    unsigned int Statistics::getBcuDisconnects()
+    {
+        return _bcuDisconnects;
+    }
+
+    unsigned int Statistics::getBcuConRescues()
+    {
+        return _bcuConRescues;
+    }
+
+    unsigned int Statistics::getBcuTempWarnings()
+    {
+        return _bcuTempWarnings;
+    }
+
+    unsigned int Statistics::getBcuSlaveCollisions()
+    {
+        return _bcuSlaveCollisions;
+    }
+
+    unsigned int Statistics::getBcuReceiveErrors()
+    {
+        return _bcuReceiveErrors;
+    }
+
+    unsigned int Statistics::getBcuTransmitErrors()
+    {
+        return _bcuTransmitErrors;
+    }
+
+    unsigned int Statistics::getBcuProtocolErrors()
+    {
+        return _bcuProtocolErrors;
+    }
+#endif
 
     unsigned int Statistics::getBusLoad()
     {

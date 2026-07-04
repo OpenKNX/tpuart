@@ -14,8 +14,13 @@ namespace TPUart
         size_t _transmitPos;
         volatile unsigned long _time;
         unsigned long _maxQueueSize;
-        TxState _state;
+        volatile TxState _state; // H1: written by the UART task (finalize), read by the main loop -> volatile (matches Receiver::_state)
         Frame *_frame = nullptr;
+#ifdef TPUART_BCU_BACKSTOP
+        // Timestamp of the last backstop fast-reset; throttles repeated fast-resets so a PERSISTENT
+        // echo-loss fault degrades to the 60s cap instead of an indefinite fast-reset cadence.
+        uint32_t _lastBackstopReset = 0;
+#endif
 
       public:
         std::queue<Frame *> _queue;

@@ -85,8 +85,32 @@ namespace TPUart
         _modeExtendedCRC = false;
         _lastDiscardedBytes = 0;
         _receiver._invalid = false;
+        // Re-arm RX liveness on EVERY reset (all build flavors), so a reset on an already-quiet bus does
+        // not make the very next process() count a spurious CONNECTED->DISCONNECTED.
+        _receiver._lastReceivedTime = millis();
+#ifdef TPUART_BCU_AUTORECONNECT
+        // Seed the valid-protocol-rx liveness + reconnect throttle (auto-reconnect only).
+        _lastValidRx = millis();
+        _lastReconnectAttempt = millis();
+        _reconnectBackoff = 1000;
+#endif
         rxUnlock();
     }
+
+#ifdef TPUART_BCU_DEBUG
+    void DataLinkLayer::forceDisconnect()
+    {
+        // Test hook (console: "bcu dis"): reproduce the terminal "BCU disconnected" on demand.
+        // Latch _invalid (blocks the keep-alive probe and -- unless U_RESET_IND is parsed unconditionally -- would swallow the
+        // U_RESET_IND reply) and drop to DISCONNECTED. On stock fw this stays stuck on a quiet bus
+        // (only "bcu rst" heals); with TPUART_BCU_AUTORECONNECT the poke recovers it automatically.
+        printMessage("BCU force-disconnect (test)");
+        rxLock(true);
+        _receiver._invalid = true;
+        setBCUState(BCU_DISCONNECTED);
+        rxUnlock();
+    }
+#endif
 
     const char *DataLinkLayer::getBcuStateInfo()
     {
@@ -144,6 +168,9 @@ namespace TPUart
 
     void DataLinkLayer::pushRxFrameBuffer(Frame &frame)
     {
+#ifdef TPUART_BCU_AUTORECONNECT
+        _lastValidRx = millis(); // a parsed frame -> bus/chip alive -> liveness for auto-reconnect
+#endif
         const unsigned short frameSize = frame.size();
         const unsigned short bufferSize = frameSize + 3;
         if (_rxFrameBuffer.available() <= bufferSize)
@@ -273,7 +300,32 @@ namespace TPUart
 
         if (_bcuState == BCU_UNINITIALIZED) return;
 
+#ifdef TPUART_BCU_AUTORECONNECT
+        if (_bcuState == BCU_DISCONNECTED && millis() - _lastReconnectAttempt >= _reconnectBackoff)
+        {
+            // Active reconnect: the NCN went mute or desynced. Clean the parser (Receiver::reset clears
+            // _invalid so a U_RESET_IND reply can be parsed), flush, and poke with U_RESET_REQ -- all
+            // under rxLock, with NO UART driver teardown (no use-after-free). We do NOT declare CONNECTED
+            // on a raw byte: a wedged chip dribbling noise must not look alive. The only transition back
+            // to CONNECTED is receivedReset() on a genuine U_RESET_IND, parsed unconditionally even while
+            // _invalid (see the unconditional U_RESET_IND handling in Receiver::processSearchBuffer).
+            _lastReconnectAttempt = millis();
+            printMessage("BCU reconnect: U_RESET_REQ");
+            rxLock(true);
+            _receiver.reset();
+            _interface->flush();
+            _interface->write(U_RESET_REQ);
+            rxUnlock();
+            // Back off 1s -> 30s while the NCN stays absent: keeps fast recovery for a transient desync
+            // (seconds), but degrades to gentle 30s polling -- no per-second log spam / U_RESET_REQ flood
+            // -- if the chip/bus is genuinely gone. Still recovers <=30s after it returns. Reset to 1s on
+            // a real reconnect (receivedReset) and in reset().
+            _reconnectBackoff *= 2;
+            if (_reconnectBackoff > 30000) _reconnectBackoff = 30000;
+        }
+#else
         if (_bcuState == BCU_DISCONNECTED && _interface->available()) setBCUState(BCU_CONNECTED);
+#endif
 
         exitBusyModeTimer();
         processRequestState();
@@ -294,12 +346,25 @@ namespace TPUart
         {
             processTransmitByte();
 #ifdef ARDUINO_ARCH_ESP32
+#ifdef TPUART_TX_FAST
+            taskYIELD(); // bytes go to the non-blocking 1024B HW TX FIFO; the vTaskDelay(1)/byte below was
+                         // pure scheduler tax (~1ms/byte) -- the 9600-baud TP wire serializes them anyway.
+#else
             vTaskDelay(1);
 #endif
-            if (millis() - start > 20) break;
+#endif
+            if (millis() - start > 20) break; // unchanged fairness/watchdog bound
         }
 
         processRxFrameBuffer();
+
+#ifdef TPUART_TX_FAST
+        // The CON for the just-sent frame may have been parsed in this same process() pass; if TX is now
+        // idle, pop+arm the NEXT queued frame NOW instead of stalling a full ~16ms main-loop period.
+        // Still STRICTLY one-in-flight: processQueue() returns unless _state==TX_IDLE -- no pipelining
+        // past an unconfirmed CON, watchdog + lost-CON rescues untouched.
+        _transmitter.processQueue();
+#endif
 
         // Show state changes and errors
         showOverflowError();
@@ -309,9 +374,20 @@ namespace TPUart
 
         // check nothing received
         const unsigned long last = _receiver._lastReceivedTime;
+#ifdef TPUART_BCU_AUTORECONNECT
+        const unsigned long lastValid = _lastValidRx;
+#endif
         asm volatile("" ::: "memory"); // ensures that the last value is not updated again by the parallel task or interrupt after the query of millis()
         const unsigned long current = millis();
+#ifdef TPUART_BCU_AUTORECONNECT
+        // Disconnect only when BOTH are stale: no byte at all for 5s (bus physically dead) AND no valid
+        // protocol RX for 30s (chip not really answering our 1Hz state probe). A busy-but-healthy burst
+        // with a transient _invalid keeps the 5s timer fresh, so it cannot cause a spurious mid-burst
+        // disconnect + parser flush.
+        if (_bcuState == BCU_CONNECTED && current - last > 5000UL && current - lastValid > 30000UL)
+#else
         if (_bcuState == BCU_CONNECTED && current - last > 5000UL)
+#endif
         {
             // printMessage("Time: %li - %li = %li", current, _receiver._lastReceivedTime, current - last);
             setBCUState(BCU_DISCONNECTED);
@@ -638,11 +714,11 @@ namespace TPUart
         if (!_uState) return;
 
         std::string errorMessage = "TP Error:";
-        if (_uState & SLAVE_COLLISION) errorMessage += " SC";
-        if (_uState & RECEIVE_ERROR) errorMessage += " RE";
-        if (_uState & TRANSMIT_ERROR) errorMessage += " TE";
-        if (_uState & PROTOCOL_ERROR) errorMessage += " PE";
-        if (_uState & TEMPERATURE_WARNING) errorMessage += " TW";
+        if (_uState & SLAVE_COLLISION) { errorMessage += " Slave-Collision"; _statistics.incrementBcuSlaveCollisions(); }
+        if (_uState & RECEIVE_ERROR) { errorMessage += " Receive-Error"; _statistics.incrementBcuReceiveErrors(); }
+        if (_uState & TRANSMIT_ERROR) { errorMessage += " Transmit-Error"; _statistics.incrementBcuTransmitErrors(); }
+        if (_uState & PROTOCOL_ERROR) { errorMessage += " Protocol-Error"; _statistics.incrementBcuProtocolErrors(); }
+        if (_uState & TEMPERATURE_WARNING) { errorMessage += " Temperature-Warning"; _statistics.incrementBcuTempWarnings(); }
         printError(errorMessage.c_str());
         _uState = 0;
     }
@@ -710,6 +786,7 @@ namespace TPUart
         }
         else if (state == BCU_DISCONNECTED)
         {
+            _statistics.incrementBcuDisconnects(); // genuine transition only (guarded above)
             printMessage("BCU disconnected");
         }
         else if (state == BCU_BUSMONITOR)
@@ -750,6 +827,9 @@ namespace TPUart
 
     void DataLinkLayer::receivedState(char state)
     {
+#ifdef TPUART_BCU_AUTORECONNECT
+        _lastValidRx = millis(); // valid protocol RX (1Hz state-probe reply) -> liveness for auto-reconnect
+#endif
         if (state == U_STATE_IND) return;
 
         // printMessage("U_STATE_IND %02X", state);
@@ -759,14 +839,22 @@ namespace TPUart
     void DataLinkLayer::receivedReset()
     {
         // printMessage("U_RESET_IND");
+#ifdef TPUART_BCU_AUTORECONNECT
+        _lastValidRx = millis();
+        _reconnectBackoff = 1000; // a real reconnect succeeded -> reset the poke backoff to fast
+#endif
         _uReset = true;
         _modeExtendedCRC = false;
         _modeAutoAcknowlage = false;
+        _receiver._invalid = false; // reset indication -> the stream restarts in sync, so clear the desync flag (belt-and-suspenders; the parser also clears it on the U_RESET_IND)
         setBCUState(BCU_CONNECTED);
     }
 
     void DataLinkLayer::receivedConfiguration(char config)
     {
+#ifdef TPUART_BCU_AUTORECONNECT
+        _lastValidRx = millis();
+#endif
         // printMessage("U_CONFIGURE_IND %02X", value);
         _modeAutoAcknowlage = config & AUTO_ACKNOWLEDGE;
         _modeExtendedCRC = config & CRC_CCITT;
