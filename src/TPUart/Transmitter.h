@@ -1,6 +1,7 @@
 #pragma once
 #include "TPUart/Frame.h"
 #include "TPUart/Types.h"
+#include <cstdint>
 #include <queue>
 
 namespace TPUart
