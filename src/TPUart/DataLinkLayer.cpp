@@ -127,6 +127,11 @@ namespace TPUart
         }
     }
 
+    int DataLinkLayer::getBaudrate()
+    {
+        return _baudrate;
+    }
+
     void DataLinkLayer::processRxFrameBuffer()
     {
         if (!_rxFrameBufferEntries) return;
@@ -714,11 +719,31 @@ namespace TPUart
         if (!_uState) return;
 
         std::string errorMessage = "TP Error:";
-        if (_uState & SLAVE_COLLISION) { errorMessage += " Slave-Collision"; _statistics.incrementBcuSlaveCollisions(); }
-        if (_uState & RECEIVE_ERROR) { errorMessage += " Receive-Error"; _statistics.incrementBcuReceiveErrors(); }
-        if (_uState & TRANSMIT_ERROR) { errorMessage += " Transmit-Error"; _statistics.incrementBcuTransmitErrors(); }
-        if (_uState & PROTOCOL_ERROR) { errorMessage += " Protocol-Error"; _statistics.incrementBcuProtocolErrors(); }
-        if (_uState & TEMPERATURE_WARNING) { errorMessage += " Temperature-Warning"; _statistics.incrementBcuTempWarnings(); }
+        if (_uState & SLAVE_COLLISION)
+        {
+            errorMessage += " Slave-Collision";
+            _statistics.incrementBcuSlaveCollisions();
+        }
+        if (_uState & RECEIVE_ERROR)
+        {
+            errorMessage += " Receive-Error";
+            _statistics.incrementBcuReceiveErrors();
+        }
+        if (_uState & TRANSMIT_ERROR)
+        {
+            errorMessage += " Transmit-Error";
+            _statistics.incrementBcuTransmitErrors();
+        }
+        if (_uState & PROTOCOL_ERROR)
+        {
+            errorMessage += " Protocol-Error";
+            _statistics.incrementBcuProtocolErrors();
+        }
+        if (_uState & TEMPERATURE_WARNING)
+        {
+            errorMessage += " Temperature-Warning";
+            _statistics.incrementBcuTempWarnings();
+        }
         printError(errorMessage.c_str());
         _uState = 0;
     }
@@ -780,7 +805,10 @@ namespace TPUart
             if (baudrate == 0)
                 printMessage("BCU connected");
             else
+            {
+                _baudrate = baudrate;
                 printMessage("BCU connected (Baudrate: %d)", baudrate);
+            }
 
             _receiver._lastReceivedTime = millis();
         }

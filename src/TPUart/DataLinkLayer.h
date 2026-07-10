@@ -56,15 +56,15 @@ namespace TPUart
         volatile size_t _rxFrameBufferEntries = 0;
         volatile BcuType _bcuType;
         volatile BcuState _bcuState = BCU_UNINITIALIZED;
+        volatile int _baudrate = 0; // last negotiated BCU baudrate (19200/38400), stored on connect
 
         // Overflow
         volatile bool _rxSearchBufferOverflow = false;
         volatile bool _rxFrameBufferOverflow = false;
         volatile bool _rxInterfaceOverflow = false;
         volatile unsigned long _rxShowOverflowTime = 0;
-        
+
         Interface::Abstract *_interface = nullptr;
-        
 
 #if defined(ARDUINO_ARCH_RP2040)
         mutex_t _rxLock;
@@ -151,6 +151,7 @@ namespace TPUart
         bool startMonitoring();
         BcuState getBcuState();
         const char *getBcuStateInfo();
+        int getBaudrate();
         bool isMonitoring() const;
         bool isConnected() const;
 
