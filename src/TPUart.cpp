@@ -21,6 +21,10 @@
 #pragma message(">>>  TPUart: TX FAST = ON  <<<")
 #endif
 
+#ifdef TPUART_TX_STICKY_OFFSET
+    #pragma message(">>>  TPUart: TX STICKY OFFSET = ON  <<<")
+#endif
+
 // Fast-reset backstop for the residual transient lost-CON: cuts the 60s TX-stall to ~few s
 // when the receiver is healthy-idle but the TX is stranded in TX_AWAIT. Default off = stock 60s cap.
 #ifdef TPUART_BCU_BACKSTOP

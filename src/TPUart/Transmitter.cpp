@@ -21,6 +21,9 @@ namespace TPUart
         _cachedAcknowledge = 0;
         _state = TX_IDLE;
         _transmitPos = 0;
+#ifdef TPUART_TX_STICKY_OFFSET
+        _lastOffset = 0; // the chip resets its own offset on U_L_DataStart.req (DS p.49)
+#endif
         _time = 0;
         _maxQueueSize = MAX_QUEUE_SIZE;
     }
@@ -76,6 +79,11 @@ namespace TPUart
             delete _frame;
             _frame = nullptr;
             _transmitPos = 0;
+#ifdef TPUART_TX_STICKY_OFFSET
+            _lastOffset = 0; // paired with _transmitPos: the chip resets its own offset when it sees
+                             // the U_L_DataStart.req of the next frame (DS p.49), so the mirror must
+                             // start at 0 too -- otherwise a stale value would mis-index frame 2.
+#endif
         }
 
         _frame = _queue.front();
@@ -243,7 +251,19 @@ namespace TPUart
         const unsigned char offset = (_transmitPos >> 6);
         const unsigned char position = (_transmitPos & 0x3F);
 
+#ifdef TPUART_TX_STICKY_OFFSET
+        // Offset is sticky: the NCN5130 keeps it until changed (DS p.42) -> resend only on change (~195 of
+        // 725 UART bytes/263-octet frame, +14% @pkg253; paid in full, store-and-forward p.49). Ruled out
+        // on-device: the mid-frame 0x80 (U_L_DataStart.req at each 64-B block start) does NOT reset the
+        // offset -- p.49 means a NEW frame only. Detail: README [TPUART_TX_STICKY_OFFSET].
+        if (offset != _lastOffset)
+        {
+            _dll._interface->write(U_L_DATA_OFFSET_REQ | offset);
+            _lastOffset = offset;
+        }
+#else
         if (offset) _dll._interface->write(U_L_DATA_OFFSET_REQ | offset);
+#endif
 
         if (last) // Last byte (Checksum) - the transmit
         {
@@ -332,6 +352,11 @@ namespace TPUart
             delete _frame;
             _frame = nullptr;
             _transmitPos = 0;
+#ifdef TPUART_TX_STICKY_OFFSET
+            _lastOffset = 0; // paired with _transmitPos: the chip resets its own offset when it sees
+                             // the U_L_DataStart.req of the next frame (DS p.49), so the mirror must
+                             // start at 0 too -- otherwise a stale value would mis-index frame 2.
+#endif
         }
 
         _state = TX_IDLE;

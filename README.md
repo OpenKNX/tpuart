@@ -295,6 +295,19 @@ Each flag is **OFF by default**; enabling it changes only the marked spot. Build
    byte-pump delay    : stock vTaskDelay(1)/byte  ->  fast taskYIELD  (bytes -> HW TX FIFO)
    next frame         : stock next loop pass      ->  fast same pass after CON (step 11) still strictly one-in-flight (no pipelining past an unconfirmed CON)
 
+[TPUART_TX_STICKY_OFFSET]  all platforms; only affects frames > 64 octets
+   U_L_DataOffset     : stock before EVERY byte with offset != 0  ->  sticky: only when the offset changes
+   why                : the NCN5130 "stores [the offset] internally until a new offset is provided with another call" (DS p.42),
+                        so the stock resend is redundant: 199 offset bytes instead of 4 on a 263 octet frame = 195 of 725 UART bytes.
+                        It costs full time because the chip starts the bus transmission only once the whole frame has arrived
+                        (DS p.49) -- UART time ADDS to bus time, it does not hide behind it.
+   measured           : RP2350 -> real target, pkg 253: 285 -> 326 B/s (+14%). pkg 64 (only 7 bytes saved): +3%.
+                        The gain scales with frame length, which is what the mechanism predicts.
+   <= 64 octets       : byte-identical to stock (offset is 0, both branches emit nothing) -- group telegrams are untouched
+   ruled out          : at position 0 of each 64 byte block the command byte is 0x80 = U_L_DataStart.req, which DS p.49 says
+                        resets the offset. It does not apply mid-frame. Verified on the device across all four boundaries
+                        (pkg 50/56/57/119/120/121/184/185/248/249/253, each straddling one) -- expected CRC, 0 retries.
+
 [TPUART_BCU_AUTORECONNECT]
    reconnect          : stock passive (waits for a byte a mute NCN never sends -> terminal) ->  active U_RESET_REQ poke, backoff 1s..30s
    reset reply        : U_RESET_IND parsed UNCONDITIONALLY, even while _invalid (the only path back to CONNECTED on a desynced NCN)
@@ -445,6 +458,7 @@ FAST    [TPUART_BCU_BACKSTOP]
   ----------------------------  --------  -------  -----------------------------------------------------------------------------
   TPUART_RX_DRAIN_FAST          off       ESP32    drain whole RX ring/wakeup; ring 1024; threshold 1; removes ~1000 B/s ceiling
   TPUART_TX_FAST                off       ESP32    taskYIELD pump + arm next frame same pass
+  TPUART_TX_STICKY_OFFSET       off       all      send U_L_DataOffset only when it changes (frames > 64 octets); +14% at 263 octets
   TPUART_BCU_AUTORECONNECT      off       all      active U_RESET_REQ reconnect + reset-parse
   TPUART_BCU_BACKSTOP           off       all      fast reset before the 60 s cap (guarded)
   TPUART_BCU_HEALTH             off       all      BCU lifetime health counters + their BCU<Health> / <NCN-Err> line in the `bcu` report. Off = counters are no-op stubs (0 footprint), report omits them.
