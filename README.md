@@ -462,6 +462,7 @@ FAST    [TPUART_BCU_BACKSTOP]
   TPUART_BCU_AUTORECONNECT      off       all      active U_RESET_REQ reconnect + reset-parse
   TPUART_BCU_BACKSTOP           off       all      fast reset before the 60 s cap (guarded)
   TPUART_BCU_HEALTH             off       all      BCU lifetime health counters + their BCU<Health> / <NCN-Err> line in the `bcu` report. Off = counters are no-op stubs (0 footprint), report omits them.
+  TPUART_NCN_TW_AUTORESET       off       all      NCN thermal-warning auto-heal (L2): when TW persists, issue ONE guarded U_RESET (like `bcu rst`) to clear a latched TW, then back off if it returns (genuinely hot). NOTE: L1 edge-logging of TW is ALWAYS on regardless of this flag -- the old 1/s "TP Error: Temperature-Warning" flood becomes one line on set, an optional heartbeat, one on clear.
 
   tunables (#ifndef, have a default):
   TPUART_ESP32_TASK_STACK_SIZE  4096      ESP32    RX task stack (raised from 2048)
@@ -469,6 +470,10 @@ FAST    [TPUART_BCU_BACKSTOP]
   TX_BACKSTOP_MS                8000 ms   backstop fast-reset trigger delay
   TX_BACKSTOP_COOLDOWN_MS       30000 ms  backstop after a fast reset only the 60 s cap fires
   TX_BACKSTOP_INVALID_MS        12000 ms  backstop latched-_invalid reset window
+  TPUART_TW_HEARTBEAT_MS        60000 ms  TW: min spacing of the "still set" heartbeat while it holds
+  TPUART_TW_AUTORESET_AFTER_MS  45000 ms  TW auto-heal: let TW persist this long before the U_RESET
+  TPUART_TW_AUTORESET_COOLDOWN_MS 300000  TW auto-heal: min spacing between two auto-resets (cross-episode backoff)
+  TPUART_TW_RELAPSE_MS          8000 ms   TW still set this long after the reset => genuinely-hot verdict
 
   stock switches / tunables:
   TPUART_REPETITION_SIMPLE           off      rep-filter store: 1 entry/source map (stock: bounded LRU list+map, MAX_SIZE 50)

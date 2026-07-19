@@ -2,6 +2,20 @@
 #include "TPUart/DataLinkLayer.h"
 #include <stdarg.h>
 
+// NCN thermal-warning (TW) handling tunables. Overridable via build flags (central TPUART flag config).
+#ifndef TPUART_TW_HEARTBEAT_MS
+#define TPUART_TW_HEARTBEAT_MS 60000 // while TW stays set: at most one "still set" line this often
+#endif
+#ifndef TPUART_TW_AUTORESET_AFTER_MS
+#define TPUART_TW_AUTORESET_AFTER_MS 45000 // TPUART_NCN_TW_AUTORESET: let TW persist this long before the heal reset
+#endif
+#ifndef TPUART_TW_AUTORESET_COOLDOWN_MS
+#define TPUART_TW_AUTORESET_COOLDOWN_MS 300000 // minimum spacing between two auto-resets (cross-episode backoff)
+#endif
+#ifndef TPUART_TW_RELAPSE_MS
+#define TPUART_TW_RELAPSE_MS 8000 // TW still set this long after the reset => genuinely hot, not a latch
+#endif
+
 namespace TPUart
 {
     SystemState &DataLinkLayer::getSystemState()
@@ -376,6 +390,7 @@ namespace TPUart
         showStateError();
         showDiscardedError();
         showSystemState();
+        showThermalWarning();
 
         // check nothing received
         const unsigned long last = _receiver._lastReceivedTime;
@@ -739,14 +754,102 @@ namespace TPUart
             errorMessage += " Protocol-Error";
             _statistics.incrementBcuProtocolErrors();
         }
-        if (_uState & TEMPERATURE_WARNING)
-        {
-            errorMessage += " Temperature-Warning";
-            _statistics.incrementBcuTempWarnings();
-        }
+        // TEMPERATURE_WARNING is a persistent condition handled in showThermalWarning() (edge-logged) and
+        // masked out of _uState in receivedState(), so it never reaches this per-event transient-error path.
         printError(errorMessage.c_str());
         _uState = 0;
     }
+
+    /*
+     * NCN thermal-warning (TW). The 1Hz state poll re-reads the NCN's TW bit, so a raw log floods one line
+     * per second for the whole hot/latched episode. Track it as a condition and edge-log it: once on the
+     * rising edge, an optional heartbeat while it holds, once when it clears. Runs in main-loop context
+     * (safe to log / reset); receivedState() only captures the raw bit.
+     */
+    void DataLinkLayer::showThermalWarning()
+    {
+        // On a dead/reconnecting bus there are no fresh samples -- drop the condition silently (the
+        // disconnect is reported elsewhere) so a stale bit cannot drive heartbeats or an auto-reset.
+        if (_bcuState != BCU_CONNECTED)
+        {
+            _twActive = false;
+            _twSampled = false;
+            _twRaw = false; // clear the raw bit too, else a reconnect re-logs a stale rising edge
+            return;
+        }
+
+        const unsigned long now = millis();
+        const bool tw = _twRaw;
+
+        if (_twSampled)
+        {
+            _twSampled = false;
+            if (tw) _statistics.incrementBcuTempWarnings(); // per-poll health metric (unchanged)
+        }
+
+        if (tw && !_twActive)
+        {
+            _twActive = true;
+            _twSince = now;
+            _twLastBeat = now;
+#ifdef TPUART_NCN_TW_AUTORESET
+            _twAutoResetDone = false;
+            _twHotLogged = false;
+#endif
+            printError("NCN thermal warning (TW) set");
+        }
+        else if (!tw && _twActive)
+        {
+            _twActive = false;
+            const unsigned long secs = (now - _twSince) / 1000;
+#ifdef TPUART_NCN_TW_AUTORESET
+            if (_twAutoResetDone)
+                printMessage("NCN thermal warning cleared by auto-reset (was latched, %lus)", secs);
+            else
+#endif
+                printMessage("NCN thermal warning cleared (%lus)", secs);
+        }
+        else if (tw && _twActive)
+        {
+            if (now - _twLastBeat >= TPUART_TW_HEARTBEAT_MS)
+            {
+                _twLastBeat = now;
+                printMessage("NCN thermal warning still set (%lus)", (now - _twSince) / 1000);
+            }
+#ifdef TPUART_NCN_TW_AUTORESET
+            twAutoResetCheck(now);
+#endif
+        }
+    }
+
+#ifdef TPUART_NCN_TW_AUTORESET
+    /*
+     * L2: if TW persists, issue ONE U_RESET (the same clean protocol reset as "bcu rst") to clear a
+     * possibly-latched TW. Exactly one per episode plus a long cross-episode cooldown, so a genuinely-hot
+     * chip cannot cause a reset loop: if TW returns after the reset it is real heat -> we log that verdict
+     * and stop resetting until it clears and re-triggers (subject to the cooldown).
+     */
+    void DataLinkLayer::twAutoResetCheck(unsigned long now)
+    {
+        if (_twAutoResetDone)
+        {
+            // Already reset this episode: TW still set well after it => the chip is genuinely hot.
+            if (!_twHotLogged && (now - _twLastAutoReset) >= TPUART_TW_RELAPSE_MS)
+            {
+                _twHotLogged = true;
+                printError("NCN TW persists through U_RESET -> genuinely hot (reduce TX load / cool down)");
+            }
+            return;
+        }
+        if ((now - _twSince) < TPUART_TW_AUTORESET_AFTER_MS) return;                                    // let it persist first
+        if (_twLastAutoReset && (now - _twLastAutoReset) < TPUART_TW_AUTORESET_COOLDOWN_MS) return;     // cross-episode backoff
+
+        _twAutoResetDone = true;
+        _twLastAutoReset = now;
+        printMessage("NCN TW persists %lus -> U_RESET_REQ (auto-heal latch)", (now - _twSince) / 1000);
+        reset(); // U_RESET_REQ + re-arm, identical to a manual "bcu rst"
+    }
+#endif
 
     /*
      * Show the number of Discard bytes.
@@ -858,10 +961,16 @@ namespace TPUart
 #ifdef TPUART_BCU_AUTORECONNECT
         _lastValidRx = millis(); // valid protocol RX (1Hz state-probe reply) -> liveness for auto-reconnect
 #endif
+        // TW is a persistent condition, not a per-event error. Capture the raw bit here (this can run in
+        // RX-callback context) BEFORE the clean-state early-return, so the falling edge is seen too, and
+        // let process()->showThermalWarning() edge-log it in main-loop context.
+        _twRaw = (state & TEMPERATURE_WARNING) != 0;
+        _twSampled = true;
+
         if (state == U_STATE_IND) return;
 
         // printMessage("U_STATE_IND %02X", state);
-        _uState |= state ^ U_STATE_MASK;
+        _uState |= (state ^ U_STATE_MASK) & ~TEMPERATURE_WARNING; // TW handled above; keep only transient errors
     }
 
     void DataLinkLayer::receivedReset()

@@ -64,6 +64,19 @@ namespace TPUart
         volatile bool _rxInterfaceOverflow = false;
         volatile unsigned long _rxShowOverflowTime = 0;
 
+        // NCN thermal-warning (TW): receivedState() (RX-callback context) only captures the raw bit;
+        // process()->showThermalWarning() edge-logs it (L1) and optionally auto-heals a latch (L2).
+        volatile bool _twRaw = false;     // latest TW bit from the 1Hz state poll
+        volatile bool _twSampled = false; // a fresh poll sample is pending (drives the per-poll counter)
+        bool _twActive = false;           // debounced: TW condition currently active
+        unsigned long _twSince = 0;       // rising-edge time of the current TW episode
+        unsigned long _twLastBeat = 0;    // last "still set" heartbeat while TW holds
+#ifdef TPUART_NCN_TW_AUTORESET
+        bool _twAutoResetDone = false;      // one auto-heal U_RESET per episode
+        bool _twHotLogged = false;          // logged the "persists through reset -> genuinely hot" verdict
+        unsigned long _twLastAutoReset = 0; // cross-episode auto-reset cooldown anchor
+#endif
+
         Interface::Abstract *_interface = nullptr;
 
 #if defined(ARDUINO_ARCH_RP2040)
@@ -100,6 +113,10 @@ namespace TPUart
         void showStateError();
         void showDiscardedError();
         void showSystemState();
+        void showThermalWarning();
+#ifdef TPUART_NCN_TW_AUTORESET
+        void twAutoResetCheck(unsigned long now);
+#endif
         void processRequestState();
 
         void tryInitialize();
