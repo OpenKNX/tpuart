@@ -10,6 +10,10 @@ constexpr uint32_t TPUART_RP2040_TRANSFER_COUNT = UINT32_MAX >> 1; // aus irgend
 // constexpr unsigned int TPUART_RP2040_TRANSFER_COUNT = 5000;
 // constexpr unsigned int TPUART_RP2040_TRANSFER_COUNT = 256;
 constexpr unsigned long TPUART_RP2040_BUFFER_EXP = 8; // 2**BufferExp
+// NOTE: the fast-transfer >4KB corruption is caused by a 256 B RX-ring overflowing during the
+// noInterrupts() window of a mid-stream LittleFS flash erase (chunks silently dropped, NCN auto-ACK
+// hides it). The fix is EXP=11 (2048 B). Reverted to 8 here while isolating an unrelated intermittent
+// KNXnet/IP routing issue -- re-apply EXP=11 to fix the fast-transfer corruption once the net is clean.
 constexpr unsigned long TPUART_RP2040_BUFFER_SIZE = (1u << TPUART_RP2040_BUFFER_EXP);
 
 namespace TPUart
