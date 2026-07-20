@@ -729,35 +729,52 @@ namespace TPUart
     /*
      * Show the current state of the TPUart.
      */
+#ifndef TPUART_STATE_ERR_THROTTLE_MS
+#define TPUART_STATE_ERR_THROTTLE_MS 10000 // min ms between repeated "TP Error" lines of the SAME error set
+#endif
+
     void DataLinkLayer::showStateError()
     {
         if (!_uState) return;
 
+        // Snapshot + clear first (minimise the race with receivedState in RX context), then COUNT every
+        // event so the health counters / `bcu` report stay exact regardless of the log throttling below.
+        const char errors = _uState;
+        _uState = 0;
+        if (errors & SLAVE_COLLISION) _statistics.incrementBcuSlaveCollisions();
+        if (errors & RECEIVE_ERROR) _statistics.incrementBcuReceiveErrors();
+        if (errors & TRANSMIT_ERROR) _statistics.incrementBcuTransmitErrors();
+        if (errors & PROTOCOL_ERROR) _statistics.incrementBcuProtocolErrors();
+
+        // RATE-LIMIT the log. Probing a non-existent individual address (an ETS-style `ftc scan` over empty
+        // PAs) gets no L2-ACK, which the NCN surfaces as a U_State Protocol-Error on every un-acked TX -- so
+        // the scan floods one line per probe. That is the EXPECTED, benign outcome of probing addresses that
+        // do not exist. Collapse a repeated IDENTICAL error set to one line per window + a suppressed-count,
+        // mirroring showThermalWarning(). A NEW error set logs at once, so a real RE/TE/SC is never hidden.
+        const unsigned long now = millis();
+        if (errors == _stateErrLast && (now - _stateErrLogged) < TPUART_STATE_ERR_THROTTLE_MS)
+        {
+            _stateErrSuppressed++;
+            return;
+        }
+
         std::string errorMessage = "TP Error:";
-        if (_uState & SLAVE_COLLISION)
+        if (errors & SLAVE_COLLISION) errorMessage += " Slave-Collision";
+        if (errors & RECEIVE_ERROR) errorMessage += " Receive-Error";
+        if (errors & TRANSMIT_ERROR) errorMessage += " Transmit-Error";
+        if (errors & PROTOCOL_ERROR) errorMessage += " Protocol-Error";
+        if (_stateErrSuppressed)
         {
-            errorMessage += " Slave-Collision";
-            _statistics.incrementBcuSlaveCollisions();
-        }
-        if (_uState & RECEIVE_ERROR)
-        {
-            errorMessage += " Receive-Error";
-            _statistics.incrementBcuReceiveErrors();
-        }
-        if (_uState & TRANSMIT_ERROR)
-        {
-            errorMessage += " Transmit-Error";
-            _statistics.incrementBcuTransmitErrors();
-        }
-        if (_uState & PROTOCOL_ERROR)
-        {
-            errorMessage += " Protocol-Error";
-            _statistics.incrementBcuProtocolErrors();
+            char tail[24];
+            snprintf(tail, sizeof(tail), " (+%u more)", _stateErrSuppressed);
+            errorMessage += tail;
         }
         // TEMPERATURE_WARNING is a persistent condition handled in showThermalWarning() (edge-logged) and
         // masked out of _uState in receivedState(), so it never reaches this per-event transient-error path.
         printError(errorMessage.c_str());
-        _uState = 0;
+        _stateErrLast = errors;
+        _stateErrLogged = now;
+        _stateErrSuppressed = 0;
     }
 
     /*

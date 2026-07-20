@@ -64,6 +64,13 @@ namespace TPUart
         volatile bool _rxInterfaceOverflow = false;
         volatile unsigned long _rxShowOverflowTime = 0;
 
+        // Transient U_State errors (SC/RE/TE/PE): every event is COUNTED (see showStateError), but the LOG
+        // is rate-limited. Probing a non-existent individual address (`ftc scan` over empty PAs) gets no
+        // L2-ACK -> the NCN reports a Protocol-Error on every un-acked TX -> one line per probe otherwise.
+        char _stateErrLast = 0;               // last-logged error-bit set (a NEW set logs immediately)
+        unsigned long _stateErrLogged = 0;    // millis() of the last printed "TP Error" line
+        unsigned int _stateErrSuppressed = 0; // events collapsed since that line
+
         // NCN thermal-warning (TW): receivedState() (RX-callback context) only captures the raw bit;
         // process()->showThermalWarning() edge-logs it (L1) and optionally auto-heals a latch (L2).
         volatile bool _twRaw = false;     // latest TW bit from the 1Hz state poll
