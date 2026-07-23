@@ -88,6 +88,18 @@
 #define U_INT_REG_RD_REQ_ACR0 0x39
 #define U_INT_REG_RD_REQ_ACR1 0x3A
 #define U_INT_REG_RD_REQ_ASR0 0x3B
+// Revision ID register (0x05): opcode 0x38|0x05. Present on NCN5121/NCN5130 only (NCN5120 has no 0x05).
+// NCN5130/D Rev.8 p.56 Table 22/23 (Revision ID Register): [7:5] silicon rev, [4:0] part number.
+#define U_INT_REG_RD_REQ_RID 0x3D
+// Analog Status Register 0 (ASR0, reg 0x03) bit masks: [6]V20V [5]VDD2 [4]VBUS [3]VFILT [2]XTAL [1]TW [0]TSD.
+// NCN5130/D Rev.8 p.56 Table 20/21 (Analog Status Register); bit 7 reserved.
+#define ASR0_V20V 0x40
+#define ASR0_VDD2 0x20
+#define ASR0_VBUS 0x10
+#define ASR0_VFILT 0x08
+#define ASR0_XTAL 0x04
+#define ASR0_TW 0x02
+#define ASR0_TSD 0x01
 // Analog Control Register 0 - Bit values
 #define ACR0_FLAG_V20VEN 0x40
 #define ACR0_FLAG_DC2EN 0x20

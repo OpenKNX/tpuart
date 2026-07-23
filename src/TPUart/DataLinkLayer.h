@@ -55,6 +55,10 @@ namespace TPUart
         unsigned long _lastDiscardedBytes = 0;
         volatile size_t _rxFrameBufferEntries = 0;
         volatile BcuType _bcuType;
+        // NCN5121/5130 boot register snapshot (read once in tryInitialize; static/latched values).
+        uint8_t _ncnAsr0 = 0;      // ASR0 @ boot: rails + TW + TSD (thermal-shutdown history)
+        uint8_t _ncnRevId = 0;     // RevID register: [7:5] silicon rev, [4:0] part number (0 = none / NCN5120)
+        bool _ncnRegValid = false; // true once the boot snapshot was taken
         volatile BcuState _bcuState = BCU_UNINITIALIZED;
         volatile int _baudrate = 0; // last negotiated BCU baudrate (19200/38400), stored on connect
 
@@ -128,6 +132,10 @@ namespace TPUart
 
         void tryInitialize();
         bool tryInitialize(uint baudrate);
+        // Synchronous single-register read; ONLY safe inside the init busy-wait (no async/bus traffic).
+        uint8_t readRegisterBlocking(char readOpcode);
+        // One-shot NCN RevID + ASR0 snapshot, taken during init (NCN family only).
+        void readNcnRegisterSnapshot();
 
         void exitBusyModeTimer();
         void setBCUState(BcuState state, int baudrate = 0);
@@ -167,6 +175,12 @@ namespace TPUart
         SystemState &getSystemState();
         Receiver &getReceiver();
         Transmitter &getTransmitter();
+
+        // NCN family identity + boot register snapshot (see tryInitialize).
+        BcuType getBcuType();
+        uint8_t getNcnAsr0();
+        uint8_t getNcnRevId();
+        bool ncnRegValid();
 
         bool powerControl(bool state);
         bool stopMode(bool state);

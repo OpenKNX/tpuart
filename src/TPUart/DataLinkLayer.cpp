@@ -23,6 +23,37 @@ namespace TPUart
         return _systemState;
     }
 
+    BcuType DataLinkLayer::getBcuType() { return _bcuType; }
+    uint8_t DataLinkLayer::getNcnAsr0() { return _ncnAsr0; }
+    uint8_t DataLinkLayer::getNcnRevId() { return _ncnRevId; }
+    bool DataLinkLayer::ncnRegValid() { return _ncnRegValid; }
+
+    // Synchronous single-register read. ONLY valid inside the init busy-wait: the request reply is a
+    // single header-less data byte, which is only unambiguous while no async bus traffic contends the UART.
+    uint8_t DataLinkLayer::readRegisterBlocking(char readOpcode)
+    {
+        _interface->write(readOpcode); // read request = opcode only, no data byte
+        unsigned long start = millis();
+        do
+        {
+            int value = _interface->read();
+            if (value >= 0) return (uint8_t)value; // first reply byte = register content
+        } while ((millis() - start) < 20);
+        return 0; // no reply (non-NCN chip / register absent / timeout)
+    }
+
+    // One-shot RevID + ASR0 snapshot during init. RevID (0x05) exists only on NCN5121/5130; on an
+    // NCN5120 the read yields no valid code -> _ncnRevId stays 0 -> reported as "NCN5120". ASR0 (0x03)
+    // is present on the whole NCN family and carries the rails + TW + latched TSD (thermal-shutdown) bit.
+    // Registers per NCN5130/D Rev.8 p.56: ASR0 Table 20/21, RevID Table 22/23.
+    void DataLinkLayer::readNcnRegisterSnapshot()
+    {
+        if (_bcuType != BCU_NCN5120) return; // register reads are NCN-family only
+        _ncnRevId = readRegisterBlocking(U_INT_REG_RD_REQ_RID);
+        _ncnAsr0 = readRegisterBlocking(U_INT_REG_RD_REQ_ASR0);
+        _ncnRegValid = true;
+    }
+
     void DataLinkLayer::begin(BcuType bcuType, Interface::Abstract *interface)
     {
         _bcuType = bcuType;
@@ -71,7 +102,13 @@ namespace TPUart
             // Serial.printf("%02X", value);
 
             // War direkt erfolgreich - Top
-            if (value == U_RESET_IND) return true;
+            if (value == U_RESET_IND)
+            {
+                // Safe here: synchronous, before the async RX pump owns the stream and before any
+                // bus/tunnel traffic -> the header-less register replies cannot be mis-captured.
+                readNcnRegisterSnapshot();
+                return true;
+            }
             break;
         }
         while (!((millis() - start) >= 50));
