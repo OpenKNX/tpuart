@@ -157,7 +157,22 @@ namespace TPUart
             const uint16_t bufferSize = _rxFrameBuffer.pop() + (_rxFrameBuffer.pop() << 8);
             const uint16_t frameSize = bufferSize - 3;
 
-            char frameData[frameSize] = {};
+            // Bound what was a VLA (char frameData[frameSize]): the producer (pushRxFrameBuffer) never pushes
+            // more than the rx search buffer holds, so a frameSize above it means the ring desynced or the
+            // 2-byte length header underflowed (bufferSize < 3 -> frameSize wraps to ~65533). Either way the
+            // read pointer is untrustworthy; sizing a stack array from it would overflow the stack. Drop the
+            // whole buffer and resync (same reset idiom as the init/overflow paths) instead of indexing wild.
+            if (frameSize > TPUART_RX_SEARCH_BUFFER_SIZE)
+            {
+                _rxFrameBuffer.clear();
+                _rxFrameBufferEntries = 0;
+                rxUnlock();
+                _rxFrameBufferOverflow = true;
+                _statistics.incrementRxFrameBufferOverflow();
+                return;
+            }
+
+            char frameData[TPUART_RX_SEARCH_BUFFER_SIZE]; // fixed max; only the first frameSize bytes are written+read below
 
             for (size_t i = 0; i < frameSize; i++)
                 frameData[i] = _rxFrameBuffer.pop();
