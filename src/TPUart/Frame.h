@@ -36,6 +36,9 @@
 // Means that the frame has been acked
 #define TP_FRAME_FLAG_ACK 0b00000001
 
+// Means that the frame failed FCS validation; used only to forward it to the busmon tagged as errored
+#define TP_FRAME_FLAG_FCS_ERROR 0b00010000
+
 namespace TPUart
 {
     class Frame
@@ -242,6 +245,12 @@ namespace TPUart
         bool isInvalid()
         {
             return !isValid();
+        }
+
+        // True when the frame was flagged as FCS-failed for busmon-only forwarding (see Receiver).
+        bool isErrored()
+        {
+            return _flags & TP_FRAME_FLAG_FCS_ERROR;
         }
 
         bool isAck()

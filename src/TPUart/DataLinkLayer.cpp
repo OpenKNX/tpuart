@@ -223,12 +223,17 @@ namespace TPUart
 
             run++;
 
-            bool alreadFound;
-            alreadFound = _repetitionFilter.check(frame);
-            if (frame.isRepeated() && alreadFound)
+            // Skip the repetition filter for a busmon-only FCS-error carrier: it must not pollute the
+            // per-source repetition map and is never delivered up to the link layer.
+            if (!frame.isErrored())
             {
-                frame.setFiltered();
-                _statistics.incrementRxRepetitions();
+                bool alreadFound;
+                alreadFound = _repetitionFilter.check(frame);
+                if (frame.isRepeated() && alreadFound)
+                {
+                    frame.setFiltered();
+                    _statistics.incrementRxRepetitions();
+                }
             }
 
             // Complete TX Frame

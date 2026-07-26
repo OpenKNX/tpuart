@@ -363,16 +363,14 @@ namespace TPUart
             }
             else
             {
-                // _dll.printMessage("INVALID FRAME");
-                // String tmp;
-                // tmp.reserve(1024);
-                // for (size_t i = 0; i < _searchBuffer.position(); i++)
-                // {
-                //     char t2[3];
-                //     snprintf(t2, 3, "%02X ", _searchBuffer.get(i));
-                //     tmp += String(t2) + " ";
-                // }
-                // _dll.printMessage("      %s", tmp.c_str());
+                // Raw busmon: forward the FCS-failed frame exactly as captured (incl. FCS) tagged as
+                // errored, then discard it. Monitor-gated -> no change off-monitor. The errored frame is
+                // never delivered up to the link layer (knx processRxFrame returns after the busmon push).
+                if (_dll.isMonitoring())
+                {
+                    frame.addFlags(TP_FRAME_FLAG_FCS_ERROR);
+                    _dll.pushRxFrameBuffer(frame);
+                }
                 processSearchBufferInvalid(3);
             }
         }
