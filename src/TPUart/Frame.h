@@ -131,7 +131,7 @@ namespace TPUart
         /*
          * Include the all metadata at the beginning of the frame and the checksum at the end.
          */
-        char metadataSize()
+        unsigned short metadataSize()
         {
             return isExtended() ? 9 : 8;
         }
@@ -179,9 +179,11 @@ namespace TPUart
             return isExtended() ? (_data[2] << 8) + _data[3] : (_data[1] << 8) + _data[2];
         }
 
-        char apduSize()
+        unsigned short apduSize()
         {
-            return isExtended() ? _data[6] : _data[5] & 0b1111;
+            // Read length bytes unsigned: on ESP32 (signed char) an extended LEN > 127 in _data[6]
+            // would otherwise sign-extend to a negative value and wrap size()/await arithmetic.
+            return isExtended() ? (unsigned char)_data[6] : (unsigned char)(_data[5] & 0x0F);
         }
 
         void resetFlags()
