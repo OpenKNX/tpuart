@@ -492,7 +492,7 @@ FAST    [TPUART_BCU_BACKSTOP]
 ## Recommended presets
 
 ```
-Production -- LAN-TP-Base (ESP32 IP-Router)   (matches the field-tested build)
+Production -- LAN-TP-Base (ESP32 IP-Router/IP-Interface)   (matches the field-tested build)
   -D TPUART_BCU_AUTORECONNECT   BCU self-heals (mute/desync) -- real stability
   -D TPUART_RX_DRAIN_FAST       drain RX ring + threshold 1 (ETS app-download works)
   -D TPUART_TX_FAST             higher IP->TP forward rate (no "queue full" under load)
