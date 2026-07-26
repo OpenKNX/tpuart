@@ -9,11 +9,12 @@
 constexpr uint32_t TPUART_RP2040_TRANSFER_COUNT = UINT32_MAX >> 1; // aus irgendeinem Grund funktioniert UINT32_MAX nicht und ich musste den wert halbieren
 // constexpr unsigned int TPUART_RP2040_TRANSFER_COUNT = 5000;
 // constexpr unsigned int TPUART_RP2040_TRANSFER_COUNT = 256;
-constexpr unsigned long TPUART_RP2040_BUFFER_EXP = 8; // 2**BufferExp
-// NOTE: the fast-transfer >4KB corruption is caused by a 256 B RX-ring overflowing during the
-// noInterrupts() window of a mid-stream LittleFS flash erase (chunks silently dropped, NCN auto-ACK
-// hides it). The fix is EXP=11 (2048 B). Reverted to 8 here while isolating an unrelated intermittent
-// KNXnet/IP routing issue -- re-apply EXP=11 to fix the fast-transfer corruption once the net is clean.
+constexpr unsigned long TPUART_RP2040_BUFFER_EXP = 11; // 2**BufferExp -> 2048 B
+// The DMA RX ring must outlast the longest noInterrupts() stall (mid-stream LittleFS flash erase) and
+// hold a full worst-case burst without wrapping. A 256 B ring overflows there -> mid-frame bytes are
+// silently jump-discarded in read() (fast-transfer >4KB corruption) and a single max extended LPDU
+// (264 B incl. FCS) already exceeds it -> raw-busmon long frames are lost. 2048 B gives ample headroom.
+// (Previously reverted to 8 while isolating an unrelated KNXnet/IP routing issue; that net is clean now.)
 constexpr unsigned long TPUART_RP2040_BUFFER_SIZE = (1u << TPUART_RP2040_BUFFER_EXP);
 
 namespace TPUart
