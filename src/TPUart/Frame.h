@@ -15,8 +15,9 @@
 // Means that the frame is transmitted
 #define TP_FRAME_FLAG_TX 0b10000000
 
-// Means that the frame is answered with L_DATA_CON if success the TP_FRAME_FLAG_ACK is also set
-#define TP_FRAME_FLAG_DATA_CON 0b01000000
+// Marks a 1-byte carrier holding a standalone L2 acknowledge octet, forwarded to the busmon only.
+// (Reuses the former, unused TP_FRAME_FLAG_DATA_CON bit.)
+#define TP_FRAME_FLAG_ACK_ONLY 0b01000000
 
 // Means that the frame should be filtered by the device
 #define TP_FRAME_FLAG_FILTERED 0b00100000
@@ -251,6 +252,13 @@ namespace TPUart
         bool isErrored()
         {
             return _flags & TP_FRAME_FLAG_FCS_ERROR;
+        }
+
+        // True for a 1-byte carrier holding a standalone L2 acknowledge octet (busmon-only, see Receiver).
+        // Callers must NOT invoke size()/isFrame()/cemi conversion on it -- its buffer is a single byte.
+        bool isAckOnly()
+        {
+            return _flags & TP_FRAME_FLAG_ACK_ONLY;
         }
 
         bool isAck()

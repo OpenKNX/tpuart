@@ -112,6 +112,8 @@ namespace TPUart
 
         void connected(bool connected);
         void pushRxFrameBuffer(Frame &frame);
+        // Push a standalone L2 acknowledge octet as a 1-byte busmon-only carrier (monitor mode only).
+        void pushRxAcknByte(char value);
         // void processIncompleteFrame();
         // void processWaitForAcknTimer();
         void processRxFrameBuffer();

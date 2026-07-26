@@ -223,9 +223,10 @@ namespace TPUart
 
             run++;
 
-            // Skip the repetition filter for a busmon-only FCS-error carrier: it must not pollute the
-            // per-source repetition map and is never delivered up to the link layer.
-            if (!frame.isErrored())
+            // Skip the repetition filter for busmon-only carriers (FCS-failed frames and 1-byte standalone
+            // acknowledges): they must not pollute the per-source repetition map, are never delivered up,
+            // and a 1-byte ack carrier has no valid size()/source() for the filter to read.
+            if (!frame.isErrored() && !frame.isAckOnly())
             {
                 bool alreadFound;
                 alreadFound = _repetitionFilter.check(frame);
@@ -266,6 +267,28 @@ namespace TPUart
 
         // Flags (1 byte)
         _rxFrameBuffer.push(frame.flags());
+        asm volatile("" ::: "memory");
+        _rxFrameBufferEntries = _rxFrameBufferEntries + 1;
+    }
+
+    void DataLinkLayer::pushRxAcknByte(char value)
+    {
+        // A standalone L2 acknowledge (ACK/NAK/BUSY) is forwarded to the busmon as a 1-byte carrier. It
+        // rides the normal rx-frame ring so the forward happens in loop context (processRxFrameBuffer),
+        // and is tagged ACK_ONLY so the consumer short-circuits it to the busmon without ever calling
+        // size()/isFrame()/cemi conversion (which would read past this single byte). Kept separate from
+        // pushRxFrameBuffer, whose frame.size() would itself read past a 1-byte buffer.
+        const unsigned short bufferSize = 1 + 3;
+        if (_rxFrameBuffer.available() <= bufferSize)
+        {
+            _rxFrameBufferOverflow = true;
+            _statistics.incrementRxFrameBufferOverflow();
+            return;
+        }
+        _rxFrameBuffer.push(bufferSize & 0xFF);
+        _rxFrameBuffer.push(bufferSize >> 8);
+        _rxFrameBuffer.push(value);
+        _rxFrameBuffer.push(TP_FRAME_FLAG_ACK_ONLY);
         asm volatile("" ::: "memory");
         _rxFrameBufferEntries = _rxFrameBufferEntries + 1;
     }

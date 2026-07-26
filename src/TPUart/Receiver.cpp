@@ -460,6 +460,12 @@ namespace TPUart
 
         else if ((value & L_ACKN_MASK) == L_ACKN_IND)
         {
+            // Standalone L2 acknowledge (ACK/NAK/BUSY). This is the bare-ackn control path (a frame-
+            // trailing ack is instead folded by processSearchBufferAcknowledge in RX_FRAME_WAIT_ACKN and
+            // never reaches here). Monitor-only: forward the single raw octet to the busmon as a 1-byte
+            // carrier (03_08_04: acknowledges shall also be transferred). Off-monitor this stays a no-op.
+            if (_dll.isMonitoring())
+                _dll.pushRxAcknByte(value);
         }
 
         else
