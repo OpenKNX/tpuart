@@ -12,6 +12,7 @@ namespace TPUart
         DataLinkLayer &_dll;
         volatile char _cachedAcknowledge;
         size_t _transmitPos;
+        unsigned char _transmitOffset; // NCN5130 keeps the data-index offset until it is changed (DS p.42)
         volatile unsigned long _time;
         unsigned long _maxQueueSize;
         TxState _state;
