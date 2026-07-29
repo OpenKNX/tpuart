@@ -80,6 +80,7 @@ namespace TPUart
         _repetitionFilter.clear();
         _interface->flush();
         _bcuState = BCU_CONNECTED;
+        _receiver._lastReceivedTime = millis();
 
         _interface->write(U_RESET_REQ);
         _modeExtendedCRC = false;
