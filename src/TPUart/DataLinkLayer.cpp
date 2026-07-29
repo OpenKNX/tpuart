@@ -114,6 +114,18 @@ namespace TPUart
             const uint16_t bufferSize = _rxFrameBuffer.pop() + (_rxFrameBuffer.pop() << 8);
             const uint16_t frameSize = bufferSize - 3;
 
+            // A real frame can never exceed the search buffer it was parsed from (pushRxFrameBuffer
+            // never pushes more than that). Seeing frameSize above it here means the RX frame buffer's
+            // entry count and its actual byte content are no longer in sync - a locking/invariant bug,
+            // not a condition to recover from quietly. Log it and reset instead of indexing a VLA with it.
+            if (frameSize > TPUART_RX_SEARCH_BUFFER_SIZE)
+            {
+                rxUnlock();
+                printError("RX frame buffer desynced: frameSize %u exceeds max %u", frameSize, TPUART_RX_SEARCH_BUFFER_SIZE);
+                reset();
+                return;
+            }
+
             char frameData[frameSize] = {};
 
             for (size_t i = 0; i < frameSize; i++)
