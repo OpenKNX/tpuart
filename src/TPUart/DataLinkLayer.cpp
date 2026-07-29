@@ -762,6 +762,7 @@ namespace TPUart
         _uReset = true;
         _modeExtendedCRC = false;
         _modeAutoAcknowlage = false;
+        _transmitter.reset();
         setBCUState(BCU_CONNECTED);
     }
 
