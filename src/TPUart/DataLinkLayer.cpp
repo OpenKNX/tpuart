@@ -1081,9 +1081,7 @@ namespace TPUart
         _modeExtendedCRC = false;
         _modeAutoAcknowlage = false;
         _receiver._invalid = false; // reset indication -> the stream restarts in sync, so clear the desync flag (belt-and-suspenders; the parser also clears it on the U_RESET_IND)
-#ifdef TPUART_TX_STICKY_OFFSET
-        _transmitter._lastOffset = 0; // the chip reset its own data-index offset (DS p.42) -> drop the stale mirror at once, so an autonomous mid-frame reset heals immediately instead of via a watchdog cycle
-#endif
+        _transmitter.reset();       // unsolicited chip reset -> abandon the stale in-flight TX (also clears _lastOffset when TPUART_TX_STICKY_OFFSET); adopted from 1.1.0 (18d8655)
         setBCUState(BCU_CONNECTED);
     }
 
