@@ -336,7 +336,7 @@ RX-liveness re-arm (`_lastReceivedTime` set on every reset(), no spurious discon
   TPUART_NCN_TW_AUTORESET       off       all      NCN thermal-warning auto-heal (L2): when TW persists, issue ONE guarded U_RESET (like `bcu rst`) to clear a latched TW, then back off if it returns (genuinely hot). NOTE: L1 edge-logging of TW is ALWAYS on regardless of this flag -- the old 1/s "TP Error: Temperature-Warning" flood becomes one line on set, an optional heartbeat, one on clear.
 
   tunables (#ifndef, have a default):
-  TPUART_ESP32_TASK_STACK_SIZE  4096      ESP32    RX task stack (raised from 2048)
+  TPUART_ESP32_TASK_STACK_SIZE  4096      ESP32    RX task stack (raised from 2048) -- EXPERIMENTAL, may still be re-evaluated / re-tuned
   TPUART_RX_TIMEOUT             5 ms      all      RX inter-byte / quiet-bus window
   TX_BACKSTOP_MS                8000 ms   backstop fast-reset trigger delay
   TX_BACKSTOP_COOLDOWN_MS       30000 ms  backstop after a fast reset only the 60 s cap fires
@@ -352,7 +352,7 @@ RX-liveness re-arm (`_lastReceivedTime` set on every reset(), no spurious discon
   TPUART_MAX_RXQUEUE_TIME_PER_LOOP   20       per-loop RX-frame-buffer drain budget
   TPUART_RX_FRAME_BUFFER_SIZE        6000     RX frame output ring (bytes)
   TPUART_RX_SEARCH_BUFFER_SIZE       300      parser search window (263 + slack)
-  TPUART_RP2040_BUFFER_SIZE / _EXP   256 / 8  RP2040 DMA ring geometry
+  TPUART_RP2040_BUFFER_SIZE / _EXP   2048 / 11  RP2040 DMA ring geometry -- EXPERIMENTAL, may still be re-evaluated / re-tuned
 
   debug:
   TPUART_BCU_DEBUG              off       all      test hooks + diagnostic traces
