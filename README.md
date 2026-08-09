@@ -6,8 +6,8 @@ parsed KNX frames (RX), pushes queued frames onto the TP1 twisted pair (TX), and
 coupler chip connected and self-healed. Part of OpenKNX; consumed by the OpenKNX `knx`
 stack as its TP data-link layer.
 
-> This README describes the **stock** architecture. Project-specific changes are OFF by
-> default and shown as `[TPUART_*]` overlays (see "Modifications").
+> Perf/stability behaviours (RX-drain, TX-fast, sticky-offset, auto-reconnect, backstop, health
+> counters) are built into the driver; see "Behaviour details". Opt-in switches are marked `[TPUART_*]`.
 
 ---
 
@@ -193,13 +193,13 @@ the UART -- our own RX parser sees it -- then appends the confirm (CON) that rel
 └──────────────────────┘
 ```
 
-Byte pump: `stock vTaskDelay(1)/byte` ...... `[TPUART_TX_FAST: taskYIELD]`.
+Byte pump: `taskYIELD` per byte, bytes go to the HW TX FIFO (ESP32).
 Three ways back from `TX_AWAIT` to `TX_IDLE` (see "Recovery ladder"):
 
 ```
   finalize()   CON matched normally
-  finalize()   CON-rescue: echo proven but CON lost ............. [always-on]
-  reset()      60s watchdog, or fast reset ...................... [TPUART_BCU_BACKSTOP]
+  finalize()   CON-rescue: echo proven but CON lost
+  reset()      guarded fast reset (~8 s), else the 60 s watchdog cap
 ```
 
 ---
@@ -212,12 +212,10 @@ States: `BCU_UNINITIALIZED`, `BCU_CONNECTED`, `BCU_DISCONNECTED`, `BCU_BUSMONITO
   UNINITIALIZED -> CONNECTED     begin(): write U_RESET_REQ @19200 (+ @38400 for NCN),
                                  wait <= 50 ms for U_RESET_IND    (retry every > 1 s)
 
-  CONNECTED -> DISCONNECTED      no RX byte > 5000 ms
-                                 [AUTORECONNECT: AND no valid frame > 30000 ms]
+  CONNECTED -> DISCONNECTED      no RX byte > 5000 ms AND no valid frame > 30000 ms
 
-  DISCONNECTED -> CONNECTED      stock          : passive -- any raw byte flips it
-                                 [AUTORECONNECT] : active  -- poke U_RESET_REQ, backoff
-                                                   1 s -> 30 s, until a real U_RESET_IND
+  DISCONNECTED -> CONNECTED      active reconnect: poke U_RESET_REQ, backoff
+                                 1 s -> 30 s, until a real U_RESET_IND
 
   CONNECTED -> BUSMONITOR        startMonitoring(): write U_BUSMON_REQ    (one-way)
 ```
@@ -233,19 +231,19 @@ with `U_RESET_IND`.
 
 ```
    1  (re)initialize if UNINITIALIZED
-   2  reconnect branch      stock: passive   |   [TPUART_BCU_AUTORECONNECT]: active poke
+   2  reconnect branch      active U_RESET_REQ poke while DISCONNECTED
    3  busy-mode auto-off (700 ms)
    4  keep-alive: U_STATE_REQ every 1000 ms  (skipped while _invalid)
    5  handleReset(): applyConfiguration() + requestState() after a U_RESET_IND
    6  RX drain:   while available() processReceviedByte()
-   7  Receiver::process()          loop-driven CON-rescue + RX timeout ...... [always-on]
+   7  Receiver::process()          loop-driven CON-rescue + RX timeout
    8  Transmitter::processQueue()  arm next frame if TX_IDLE
    9  TX pump:    while isTransmitting() processTransmitByte()   (fairness break > 20 ms)
   10  processRxFrameBuffer()       pop frames -> RepetitionFilter -> callbacks
-  11  processQueue() again         arm next frame same pass ............. [TPUART_TX_FAST]
+  11  processQueue() again         arm next frame in the same pass after the CON
   12  surface errors: overflow / U_State / discarded / system-state
   13  liveness check: CONNECTED && stale -> BCU_DISCONNECTED
-  14  processWatchdog(): Transmitter 60s cap .................... [+ TPUART_BCU_BACKSTOP]
+  14  processWatchdog(): guarded fast reset (~8 s), else the 60 s cap
 ```
 
 ---
@@ -256,10 +254,9 @@ with `U_RESET_IND`.
   cause                             recovery                           latency
   --------------------------------  -------------------------------    -----------
   CON matched normally              finalize()                         immediate
-  echo PROVEN, CON lost/misparsed   CON-rescue finalize()  [always]    RX-quiet
-  echo NEVER matched (bus error)    60s watchdog -> reset()            60 s
-                                    fast reset  [TPUART_BCU_BACKSTOP]  8 s / 12 s
-  NCN mute / desynced               active poke [AUTORECONNECT]        1 s .. 30 s
+  echo PROVEN, CON lost/misparsed   CON-rescue finalize()              RX-quiet
+  echo NEVER matched (bus error)    guarded fast reset, else watchdog  8 s / 12 s / 60 s
+  NCN mute / desynced               active U_RESET_REQ poke            1 s .. 30 s
 ```
 
 **NCN U_State error bits** (surfaced by `showStateError()`, counted in `Statistics`):
@@ -280,174 +277,54 @@ ESP/NCN supply.
 
 ---
 
-## Modifications  (opt-in overlays; stock = baseline above)
+## Behaviour details
 
-Each flag is **OFF by default**; enabling it changes only the marked spot. Build markers
-(`#pragma message` in `TPUart.cpp`) print which are compiled, e.g. `>>> TPUart: TX FAST = ON <<<`.
-
-```
-[TPUART_RX_DRAIN_FAST]   ESP32 only
-   RX task wakeup     : stock 1 byte/event + vTaskDelay(1)  (~1000 B/s ceiling) fast  drain whole ring/wakeup + taskYIELD  (guard 2048)
-   IDF driver ring    : stock 512 B               ->  fast 1024 B
-   rx_full_threshold  : 1 in BOTH branches (a lone L_ACK byte must arrive promptly; a high threshold holds it until rx-timeout -> breaks ETS download)
-
-[TPUART_TX_FAST]         ESP32 pump
-   byte-pump delay    : stock vTaskDelay(1)/byte  ->  fast taskYIELD  (bytes -> HW TX FIFO)
-   next frame         : stock next loop pass      ->  fast same pass after CON (step 11) still strictly one-in-flight (no pipelining past an unconfirmed CON)
-
-[TPUART_TX_STICKY_OFFSET]  all platforms; only affects frames > 64 octets
-   U_L_DataOffset     : stock before EVERY byte with offset != 0  ->  sticky: only when the offset changes
-   why                : the NCN5130 "stores [the offset] internally until a new offset is provided with another call" (DS p.42),
-                        so the stock resend is redundant: 199 offset bytes instead of 4 on a 263 octet frame = 195 of 725 UART bytes.
-                        It costs full time because the chip starts the bus transmission only once the whole frame has arrived
-                        (DS p.49) -- UART time ADDS to bus time, it does not hide behind it.
-   measured           : RP2350 -> real target, pkg 253: 285 -> 326 B/s (+14%). pkg 64 (only 7 bytes saved): +3%.
-                        The gain scales with frame length, which is what the mechanism predicts.
-   <= 64 octets       : byte-identical to stock (offset is 0, both branches emit nothing) -- group telegrams are untouched
-   ruled out          : at position 0 of each 64 byte block the command byte is 0x80 = U_L_DataStart.req, which DS p.49 says
-                        resets the offset. It does not apply mid-frame. Verified on the device across all four boundaries
-                        (pkg 50/56/57/119/120/121/184/185/248/249/253, each straddling one) -- expected CRC, 0 retries.
-
-[TPUART_BCU_AUTORECONNECT]
-   reconnect          : stock passive (waits for a byte a mute NCN never sends -> terminal) ->  active U_RESET_REQ poke, backoff 1s..30s
-   reset reply        : U_RESET_IND parsed UNCONDITIONALLY, even while _invalid (the only path back to CONNECTED on a desynced NCN)
-   disconnect gate    : stock > 5s no byte        ->  > 5s no byte AND > 30s no valid frame
-
-[TPUART_BCU_BACKSTOP]    verified, RP2040-safe
-   case: echo never matched, CON lost, bus quiet -> stock would wait the full 60 s
-   fast reset when TX_AWAIT and RX healthy-idle:
-      TX_BACKSTOP_MS          = 8000    (> worst-case legit CON: 263 B ext @9600, 3+3 repeats)
-      TX_BACKSTOP_INVALID_MS  = 12000   (latched _invalid on a quiet bus)
-      TX_BACKSTOP_COOLDOWN_MS = 30000   (persistent fault degrades back to the 60 s cap)
-   guard: re-check under rxLock + !available() + RX quiet + re-check after unlock
-          -> a late-but-valid CON is processed first, never dropped
-
-[TPUART_BCU_DEBUG]       test / diagnosis only
-   forceDisconnect() console hook ("bcu dis"), "CONr: idleBus" trace,
-   watchdog give-up dump (rxState / rxTx / _invalid / ...)
-
-ALWAYS ON  (no flag)  -- real reliability fixes; stock default without them is broken/degraded
-   CON-rescue          release TX when our echo was proven but the CON was lost (3 sites)
-   ESP32 task stack    TPUART_ESP32_TASK_STACK_SIZE = 4096 (stock 2048; recursive parser+VLAs)
-   RX-liveness re-arm  _lastReceivedTime set on every reset() (no spurious disconnect)
-```
-
-**Where each modification hooks in** -- `◀──` marks the spot; `stock:` is the baseline it
-replaces (so you see exactly what changes vs the stock flow above):
+Perf/stability behaviours built into the driver (opt-in ones are marked):
 
 ```
-RX PATH   (ESP32 wakeup -> parser -> deliver frame)
-  runTask() wakeup                ◀── [RX_DRAIN_FAST]  drain whole ring + taskYIELD
-    │                                 stock: 1 byte + vTaskDelay(1); ring 512 -> 1024
-    ▼
-  processSearchBuffer() [FSM]     ◀── [AUTORECONNECT]  parse U_RESET_IND
-    │                                 unconditionally  (stock: swallowed while _invalid)
-    ▼
-  processCompleteFrame()          ◀── CON-rescue (always on)  release TX when the echo
-                                      was proven but the CON got lost
+RX drain       (ESP32)
+   The RX task drains the whole IDF UART ring per wakeup (guard 2048), then taskYIELD. Driver ring
+   1024 B; rx_full_threshold 1 (a lone L_ACK byte is delivered at once -- a high threshold would hold
+   it until the rx-timeout and break ETS app-download).
 
-TX PATH   (queue -> pump -> confirm -> watchdog)
-  processTransmitByte() pump      ◀── [TX_FAST]  taskYIELD per byte
-    │                                 stock: vTaskDelay(1) per byte
-    ▼
-  after CON: processQueue()       ◀── [TX_FAST]  arm next frame in the same pass
-    │                                 stock: waits for the next loop pass
-    ▼
-  processWatchdog() (TX_AWAIT)    ◀── [BACKSTOP]  + 8 s / 12 s guarded fast reset
-                                      stock: 60 s cap only
+TX fast        (ESP32 pump)
+   Byte pump uses taskYIELD; bytes go to the HW TX FIFO. The next queued frame is armed in the same
+   pass after the CON (step 11), still strictly one-in-flight (no pipelining past an unconfirmed CON).
 
-CONTROL   (BCU state + bookkeeping)
-  BCU_DISCONNECTED reconnect      ◀── [AUTORECONNECT]  active U_RESET_REQ poke,
-    │                                 backoff 1 s..30 s  (stock: passive -> terminal)
-    ▼
-  every reset / error path        ◀── health counters (always on)  resets / disc /
-                                      con-rescues + SC/RE/TE/PE/TW, persist across reset()
+Sticky offset  (all platforms; only affects frames > 64 octets)
+   U_L_DataOffset is sent only when the offset changes. The NCN5130 stores it internally until a new
+   offset is provided (DS p.42), so a 263-octet frame sends 4 offset bytes instead of 199 -- 195 of
+   725 UART bytes, +14% throughput (RP2350, pkg 253). It costs full time because the chip starts the
+   bus transmission only once the whole frame has arrived (DS p.49) -- UART time adds to bus time.
+   <= 64 octets: nothing emitted (offset 0), group telegrams untouched. The mid-frame 0x80
+   (U_L_DataStart.req at each 64-B block) does NOT reset the offset (DS p.49 = new frame only;
+   verified across all four boundaries -- expected CRC, 0 retries).
+
+Auto-reconnect (all platforms)
+   On a mute/desynced NCN the driver actively pokes U_RESET_REQ (backoff 1 s -> 30 s) until it answers;
+   the U_RESET_IND reply is parsed UNCONDITIONALLY, even while _invalid (the only path back to CONNECTED
+   on a desynced NCN). Disconnect gate: > 5 s no byte AND > 30 s no valid frame.
+
+Backstop       (all platforms, RP2040-safe)
+   TX stranded in TX_AWAIT with the echo never matched and the bus idle: a guarded fast reset fires at
+   TX_BACKSTOP_MS = 8000 (TX_BACKSTOP_INVALID_MS = 12000 if _invalid is latched on a quiet bus) instead
+   of the 60 s watchdog. Guard: re-check under rxLock + !available() + RX quiet, re-checked after unlock
+   -> a late-but-valid CON is processed first, never dropped. Cooldown TX_BACKSTOP_COOLDOWN_MS = 30000:
+   a persistent fault degrades back to the 60 s cap.
+
+Health counters (all platforms)
+   Lifetime BCU health counters (resets / disconnects / con-rescues / TW + SC/RE/TE/PE), shown in the
+   `bcu` report; persist across reset() (cleared only on reboot).
+
+CON-rescue     (all platforms)
+   Releases TX when our echo was proven but the CON was lost (3 sites).
+
+BCU debug      (opt-in: TPUART_BCU_DEBUG)
+   forceDisconnect() console hook ("bcu dis"), CONr trace, watchdog give-up dump.
 ```
 
-**The RX ring (why `[TPUART_RX_DRAIN_FAST]` matters).** The IDF UART driver fills a ring
-buffer from the wire; the FreeRTOS task drains it into the parser. Stock drains 1 byte per
-wakeup -- slower than a burst fills it -- so the ring backs up and overflows. Draining the
-whole ring each wakeup keeps it empty:
-
-```
-IDF UART RX ring  (ESP32): the driver ISR/DMA fills it from the wire,
-the FreeRTOS task drains it into the parser.   ( # = byte waiting )
-
-STOCK   (1 byte / wakeup, then vTaskDelay(1);  ring 512 B)
-         ┌────────────────────────────────────────┐   <- drain 1 byte / wakeup
-         │####################################    │   fill up to ~3490 B/s (38400 baud)
-         └────────────────────────────────────────┘   drain only ~1000 B/s
-         => ring backs up => OVERFLOW, byte lost => receiver desync
-
-FAST    [TPUART_RX_DRAIN_FAST]  (drain whole ring, then taskYIELD;  ring 1024 B)
-         ┌────────────────────────────────────────┐   <- drain ALL  while(available())
-         │                                        │   emptied every wakeup
-         └────────────────────────────────────────┘   keeps up with the fill
-         => no overflow, no ~1000 B/s ceiling
-         (rx_full_threshold stays 1: a lone L_ACK byte is delivered at once)
-```
-
-**The TX queue (why `[TPUART_TX_FAST]` matters).** The mirror image on the send side: the
-consumer fills a frame queue, the byte pump drains it to the bus. Stock drains too slowly
-(a `vTaskDelay(1)` self-brake per byte, plus only one frame armed per loop pass), so under a
-forward burst the queue backs up and drops frames. `TX_FAST` removes the brake and arms the
-next frame in the same pass, draining at wire speed:
-
-```
-TX frame queue  (_queue, max 50): the consumer/IP fills it, the pump drains it to
-the bus.   ( # = frame waiting )
-
-STOCK   (vTaskDelay(1)/byte pump + next frame on the NEXT loop pass)
-         ┌──────────────────────────────┐   <- drain ~33-38 frames/s (self-brake + 1/loop)
-         │##############################│   fill: IP->TP forward bursts
-         └──────────────────────────────┘
-         => backs up => "Ignore frame because transmit queue is full!" => DROPPED
-
-FAST    [TPUART_TX_FAST]  (taskYIELD pump + arm next frame in the SAME pass after CON)
-         ┌──────────────────────────────┐   <- drain ~45-50 frames/s (at the 9600-baud TP floor)
-         │####                          │   self-brake gone
-         └──────────────────────────────┘
-         => queue stays low => no "queue full" under normal load
-         (the 9600-baud TP wire is still the ultimate cap: a real overload still fills it)
-```
-
-**Self-healing reconnect (why `[TPUART_BCU_AUTORECONNECT]` matters).** Stock waits passively
-for a byte from the NCN -- a mute / desynced NCN never sends one, so it stays disconnected
-forever. The flag actively pokes `U_RESET_REQ` until the NCN answers (and the reply is parsed
-even while the receiver is desynced):
-
-```
-STOCK   passive reconnect
-   [DISCONNECTED] ──── wait for an incoming byte ────▶  a mute / desynced NCN sends
-                                                        nothing  =>  STUCK forever
-                                                        (terminal "BCU disconnected")
-
-FAST    [TPUART_BCU_AUTORECONNECT]   active poke + unconditional U_RESET_IND parse
-   [DISCONNECTED]
-        │  U_RESET_REQ  ──────▶  NCN      retry 1s -> 2s -> 4s -> ... capped at 30s
-        │  ◀──────  U_RESET_IND  NCN      parsed even while _invalid
-        ▼
-   [CONNECTED]   self-healed
-```
-
-**Fast recovery (why `[TPUART_BCU_BACKSTOP]` matters).** When the TX is stranded in
-`TX_AWAIT` and the echo was never matched, only the 60 s watchdog recovers -- a long
-forwarding stall. The backstop cuts it to ~8 s, but only when it can prove no transaction is
-in flight (so a late-but-valid CON is never dropped):
-
-```
-   TX stuck in TX_AWAIT (echo never matched, CON lost)   ── time ──▶
-
-STOCK   60 s watchdog cap only
-   0s ├────────────────────────────────────────────────────┤ 60 s ▶ reset()
-      (forwarding stalled the whole 60 s)
-
-FAST    [TPUART_BCU_BACKSTOP]
-   0s ├─────┤ 8 s ▶ reset()      (12 s if _invalid is latched on a quiet bus)
-      guard: TX_AWAIT + RX idle + bus quiet, re-checked under rxLock
-             => a late-but-valid CON is finalized first, never dropped
-      cooldown 30 s => a persistent fault degrades back to the 60 s cap
-```
+Also always on: ESP32 task stack `TPUART_ESP32_TASK_STACK_SIZE` = 4096 (recursive parser + VLAs),
+RX-liveness re-arm (`_lastReceivedTime` set on every reset(), no spurious disconnect).
 
 ---
 
@@ -456,12 +333,6 @@ FAST    [TPUART_BCU_BACKSTOP]
 ```
   FLAG                          DEFAULT   SCOPE    EFFECT
   ----------------------------  --------  -------  -----------------------------------------------------------------------------
-  TPUART_RX_DRAIN_FAST          off       ESP32    drain whole RX ring/wakeup; ring 1024; threshold 1; removes ~1000 B/s ceiling
-  TPUART_TX_FAST                off       ESP32    taskYIELD pump + arm next frame same pass
-  TPUART_TX_STICKY_OFFSET       off       all      send U_L_DataOffset only when it changes (frames > 64 octets); +14% at 263 octets
-  TPUART_BCU_AUTORECONNECT      off       all      active U_RESET_REQ reconnect + reset-parse
-  TPUART_BCU_BACKSTOP           off       all      fast reset before the 60 s cap (guarded)
-  TPUART_BCU_HEALTH             off       all      BCU lifetime health counters + their BCU<Health> / <NCN-Err> line in the `bcu` report. Off = counters are no-op stubs (0 footprint), report omits them.
   TPUART_NCN_TW_AUTORESET       off       all      NCN thermal-warning auto-heal (L2): when TW persists, issue ONE guarded U_RESET (like `bcu rst`) to clear a latched TW, then back off if it returns (genuinely hot). NOTE: L1 edge-logging of TW is ALWAYS on regardless of this flag -- the old 1/s "TP Error: Temperature-Warning" flood becomes one line on set, an optional heartbeat, one on clear.
 
   tunables (#ifndef, have a default):
@@ -475,8 +346,8 @@ FAST    [TPUART_BCU_BACKSTOP]
   TPUART_TW_AUTORESET_COOLDOWN_MS 300000  TW auto-heal: min spacing between two auto-resets (cross-episode backoff)
   TPUART_TW_RELAPSE_MS          8000 ms   TW still set this long after the reset => genuinely-hot verdict
 
-  stock switches / tunables:
-  TPUART_REPETITION_SIMPLE           off      rep-filter store: 1 entry/source map (stock: bounded LRU list+map, MAX_SIZE 50)
+  other switches / tunables:
+  TPUART_REPETITION_SIMPLE           off      rep-filter store: 1 entry/source map (default: bounded LRU list+map, MAX_SIZE 50)
   TPUART_MAX_PROCESS_TIME_PER_LOOP   30       per-loop process budget
   TPUART_MAX_RXQUEUE_TIME_PER_LOOP   20       per-loop RX-frame-buffer drain budget
   TPUART_RX_FRAME_BUFFER_SIZE        6000     RX frame output ring (bytes)
@@ -493,18 +364,14 @@ FAST    [TPUART_BCU_BACKSTOP]
 
 ```
 Production -- LAN-TP-Base (ESP32 IP-Router/IP-Interface)   (matches the field-tested build)
-  -D TPUART_BCU_AUTORECONNECT   BCU self-heals (mute/desync) -- real stability
-  -D TPUART_RX_DRAIN_FAST       drain RX ring + threshold 1 (ETS app-download works)
-  -D TPUART_TX_FAST             higher IP->TP forward rate (no "queue full" under load)
-  -D TPUART_BCU_HEALTH          bcu Health/NCN-Err report (field diagnostics, on-demand)
-; -D TPUART_BCU_BACKSTOP        optional: lost-CON 60 s stall -> ~8 s (verified, RP-safe)
-  always-on (automatic): CON-rescue . task-stack 4096 . threshold 1 . RX-liveness re-arm
+  -D TPUART_NCN_TW_AUTORESET    optional: NCN thermal-warning auto-heal
+  built in (automatic): RX-drain . TX-fast . sticky-offset . auto-reconnect . backstop . health counters
+                        . CON-rescue . task-stack 4096 . threshold 1 . RX-liveness re-arm
 
 Debug / test only -- leave OFF in production
 ; -D TPUART_BCU_DEBUG           'bcu dis' hook + watchdog/CON diagnostic traces
 ; -D TPUART_RX_TIMEOUT_DEBUG    print each RX search-buffer timeout mark
 ```
 
-Build markers (`TPUart.cpp`): an always-on line confirms the local clone is in use
-(`==== TPUart: LOCAL lib/TPUart clone in use ====`); each active feature flag prints a
-`>>> TPUart: <NAME> = ON <<<` line so the build log states the exact configuration.
+Build markers (`TPUart.cpp`): only the still-optional switches print a `>>> TPUart: <NAME> = ON <<<`
+line (currently `TPUART_BCU_DEBUG`) so the build log states which opt-in features are compiled.

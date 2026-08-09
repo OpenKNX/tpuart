@@ -65,7 +65,6 @@ namespace TPUart
         _txFrames += increment;
     }
 
-#ifdef TPUART_BCU_HEALTH
     void Statistics::incrementBcuResets(int increment /* = 1 */)
     {
         _bcuResets += increment;
@@ -105,7 +104,6 @@ namespace TPUart
     {
         _bcuProtocolErrors += increment;
     }
-#endif
 
     void Statistics::incrementRxFrames(int increment /* = 1 */)
     {
@@ -217,7 +215,6 @@ namespace TPUart
         return _rxUartOverflow;
     }
 
-#ifdef TPUART_BCU_HEALTH
     unsigned int Statistics::getBcuResets()
     {
         return _bcuResets;
@@ -257,7 +254,6 @@ namespace TPUart
     {
         return _bcuProtocolErrors;
     }
-#endif
 
     unsigned int Statistics::getBusLoad()
     {

@@ -32,7 +32,6 @@ namespace TPUart
                 {
                     switch (event.type)
                     {
-#ifdef TPUART_RX_DRAIN_FAST
                         case UART_FIFO_OVF:
                         case UART_BUFFER_FULL:
                             _interface->_overflow = true;
@@ -50,32 +49,14 @@ namespace TPUart
                             }
                             break;
                         }
-#else
-                        case UART_DATA:
-                            if (_interface->_callback) _interface->_callback();
-                            break;
-
-                        case UART_FIFO_OVF:
-                            _interface->_overflow = true;
-                            break;
-
-                        case UART_BUFFER_FULL:
-                            _interface->_overflow = true;
-                            break;
-#endif
                         default:
 
                             break;
                     }
                 }
-#ifdef TPUART_RX_DRAIN_FAST
-                // xQueueReceive(portMAX_DELAY) already blocks when idle; yield once per drained
-                // event so this high-prio RX task cannot starve the main-loop TX pump / lwIP,
-                // without the old per-byte 1-tick throughput ceiling of vTaskDelay(1).
+                // xQueueReceive(portMAX_DELAY) already blocks when idle; yield once per drained event so this
+                // high-prio RX task cannot starve the main-loop TX pump / lwIP (no per-byte vTaskDelay ceiling).
                 taskYIELD();
-#else
-                vTaskDelay(1);
-#endif
             }
         }
 
@@ -94,19 +75,12 @@ namespace TPUart
             // UART-Konfiguration anwenden
             uart_param_config(_uart, &uart_config);
             uart_set_pin(_uart, _tx, _rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-#ifdef TPUART_RX_DRAIN_FAST
             uart_driver_install(_uart, 1024, 1024, 64, &_taskQueue, 0);
-            // Threshold MUST stay 1: a KNX L_ACK is a SINGLE byte that connection-oriented transport (ETS
-            // app programming) needs delivered promptly. A high threshold (e.g. 80) holds that lone byte
-            // until the rx-timeout -> blows the per-telegram ACK window -> app download fails ("connection
-            // closed by remote device"), and even GA reads get sluggish. The throughput/misparse win comes
-            // from the drain-whole-ring loop above + the larger ring, NOT from coalescing wakeups.
-            // A/B-confirmed: threshold 80 breaks programming, threshold 1 works (perf unchanged).
+            // Threshold MUST stay 1: a KNX L_ACK is a single byte that connection-oriented transport (ETS app
+            // programming) needs delivered promptly; a high threshold holds it until the rx-timeout and blows
+            // the per-telegram ACK window (A/B-confirmed: 80 breaks programming, 1 works). The throughput win
+            // comes from the drain-whole-ring loop above + the larger ring, not from coalescing wakeups.
             uart_set_rx_full_threshold(_uart, 1);
-#else
-            uart_driver_install(_uart, 512, 512, 32, &_taskQueue, 0);
-            uart_set_rx_full_threshold(_uart, 1);
-#endif
             _running = true;
 
             if (_uart == UART_NUM_1) xTaskCreate(&ESP32::runTask, "uart_task1", TPUART_ESP32_TASK_STACK_SIZE, this, configMAX_PRIORITIES / 5 * 4, &_taskHandle);

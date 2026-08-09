@@ -218,12 +218,9 @@ namespace TPUart
 
         if (!sufficientlyBytes()) return;
 
-#ifdef TPUART_BCU_AUTORECONNECT
-        // Load-bearing for auto-reconnect: honour a reset indication UNCONDITIONALLY, before
-        // the _invalid sweep below. Otherwise a desynced/dribbling NCN keeps _invalid latched and the
-        // chip's U_RESET_IND (the only path back to BCU_CONNECTED) is discarded forever -> the BCU never
-        // reconnects. U_RESET_IND is a single unambiguous control byte, so bypassing the invalid-gate
-        // for it is safe and guarantees the U_RESET_REQ -> U_RESET_IND handshake always completes.
+        // Honour a reset indication UNCONDITIONALLY, before the _invalid sweep below: otherwise a desynced
+        // NCN keeps _invalid latched and its U_RESET_IND (the only path back to BCU_CONNECTED) is discarded
+        // forever. U_RESET_IND is a single unambiguous control byte, so bypassing the invalid-gate is safe.
         if (_searchBuffer.get(0) == U_RESET_IND)
         {
             _dll.receivedReset(); // sets _uReset + clears _invalid + BCU_CONNECTED
@@ -234,7 +231,6 @@ namespace TPUart
             processSearchBuffer(); // continue with any trailing bytes
             return;
         }
-#endif
 
         processSearchBufferAcknowledge();
         if (_searchBuffer.empty()) return;
