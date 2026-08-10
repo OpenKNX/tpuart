@@ -21,7 +21,8 @@ namespace TPUart
         uint32_t _lastBackstopReset = 0; // throttles repeated backstop fast-resets (a persistent echo-loss fault degrades to the 60s cap)
 
       public:
-        std::queue<Frame *> _queue;
+        std::queue<Frame *> _queue[4];
+        size_t _txCount = 0;
         Transmitter(DataLinkLayer &dll);
         ~Transmitter();
 

@@ -7,6 +7,11 @@ namespace TPUart
     const size_t MAX_QUEUE_SIZE = 50;
     const unsigned short MAX_WAIT_TIME = 60000;
 
+#ifndef TP_TX_PRIO_RESERVE
+#define TP_TX_PRIO_RESERVE 6 // slots kept free of low-priority frames so a higher-priority frame (console/
+                             // management telegram) is never starved by a bulk low-priority upload burst
+#endif
+
     /**
      * @brief Constructs a new Transmitter object.
      *
@@ -70,7 +75,7 @@ namespace TPUart
     {
         if (_state != TX_IDLE) return;
         if (_dll._receiver._invalid) return;
-        if (_queue.empty()) return;
+        if (_txCount == 0) return;
 
         if (_frame != nullptr)
         {
@@ -80,8 +85,12 @@ namespace TPUart
             _lastOffset = 0; // reset the mirror with _transmitPos: U_L_DataStart.req of the next frame resets the chip's offset (DS p.49)
         }
 
-        _frame = _queue.front();
-        _queue.pop();
+        // pick the highest-priority non-empty bucket; _txCount>0 guarantees one exists in [0..3]
+        unsigned char r = 0;
+        while (r < 3 && _queue[r].empty()) ++r;
+        _frame = _queue[r].front();
+        _queue[r].pop();
+        --_txCount;
         _dll._statistics.incrementTxFrames();
 
         // Fallback if the frame is too big - Filtered on DLL, too
@@ -282,9 +291,16 @@ namespace TPUart
      */
     bool Transmitter::pushQueue(Frame *frame)
     {
-        if (_queue.size() >= _maxQueueSize) return false;
+        const unsigned char r = frame->priorityRank();
+        // low priority (rank 3) is bounded below the cap so TP_TX_PRIO_RESERVE slots stay available for a
+        // higher-priority frame; system/urgent/normal may use the full cap.
+        const size_t limit = (r == 3)
+                                 ? (_maxQueueSize > TP_TX_PRIO_RESERVE ? _maxQueueSize - TP_TX_PRIO_RESERVE : 0)
+                                 : _maxQueueSize;
+        if (_txCount >= limit) return false;
 
-        _queue.push(frame);
+        _queue[r].push(frame);
+        ++_txCount;
         return true;
     }
 
@@ -309,7 +325,7 @@ namespace TPUart
      */
     size_t Transmitter::queueSize()
     {
-        return _queue.size();
+        return _txCount;
     }
 
     /**
@@ -324,11 +340,13 @@ namespace TPUart
     void Transmitter::reset()
     {
         _dll.txLock(true);
-        while (!_queue.empty())
-        {
-            delete _queue.front();
-            _queue.pop();
-        }
+        for (unsigned char r = 0; r < 4; ++r)
+            while (!_queue[r].empty())
+            {
+                delete _queue[r].front();
+                _queue[r].pop();
+            }
+        _txCount = 0;
 
         if (_frame != nullptr)
         {

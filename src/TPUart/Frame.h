@@ -160,6 +160,12 @@ namespace TPUart
             return !(_data[0] & 0b100000);
         }
 
+        unsigned char priorityRank()
+        {
+            static const unsigned char rank[4] = {0, 2, 1, 3}; // idx = [system, normal, urgent, low]
+            return rank[(_data[0] >> 2) & 0x03];
+        }
+
         bool isFiltered()
         {
             return _flags & TP_FRAME_FLAG_FILTERED;
