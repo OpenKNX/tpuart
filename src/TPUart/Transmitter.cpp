@@ -74,6 +74,7 @@ namespace TPUart
     void Transmitter::processQueue()
     {
         if (_state != TX_IDLE) return;
+        if (_dll.isMonitoring()) return;
         if (_dll._receiver._invalid) return;
         if (_txCount == 0) return;
 
