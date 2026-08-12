@@ -83,14 +83,14 @@ namespace TPUart
             const unsigned short s = size();
             for (unsigned short i = 0; i < s; i++)
             {
-                crc ^= (_data[i] << 8);
+                crc ^= ((unsigned char)_data[i] << 8);
                 for (int j = 0; j < 8; j++)
                     if (crc & 0x8000)
                         crc = (crc << 1) ^ polynomial;
                     else
                         crc <<= 1;
             }
-            return ((_data[s] << 8) + _data[s + 1]) == crc;
+            return (((unsigned char)_data[s] << 8) + (unsigned char)_data[s + 1]) == crc;
         }
 
         bool checkCRC16SPI()
@@ -102,14 +102,14 @@ namespace TPUart
             const unsigned short s = size();
             for (unsigned short i = 0; i < s; i++)
             {
-                crc ^= (_data[i] << 8);
+                crc ^= ((unsigned char)_data[i] << 8);
                 for (int j = 0; j < 8; j++)
                     if (crc & 0x8000)
                         crc = (crc << 1) ^ polynomial;
                     else
                         crc <<= 1;
             }
-            return ((_data[s] << 8) + _data[s + 1]) == crc;
+            return (((unsigned char)_data[s] << 8) + (unsigned char)_data[s + 1]) == crc;
         }
 
         const char *data()
@@ -124,7 +124,7 @@ namespace TPUart
 
         unsigned short destination()
         {
-            return isExtended() ? (_data[4] << 8) + _data[5] : (_data[3] << 8) + _data[4];
+            return isExtended() ? ((unsigned char)_data[4] << 8) + (unsigned char)_data[5] : ((unsigned char)_data[3] << 8) + (unsigned char)_data[4];
         }
 
         unsigned short flags()
@@ -186,7 +186,7 @@ namespace TPUart
 
         unsigned short source()
         {
-            return isExtended() ? (_data[2] << 8) + _data[3] : (_data[1] << 8) + _data[2];
+            return isExtended() ? ((unsigned char)_data[2] << 8) + (unsigned char)_data[3] : ((unsigned char)_data[1] << 8) + (unsigned char)_data[2];
         }
 
         unsigned short apduSize()
@@ -373,7 +373,7 @@ namespace TPUart
             for (size_t i = 0; i < size(); i++)
             {
                 if (i) result.push_back(' ');
-                std::sprintf(hexStr, "%02X", _data[i]);
+                std::sprintf(hexStr, "%02X", (unsigned char)_data[i]);
                 result.append(hexStr);
             }
             result.append(" ) [");
