@@ -22,6 +22,7 @@ namespace TPUart
         if (_state != state) _dirty = true;
 
         _state = state;
+        _seen = true;
     }
 
     /*
@@ -146,6 +147,11 @@ namespace TPUart
         bool dirty = _dirty;
         _dirty = false;
         return dirty;
+    }
+
+    bool SystemState::seen()
+    {
+        return _seen;
     }
 
 } // namespace TPUart

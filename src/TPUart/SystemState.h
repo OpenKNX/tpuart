@@ -8,6 +8,7 @@ namespace TPUart
       private:
         volatile char _state = 0;
         volatile bool _dirty = false;
+        volatile bool _seen = false; // set once any state reply has been parsed (never on a non-NCN chip)
 
       public:
         bool v20v();
@@ -26,6 +27,7 @@ namespace TPUart
 
         void update(char state);
         bool dirty();
+        bool seen(); // has any system-state reply been parsed? (false on non-NCN chips -> no VBUS telemetry)
     };
 
 } // namespace TPUart

@@ -192,6 +192,10 @@ namespace TPUart
         int getBaudrate();
         bool isMonitoring() const;
         bool isConnected() const;
+        // "Is the KNX bus actually usable?" for the tunnel connectionstate heartbeat: host<->chip link up AND,
+        // on an NCN, the bus-voltage (VBUS) bit set. isConnected() alone misses bus-power loss on an
+        // externally-powered NCN (the chip keeps answering while the bus is dead).
+        bool busOperational();
 
         volatile uint _statsDurationMax = 0;
         volatile uint _statsDurationMin = 0;

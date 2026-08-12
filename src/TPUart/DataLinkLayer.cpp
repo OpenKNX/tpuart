@@ -1026,6 +1026,14 @@ namespace TPUart
         return _bcuState == BCU_CONNECTED;
     }
 
+    bool DataLinkLayer::busOperational()
+    {
+        if (_bcuState == BCU_BUSMONITOR) return true; // busmon: chip passive, but the bus itself is fine
+        if (_bcuState != BCU_CONNECTED) return false; // uninitialised / disconnected: chip mute (link or bus power gone)
+        if (!_systemState.seen()) return true;        // no VBUS telemetry (non-NCN, or before the first reply) -> trust the link
+        return _systemState.vbus();                   // NCN: report the real KNX bus-voltage state
+    }
+
     void DataLinkLayer::receivedState(char state)
     {
         _lastValidRx = millis(); // valid protocol RX (1Hz state-probe reply) -> liveness for auto-reconnect
