@@ -187,7 +187,9 @@ namespace TPUart
         while (_rxFrameBufferEntries && (TPUART_MAX_RXQUEUE_TIME_PER_LOOP == 0 || run < TPUART_MAX_RXQUEUE_TIME_PER_LOOP))
         {
             rxLock(true);
-            const uint16_t bufferSize = _rxFrameBuffer.pop() + (_rxFrameBuffer.pop() << 8);
+            const uint8_t bsLo = (uint8_t)_rxFrameBuffer.pop();
+            const uint8_t bsHi = (uint8_t)_rxFrameBuffer.pop();
+            const uint16_t bufferSize = (uint16_t)(bsLo | (bsHi << 8));
             const uint16_t frameSize = bufferSize - 3;
 
             // Bound what was a VLA (char frameData[frameSize]): the producer (pushRxFrameBuffer) never pushes
@@ -934,7 +936,7 @@ namespace TPUart
         while (_receiver._discardedBytes.size())
         {
             char hexBuffer[4];
-            sprintf(hexBuffer, " %02X", _receiver._discardedBytes.pop());
+            sprintf(hexBuffer, " %02X", (uint8_t)_receiver._discardedBytes.pop());
             buffer += hexBuffer;
         }
 
