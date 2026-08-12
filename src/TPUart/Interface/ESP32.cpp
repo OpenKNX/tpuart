@@ -129,8 +129,8 @@ namespace TPUart
         int ESP32::read()
         {
             if (!available()) return -1;
-            char c;
-            return uart_read_bytes(_uart, (uint8_t *)&c, 1, pdMS_TO_TICKS(1)) == 1 ? c : -1;
+            uint8_t c;
+            return uart_read_bytes(_uart, &c, 1, pdMS_TO_TICKS(1)) == 1 ? (int)c : -1;
         }
 
         bool ESP32::overflow()
