@@ -427,7 +427,7 @@ namespace TPUart
 
     void Receiver::processControlBytes()
     {
-        const char value = _searchBuffer.get(0);
+        const uint8_t value = (uint8_t)_searchBuffer.get(0);
         uint8_t count = 1;
         // _dll.printMessage("processControlBytes %02X", value);
 
