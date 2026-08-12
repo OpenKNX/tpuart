@@ -7,7 +7,7 @@
 #define SYSTEM_STATE_XTAL 0x08
 #define SYSTEM_STATE_TW 0x04
 #define SYSTEM_STATE_MODE 0x03
-#define SYSTEM_STATE_MODE_NORMAL 0x33
+//#define SYSTEM_STATE_MODE_NORMAL 0x33 ??
 #define SYSTEM_STATE_MODE_STOP 0x02
 #define SYSTEM_STATE_MODE_SYNC 0x01
 #define SYSTEM_STATE_MODE_POWERUP 0x00
@@ -123,7 +123,7 @@ namespace TPUart
      */
     bool SystemState::normalMode()
     {
-        return mode() == SYSTEM_STATE_MODE_NORMAL;
+        return mode() == SYSTEM_STATE_MODE; // Normal
     }
 
     bool SystemState::stopMode()
