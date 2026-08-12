@@ -47,6 +47,21 @@ namespace TPUart
             }
             _dll.rxUnlock();
         }
+        if (_state == RX_FRAME_WAIT_ACKN
+            && _dll.isMonitoring()
+            && millis() - _lastReceivedTime >= TPUART_RX_TIMEOUT)
+        {
+            _dll.rxLock(true);
+            if (_state == RX_FRAME_WAIT_ACKN
+                && _dll.isMonitoring()
+                && !_dll._interface->available()
+                && millis() - _lastReceivedTime >= TPUART_RX_TIMEOUT)
+            {
+                if (!_searchBuffer.timeout()) _searchBuffer.timeout(_searchBuffer.position());
+                processSearchBufferTimeout();
+            }
+            _dll.rxUnlock();
+        }
     }
 
     /*
