@@ -2,6 +2,10 @@
 #include "TPUart/Transmitter.h"
 #include "TPUart/DataLinkLayer.h"
 
+#ifdef OPENKNX_CON_DIAG
+uint16_t g_txSent = 0; // frames handed to TX_TRANSMIT (con diag)
+#endif
+
 namespace TPUart
 {
     const size_t MAX_QUEUE_SIZE = 50;
@@ -103,6 +107,9 @@ namespace TPUart
         }
 
         asm volatile("" ::: "memory");
+#ifdef OPENKNX_CON_DIAG
+        g_txSent++;
+#endif
         _state = TX_TRANSMIT;
     }
 

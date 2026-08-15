@@ -6,6 +6,11 @@
 #define TPUART_RX_TIMEOUT 5
 #endif
 
+#ifdef OPENKNX_CON_DIAG
+// L_Data.con-generation diagnostics (counters dumped by the IP tunnel server). Gated by OPENKNX_CON_DIAG.
+uint16_t g_rxTxWaitAckn = 0, g_rxTxCompleted = 0, g_txAwaitEcho = 0, g_echoMismatch = 0, g_echoTxIdle = 0;
+#endif
+
 namespace TPUart
 {
     Receiver::Receiver(DataLinkLayer &dll) : _dll(dll)
@@ -179,6 +184,9 @@ namespace TPUart
     {
         if (_state == RX_FRAME_COMPLETE || _state == RX_FRAME_WAIT_ACKN)
         {
+#ifdef OPENKNX_CON_DIAG
+            if (_searchBuffer.frame().isTransmitted()) g_rxTxCompleted++;
+#endif
             // ESP32 read-time-vs-arrival-time misparse can lose the trailing L_DATA_CON of our OWN
             // transmitted frame's bus-echo (here: a timeout-forced completion from processSearchBuffer-
             // Timeout, or an unrecognized acknowledge byte in processSearchBufferAcknowledge), stranding
@@ -310,13 +318,23 @@ namespace TPUart
             // _dll.printMessage("    DST ADDRESS %s", frame.humanDestination().c_str());
             if (_dll.getTransmitter().awaitResponse())
             {
+#ifdef OPENKNX_CON_DIAG
+                g_txAwaitEcho++; // echo parsed while we await our own TX's confirm
+#endif
                 // _dll.printMessage("      awaitResponse %i", _searchBuffer.position());
                 if (!((frame.data(0) ^ _dll.getTransmitter().currentFrame()->data(0)) & ~0x20) && frame.destination() == _dll.getTransmitter().currentFrame()->destination() && frame.source() == _dll.getTransmitter().currentFrame()->source())
                 {
                     frame.setTransmitted();
                     // _dll.getTransmitter().resetWatchdogTimer();
                 }
+#ifdef OPENKNX_CON_DIAG
+                else g_echoMismatch++; // awaiting confirm but control/dest/source mismatch
+#endif
             }
+#ifdef OPENKNX_CON_DIAG
+            else if (_dll.getTransmitter().currentFrame() != nullptr && !((frame.data(0) ^ _dll.getTransmitter().currentFrame()->data(0)) & ~0x20) && frame.destination() == _dll.getTransmitter().currentFrame()->destination() && frame.source() == _dll.getTransmitter().currentFrame()->source())
+                g_echoTxIdle++; // matches last-TX content but transmitter not awaiting -> a con would be missed here
+#endif
 
             if (!_dll.isMonitoring())
             {
@@ -364,6 +382,9 @@ namespace TPUart
                 // Wait for a DATA_CON or ACKN
                 if (_dll.isMonitoring() || frame.isTransmitted())
                 {
+#ifdef OPENKNX_CON_DIAG
+                    if (frame.isTransmitted()) g_rxTxWaitAckn++;
+#endif
                     _awaitBytes = _awaitBytes + 1; // warte auf noch ein byte welches hoffentlich ein ACKN oder DATA_CON ist
                     _state = RX_FRAME_WAIT_ACKN;
                     return;

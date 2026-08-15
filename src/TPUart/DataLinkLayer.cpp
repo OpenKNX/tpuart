@@ -16,6 +16,10 @@
 #define TPUART_TW_RELAPSE_MS 8000 // TW still set this long after the reset => genuinely hot, not a latch
 #endif
 
+#ifdef OPENKNX_CON_DIAG
+uint16_t g_rxTxDropped = 0; // isTransmitted frame lost to rx-frame-buffer overflow (con diag)
+#endif
+
 namespace TPUart
 {
     SystemState &DataLinkLayer::getSystemState()
@@ -250,6 +254,9 @@ namespace TPUart
         {
             _rxFrameBufferOverflow = true;
             _statistics.incrementRxFrameBufferOverflow();
+#ifdef OPENKNX_CON_DIAG
+            if (frame.isTransmitted()) g_rxTxDropped++;
+#endif
             return;
         }
 
