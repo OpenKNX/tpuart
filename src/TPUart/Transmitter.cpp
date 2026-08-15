@@ -1,311 +1,427 @@
-#pragma GCC optimize("O3")
 #include "TPUart/Transmitter.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+#include <Arduino.h>
+
 #include "TPUart/DataLinkLayer.h"
+#include "TPUart/Interface/Abstract.h"
+#include "TPUart/Statistics.h"
 
 namespace TPUart
 {
-    const size_t MAX_QUEUE_SIZE = 50;
-    const unsigned short MAX_WAIT_TIME = 60000;
 
-    /**
-     * @brief Constructs a new Transmitter object.
-     *
-     * @param dll Reference to a DataLinkLayer object.
-     *
-     * This constructor initializes the Transmitter object with the provided
-     * DataLinkLayer reference. It also sets the initial values for
-     * _cachedAcknowledge, _awaitResponse, and _time to 0.
-     */
-    Transmitter::Transmitter(DataLinkLayer &dll) : _dll(dll)
+static_assert(TPUART_TX_QUEUE_COUNT >= 1, "TPUART_TX_QUEUE_COUNT muss mindestens einen Platz haben");
+
+
+Transmitter::Transmitter(DataLinkLayer &dll) : _dll(dll) {}
+
+// Gibt her, was noch in der Warteschlange liegt. Im Regelfall läuft das nie - der DataLinkLayer ist
+// üblicherweise ein globales Objekt - aber ein Heap-Halter ohne Destruktor ist eine Falle für jeden, der ihn
+// doch einmal lokal anlegt.
+Transmitter::~Transmitter()
+{
+    for (uint32_t i = _queueFree; i != _queueHead; i++)
+        free(_queue[i % TPUART_TX_QUEUE_COUNT]._data);
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Zeitkritische Seite - läuft später aus einem Timer-Interrupt
+// ---------------------------------------------------------------------------------------------------
+
+// Der einzige Schreibzugriff auf die Schnittstelle in dieser Klasse - siehe Header. Zählt mit, damit
+// Statistics::getTxBytes() die Auslastung der Hostleitung wirklich vollständig abbildet.
+bool Transmitter::writeByte(uint8_t value)
+{
+    if (!_dll._interface->write((char)value)) return false;
+
+    _dll._statistics.incrementTxBytes();
+    return true;
+}
+
+// Sendet eine Steuersequenz oder ein Telegramm. Steuercodes haben Vorrang: sie sind kurz, zeitnah
+// erwartet und dürfen sich laut Protokoll zwischen zwei Telegrammbytes schieben (jedes Telegrammbyte
+// trägt sein eigenes Positionsbyte). Pro Tick geht höchstens eines von beidem raus.
+void Transmitter::process()
+{
+    // Liegt ein Steuercode an, gehört ihm dieser Tick - auch wenn er gerade noch nicht abgesetzt werden
+    // konnte. Der Telegrammpfad muss dann warten, sonst belegt er den Platz, auf den der Steuercode wartet.
+    if (processCtrlQueue()) return;
+
+    // Das Telegramm ist raus, es fehlt die Bestätigung der BCU. Sie kommt als L_Data.con und wird im
+    // Empfangspfad ausgewertet (Receiver::processControlByte) - hier bleibt nur die Notbremse, damit ein
+    // ausbleibendes L_Data.con den Sendeweg nicht für immer belegt.
+    if (_state == TxState::Await)
     {
-        _cachedAcknowledge = 0;
-        _state = TX_IDLE;
-        _transmitPos = 0;
-        _transmitOffset = 0;
-        _time = 0;
-        _maxQueueSize = MAX_QUEUE_SIZE;
+        if ((uint32_t)(millis() - _awaitSince) < TPUART_TX_CONFIRM_TIMEOUT_MS) return;
+
+        // Keine Bestätigung. Was im Sendepuffer der BCU noch liegt, ist damit unbekannt - der einzige Weg
+        // zu einem definierten Zustand ist der Reset. Der Zustand bleibt vorerst Await; wieder aufgenommen
+        // wird der Versand von der U_Reset.ind aus, und die kommt hierauf genauso wie auf jeden anderen
+        // Reset. Bleibt auch sie aus, läuft diese Frist erneut ab und der Reset geht noch einmal raus -
+        // gegen eine stumme BCU gibt es nichts Besseres als weiter zu versuchen.
+        if (_dll._interface->availableForWrite() < 1) return;
+        if (!writeByte(U_RESET_REQ)) return;
+
+        _dll._statistics.incrementTxControlBytes();
+        _awaitSince = millis();
+        _confirmTimeout = true; // gemeldet wird das aus loop(), hier darf nichts nach außen
+
+        // Wie bei jedem abgesetzten Steuercode: der DataLinkLayer leitet daraus den Chip-Zustand ab (der
+        // Reset beendet den Busmonitor und macht eine laufende Empfangssequenz unlesbar).
+        _dll.controlByteSent(U_RESET_REQ);
+        return;
     }
 
-    /**
-     * @brief Destructor for the Transmitter class.
-     *
-     * This destructor is responsible for cleaning up the resources
-     * allocated by the Transmitter instance. Specifically, it checks
-     * if the _frame pointer is not null and deletes the allocated memory
-     * to prevent memory leaks.
-     */
-    Transmitter::~Transmitter()
+    // Sendeweg frei? Dann das nächste Telegramm aus der Warteschlange holen. Ist keines da, gibt es nichts
+    // zu tun - das ist der Normalfall und der häufigste Pfad hier.
+    if (_state == TxState::Idle && !startNextTransmission()) return;
+
+    bool last = (_bufferPos == _frameSize - 1); // das letzte Byte ist die Prüfsumme
+    uint8_t offset = (uint8_t)(_bufferPos >> 6);
+
+    // Ob das Offset-Byte mit muss, entscheidet sich VOR der Platzprüfung - und das ist der Unterschied
+    // zwischen 3 und 2 verlangten Bytes. Gebraucht wird es bei einem 263-Oktett-Telegramm fünfmal, bei
+    // allen übrigen 258 Positionen nicht.
+    //
+    // WARUM DAS MESSBAR IST: der Ring unter uns fasst vier Bytes und leert sich mit 286µs je Byte. Wer
+    // pauschal drei freie Bytes verlangt, darf nur schreiben, solange höchstens EINES belegt ist - und
+    // muss einen Tick aussetzen, sobald zwei drinstehen. Bei 500µs Takt kostete das gemessene 19ms je
+    // Telegramm (143ms statt 124ms); auf Kern 1 mit 84000 Ticks/s fiel es nicht auf, weil dort der
+    // nächste Versuch sofort kam. Verlangt wird jetzt, was wirklich gebraucht wird.
+    //
+    // An der Unteilbarkeit ändert das nichts: die zwei bzw. drei Bytes gehören weiterhin zusammen und
+    // werden erst geschrieben, wenn sie vollständig passen.
+    bool needsOffset = _dll.bcuType() == BcuType::Ncn5120 && (!_chipOffsetValid || offset != _chipOffset);
+    size_t needed = needsOffset ? 3 : 2;
+
+    if (_dll._interface->availableForWrite() < needed) return;
+
+    // NUR beim NCN512x, siehe needsOffset oben. Der TPUART2 kennt den Dienst nicht - seine Servicetabelle
+    // (docs/Siemens_TPUART.pdf, S. 21) geht von U_L_DataContinue (Index 1...62) direkt zu U_L_DataEnd (Länge 7...63),
+    // der Opcode 0x08 ist dort nicht vergeben und wäre ein unbekanntes Steuerbyte. Gebraucht wird er dort
+    // auch nie: mehr als 64 Oktette kann der Chip ohnehin nicht senden, der Index bleibt also unter 64.
+    if (needsOffset)
     {
-        reset();
+        writeByte((uint8_t)(U_L_DATA_OFFSET_REQ | offset));
+        _chipOffset = offset;
+        _chipOffsetValid = true;
     }
 
-    /**
-     * @brief Finalizes the transmitter by setting the _awaitResponse flag to false.
-     *
-     * This function is used to indicate that the transmitter should no longer
-     * await a response. It is typically called when the transmission process
-     * is complete.
-     */
-    void Transmitter::finalize()
+    writeByte((uint8_t)((last ? U_L_DATA_END_REQ : U_L_DATA_START_REQ) | (_bufferPos & U_L_DATA_POSITION_MASK)));
+    writeByte(_buffer[_bufferPos]);
+
+    _bufferPos++;
+
+    if (!last) return;
+
+    // Mit dem U_L_DataEnd.req beginnt der Chip die Übertragung auf den Bus.
+    _dll._statistics.incrementTxFrames();
+    _awaitSince = millis();
+    _state = TxState::Await;
+}
+
+// Aus dem Tick. Kopiert das nächste Telegramm in den Sendepuffer. Der Heap-Block wird hier NICHT
+// freigegeben - free() gehört nicht in einen Interrupt; das erledigt releaseSentTelegrams() aus loop().
+bool Transmitter::startNextTransmission()
+{
+    // Im Busmonitor ist der Chip transparent und sendet nichts - dort darf nichts angefangen werden.
+    // sendFrame() lehnt in diesem Modus schon ab, aber ein Telegramm, das VOR dem Umschalten eingereiht
+    // wurde, läge sonst hier und ginge trotzdem raus. Es bleibt in der Warteschlange und wartet, bis der
+    // Busmonitor per Reset verlassen wird.
+    if (_dll.isBusMonitor()) return false;
+
+    if (_queueTail == _queueHead) return false;
+
+    const Entry &entry = _queue[_queueTail % TPUART_TX_QUEUE_COUNT];
+
+    // Kann im geordneten Betrieb nicht vorkommen (sendFrame() prüft beim Einstellen). Bleibt stehen, weil
+    // ein Nullzeiger oder eine überlange Länge hier sonst über den Sendepuffer hinausschreiben würde.
+    if (entry._data == nullptr || entry._length == 0 || entry._length > TPUART_BUFFER_SIZE)
     {
-        if (_state == TX_AWAIT) _state = TX_IDLE;
+        _queueTail = _queueTail + 1;
+        return false;
     }
 
-    /**
-     * @brief Processes the transmission queue.
-     *
-     * This function checks several conditions before processing the transmission queue:
-     * - If a response is awaited, the function returns immediately.
-     * - If the queue is empty, the function returns immediately.
-     * - If the receiver is in an invalid state, the function returns immediately.
-     *
-     * If a frame is currently being processed, it is deleted. The next frame in the queue is then
-     * retrieved and the transmission statistics are updated.
-     *
-     * If the chip type is TPUart2 and the frame size exceeds 64 bytes, the function returns immediately.
-     *
-     * Finally, the frame is transmitted.
-     */
-    void Transmitter::processQueue()
+    _frameSize = entry._length;
+    for (size_t i = 0; i < _frameSize; i++)
+        _buffer[i] = entry._data[i];
+
+    _queueTail = _queueTail + 1; // ab hier darf der Hauptkontext den Block freigeben
+
+    beginTransmission();
+    return true;
+}
+
+// Der Anfang einer Übertragung, für beide Fälle: ein frisch geholtes Telegramm und eines, das nach einem
+// Reset von vorn beginnt. Identisch, weil der Sendepuffer in beiden Fällen derselbe ist - nur der Fortschritt
+// darin geht auf null, und der Offset im Chip gilt als unbekannt.
+void Transmitter::beginTransmission()
+{
+    _bufferPos = 0;
+    _chipOffsetValid = false;
+    _state = TxState::Transmit;
+}
+
+// Setzt höchstens eine vollständige Steuersequenz ab. Die Gruppe geht immer ungeteilt raus - deshalb wird
+// vorab geprüft, ob das Interface sie komplett annehmen kann. Ein Zerteilen würde die BCU die Reste als
+// eigenständigen Befehl deuten lassen.
+//
+// Der Rückgabewert heißt "der Sendeweg gehört in diesem Tick den Steuercodes" - true also auch dann, wenn
+// die Gruppe noch nicht passt. Sonst wäre der Vorrang nur die halbe Miete: der Telegrammpfad greift sich
+// drei Bytes, sobald drei frei sind, und im 4-Byte-Ring der RP2040 würden dann nie vier Bytes am Stück
+// frei. Eine viergliedrige Gruppe (U_SetAddress.req, U_SetRepetition.req) käme während eines laufenden
+// Telegramms überhaupt nicht mehr durch. Lässt der Telegrammpfad stattdessen aus, läuft der Ring in den
+// nächsten Ticks leer und die Gruppe geht raus - Vorrang bedeutet also auch, Platz zu machen.
+bool Transmitter::processCtrlQueue()
+{
+    if (_ctrlQueueTail == _ctrlQueueHead) return false;
+
+    uint32_t tail = _ctrlQueueTail;
+    size_t length = _ctrlQueue[tail % TPUART_CTRL_QUEUE_SIZE];
+
+    // Kann im geordneten Betrieb nicht vorkommen (queueControl() prüft beim Einstellen). Bleibt stehen,
+    // damit ein einzelner korrupter Eintrag nicht in eine Endlosschleife über Datenmüll führt.
+    if (length == 0 || length > TPUART_CTRL_MAX_GROUP)
     {
-        if (_state != TX_IDLE) return;
-        if (_dll._receiver._invalid) return;
-        if (_queue.empty()) return;
-
-        if (_frame != nullptr)
-        {
-            delete _frame;
-            _frame = nullptr;
-            _transmitPos = 0;
-            _transmitOffset = 0;
-        }
-
-        _frame = _queue.front();
-        _queue.pop();
-        _dll._statistics.incrementTxFrames();
-
-        // Fallback if the frame is too big - Filtered on DLL, too
-        if (_dll._bcuType == BCU_TPUART2 && _frame->size() > 64)
-        {
-            delete _frame;
-            _frame = nullptr;
-            return;
-        }
-
-        asm volatile("" ::: "memory");
-        _state = TX_TRANSMIT;
+        // Gemeldet wird das als Verlust von Steuercodes - was es auch ist, wenn auch aus anderem Grund als
+        // ein voller Ring. Genauer geht es von hier aus nicht: der Tick darf nichts ausgeben.
+        _ctrlQueueTail = _ctrlQueueHead;
+        _dll.reportControlOverflow();
+        return false;
     }
 
-    /**
-     * @brief Processes the expiration of a waiting response.
-     *
-     * This function checks if the transmitter is awaiting a response and if the
-     * waiting time has exceeded a specified timeout (60 seconds). If the response
-     * wait time has expired, reset the BCU.
-     */
-    void Transmitter::processWatchdog()
-    {
-        if (_state != TX_AWAIT) return;
-        // _last could be updated in parallel, so it must be temporarily stored
-        const uint32_t time = _time;
-        if (millis() - time < 60000) return;
+    // Noch kein Platz für die ganze Gruppe: nichts halb absetzen, aber den Sendeweg für diesen Tick auch
+    // nicht freigeben (siehe oben).
+    if (_dll._interface->availableForWrite() < length) return true;
 
-        _dll.printError("Watchdog: Transmitter did not get confirm.");
-        _dll.reset();
+    tail++;
+    uint8_t code = _ctrlQueue[tail % TPUART_CTRL_QUEUE_SIZE];
+
+    for (size_t i = 0; i < length; i++)
+        writeByte(_ctrlQueue[tail++ % TPUART_CTRL_QUEUE_SIZE]);
+
+    _ctrlQueueTail = tail;
+    _dll._statistics.incrementTxControlBytes((uint32_t)length);
+
+    // Erst jetzt gilt der Chip als umgeschaltet - vorher hätten wir einen Zustand angenommen, in dem er
+    // noch gar nicht war. Abgeleitet aus dem tatsächlich gesendeten Code statt aus einem separaten
+    // Wunsch-Feld: ein solches Feld wäre Nutzlast und müsste vor der Veröffentlichung geschrieben werden -
+    // genau diese Reihenfolge war einmal falsch, mit dem Ergebnis, dass Chip-Zustand und Busmonitor-Flag
+    // dauerhaft auseinanderliefen.
+    _dll.controlByteSent(code);
+
+    return true;
+}
+
+// Aus dem Empfangspfad und damit aus dem Tick. Entschieden hat der Receiver, hier geht das Byte nur noch
+// raus - der TxState bleibt unberührt, ein Acknowledge ist kein Telegrammversand.
+bool Transmitter::sendAcknowledge(AckType acknowledge)
+{
+    if (_dll._interface->availableForWrite() < 1) return false; // kein Platz - lieber nicht acken als blockieren
+
+    if (!writeByte((uint8_t)(U_ACKN_REQ | (uint8_t)acknowledge))) return false;
+
+    _dll._statistics.incrementAcknowledgesSent();
+    return true;
+}
+
+// Nur im Wartezustand von Belang: während der Übergabe läuft die Frist ohnehin noch nicht, und wenn sie
+// nicht läuft, gibt es nichts aufzuschieben.
+void Transmitter::echoReceived()
+{
+    if (_state != TxState::Await) return;
+
+    _awaitSince = millis();
+}
+
+void Transmitter::confirmed()
+{
+    if (_state != TxState::Await) return;
+
+    _state = TxState::Idle;
+}
+
+void Transmitter::restart()
+{
+    if (_state == TxState::Idle) return; // nichts unterwegs - dann gibt es auch nichts zu wiederholen
+
+    beginTransmission();
+}
+
+// Verglichen wird das VOLLSTÄNDIGE Telegramm - eine Prefix-Fassung für den halb eingelaufenen Fall gab es
+// einmal, sie wurde aber nur von der Acknowledge-Entscheidung gebraucht, und die kommt ohne aus (siehe
+// Receiver::sendAcknowledge).
+//
+// Zwei Bytes bleiben beim Vergleich außen vor, und beide aus demselben Grund: die BCU löscht beim
+// Wiederholen das Wiederholungs-Bit im Kontrollbyte. Das wird deshalb maskiert verglichen, und die
+// Prüfsumme am Ende gar nicht - sie hängt an eben diesem Byte.
+bool Transmitter::isEcho(const uint8_t *data, size_t length) const
+{
+    if (_state == TxState::Idle) return false;
+    if (length != _frameSize) return false;
+    if (((data[0] ^ _buffer[0]) & (uint8_t)~0x20) != 0) return false;
+
+    return memcmp(data + 1, _buffer + 1, length - 2) == 0;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Gemütliche Seite - läuft aus dem Hauptloop
+// ---------------------------------------------------------------------------------------------------
+
+// Ein Produzent, ein Konsument (tick()), Kopf zuletzt sichtbar gemacht - dieselbe Regel wie bei den anderen
+// beiden Ringen, damit der Tick nie einen halben Eintrag sieht.
+bool Transmitter::sendFrame(const uint8_t *data, size_t length)
+{
+    // Jede Ablehnung nennt ihren Grund selbst. Der Aufrufer bekommt nur ein bool und kann ihn deshalb
+    // nicht kennen - eine geratene Begründung in der Anwendung ist schlimmer als gar keine.
+    if (!_dll.isConnected())
+    {
+        _dll.printError("Send rejected: no connection");
+        return false;
     }
 
-    /*
-     * Each frame must be initiated with a U_L_DATA_START_REQ and each subsequent byte with another position byte (6 bits).
-     * Since the position byte consists of the U_L_DATA_START_REQ + position and we start with 0 anyway, no further
-     * distinction is necessary.
-     *
-     * However, the last byte (checksum) uses the U_L_DATA_END_REQ + position!
-     * Additionally, there is another peculiarity with extended frames that can be up to 263 bytes long, where 6 bits are no longer sufficient.
-     * Here, a U_L_DATA_OFFSET_REQ + position (3 bits) must be prefixed. Thus, 9 bits are available for the position.
-     */
-
-    void Transmitter::processTransmitByte()
+    if (_dll.isBusMonitor()) // dort ist der Chip transparent und sendet nichts
     {
-        if (_state != TX_TRANSMIT) return;
-        // if (!_awaitResponse) return;
-        if (!_dll.txLock()) return;
-        // Double check
-        if (_state != TX_TRANSMIT) return;
-
-        const unsigned short size = _frame->size();
-        // if (_transmitPos >= size)
-        // {
-        //     _dll.txUnlock();
-        //     return;
-        // }
-
-        // _dll.printMessage("Transmitting %u of %u", _transmitPos, size);
-        const bool last = _transmitPos == (size - 1);
-        const unsigned char offset = (_transmitPos >> 6);
-        const unsigned char position = (_transmitPos & 0x3F);
-
-        // The BCU keeps the offset until it is changed, so resend it only when it changes.
-        if (offset != _transmitOffset)
-        {
-            _dll._interface->write(U_L_DATA_OFFSET_REQ | offset);
-            _transmitOffset = offset;
-        }
-
-        if (last) // Last byte (Checksum) - the transmit
-        {
-            _dll._interface->write(U_L_DATA_END_REQ | position);
-        }
-        else
-        {
-            _dll._interface->write(U_L_DATA_START_REQ | position);
-        }
-
-        _dll._interface->write(_frame->data(_transmitPos));
-        if (last)
-        {
-            resetWatchdogTimer();
-            _state = TX_AWAIT;
-        }
-
-        _transmitPos++;
-        _dll.txUnlock();
-
-        sendCachedAcknowledge();
+        _dll.printError("Send rejected: bus monitor active");
+        return false;
     }
 
-    /**
-     * @brief Adds a frame to the transmission queue.
-     *
-     * This function attempts to add a frame to the transmission queue. If the queue
-     * has reached its maximum size, the frame will not be added and the function
-     * will return false.
-     *
-     * @param frame Pointer to the Frame object to be added to the queue.
-     * @return true if the frame was successfully added to the queue, false if the queue is full.
-     */
-    bool Transmitter::pushQueue(Frame *frame)
+    // Ein Telegramm hat mindestens 7 Nutzoktette (Standard: Control, Quelle, Ziel, Länge, TPCI), und mit
+    // der angehängten Prüfsumme muss es in den Puffer passen.
+    if (length < 7 || length + 1 > TPUART_BUFFER_SIZE)
     {
-        if (_queue.size() >= _maxQueueSize) return false;
-
-        _queue.push(frame);
-        return true;
+        _dll.printError("Send rejected: length %u out of range (7..%u)", (unsigned)length, (unsigned)(TPUART_BUFFER_SIZE - 1));
+        return false;
     }
 
-    /**
-     * @brief Checks if the transmitter is awaiting a response.
-     *
-     * This function returns the status of the transmitter's response waiting state.
-     *
-     * @return true if the transmitter is awaiting a response, false otherwise.
-     */
-    bool Transmitter::awaitResponse()
+    // Der TPUART2 kann nur 63 Nutzoktette plus Prüfsumme - dieselbe Grenze wie in der alten Library, und
+    // sie steckt in seiner Servicetabelle (docs/Siemens_TPUART.pdf, S. 21): U_L_DataContinue geht bis 0xBE, also
+    // Index 62, und U_L_DataEnd bis 0x7F, also Länge 63. Damit sind die Datenoktette 0...62 (das sind 63)
+    // und die Prüfsumme auf Index 63 - zusammen 64 Oktette. Beim NCN512x verschiebt U_L_DataOffset.req
+    // dieses Fenster, dort sind es bis zu 263.
+    if (_dll.bcuType() == BcuType::Tpuart2 && length + 1 > 64)
     {
-        return _state == TX_AWAIT;
+        _dll.printError("Send rejected: TPUART2 takes at most 63 byte plus checksum");
+        return false;
     }
 
-    /**
-     * @brief Returns the current size of the queue.
-     *
-     * This function retrieves the number of elements currently stored in the queue.
-     *
-     * @return size_t The number of elements in the queue.
-     */
-    size_t Transmitter::queueSize()
+    // Abgeholte, aber noch nicht freigegebene Plätze zuerst einsammeln - sonst gälte die Warteschlange als
+    // voll, obwohl der Tick längst weitergekommen ist.
+    releaseSentTelegrams();
+
+    if (_queueHead - _queueFree >= TPUART_TX_QUEUE_COUNT)
     {
-        return _queue.size();
+        _dll._statistics.incrementTxQueueOverflows();
+        _dll.printError("Send rejected: queue full (%u telegrams)", (unsigned)TPUART_TX_QUEUE_COUNT);
+        return false;
     }
 
-    /**
-     * @brief Resets the Transmitter by clearing the message queue and resetting the state.
-     *
-     * This function performs the following actions:
-     * - Empties the message queue and deletes each message.
-     * - Resets the _awaitResponse flag to false.
-     * - Ensures memory barriers are respected using inline assembly.
-     * - Deletes the current frame if it exists.
-     */
-    void Transmitter::reset()
+    // malloc statt new: kein Exception-Handling nötig, der Fehlerfall ist ein sauberes nullptr. Das ist die
+    // einzige Heap-Nutzung der Library, und sie liegt bewusst hier - Telegramme sind unterschiedlich groß,
+    // eine Anzahl-Grenze wie in der alten Library wäre statisch nur mit vielfachem Speicher zu haben.
+    uint8_t *buffer = (uint8_t *)malloc(length + 1);
+    if (buffer == nullptr)
     {
-        _dll.txLock(true);
-        while (!_queue.empty())
-        {
-            delete _queue.front();
-            _queue.pop();
-        }
-
-        if (_frame != nullptr)
-        {
-            delete _frame;
-            _frame = nullptr;
-            _transmitPos = 0;
-            _transmitOffset = 0;
-        }
-
-        _state = TX_IDLE;
-        resetWatchdogTimer();
-        _dll.txUnlock();
+        _dll._statistics.incrementTxQueueOverflows();
+        _dll.printError("Send rejected: out of memory (%u byte)", (unsigned)(length + 1));
+        return false;
     }
 
-    /**
-     * @brief Sends an acknowledge message.
-     *
-     * This function sends an acknowledge message of the specified type. If the
-     * transmitter lock is acquired successfully, the acknowledge message is sent
-     * immediately. Otherwise, the acknowledge message is cached for later
-     * transmission.
-     *
-     * @param acknowledge The type of acknowledge message to send.
-     */
-    void Transmitter::sendAcknowledge(AcknowledgeType acknowledge)
+    uint8_t crc = 0;
+    for (size_t i = 0; i < length; i++)
     {
-        if (_dll.txLock())
-        {
-            _dll._interface->write(U_ACK_REQ | acknowledge);
-            _dll.txUnlock();
-        }
-        else
-        {
-            _cachedAcknowledge = U_ACK_REQ | acknowledge;
-        }
+        buffer[i] = data[i];
+        crc ^= data[i];
     }
 
-    void Transmitter::sendCachedAcknowledge()
-    {
-        if (!_cachedAcknowledge) return;
+    buffer[length] = (uint8_t)~crc; // dieselbe CRC-8/GSM-A wie beim Empfang
 
-        if (_dll.txLock())
-        {
-            _dll._interface->write(_cachedAcknowledge);
-            _cachedAcknowledge = 0;
-            _dll.txUnlock();
-        }
+    Entry &entry = _queue[_queueHead % TPUART_TX_QUEUE_COUNT];
+    entry._data = buffer;
+    entry._length = (uint16_t)(length + 1);
+
+    _queueHead = _queueHead + 1; // erst jetzt ist der Eintrag für den Tick sichtbar
+    return true;
+}
+
+// Aus dem Hauptkontext. Gibt frei, was der Tick inzwischen abgeholt hat. Erst damit werden die Plätze
+// wieder verfügbar - deshalb rechnet die Belegungsprüfung in sendFrame() gegen _queueFree.
+void Transmitter::releaseSentTelegrams()
+{
+    while (_queueFree != _queueTail)
+    {
+        Entry &entry = _queue[_queueFree % TPUART_TX_QUEUE_COUNT];
+
+        free(entry._data);
+        entry._data = nullptr;
+        entry._length = 0;
+
+        _queueFree++;
+    }
+}
+
+bool Transmitter::queueControl(uint8_t code)
+{
+    return queueControl(&code, 1);
+}
+
+// Stellt eine Steuersequenz in die Warteschlange. Anders als früher wird NICHT abgelehnt, solange gerade
+// gesendet wird: Steuercodes sind kein Telegrammversand und müssen auch dann durchkommen. Genau deshalb
+// haben sie eine eigene Warteschlange und belegen keinen TxState mehr.
+bool Transmitter::queueControl(const uint8_t *codes, size_t length)
+{
+    if (!_dll.isConnected()) return false; // vorher regelt die Verbindungsaufnahme den Chip
+    if (length == 0 || length > TPUART_CTRL_MAX_GROUP) return false;
+
+    uint32_t needed = (uint32_t)(1 + length);
+    uint32_t used = _ctrlQueueHead - _ctrlQueueTail;
+
+    if (TPUART_CTRL_QUEUE_SIZE - used < needed)
+    {
+        _dll.reportControlOverflow();
+        return false;
     }
 
-    /**
-     * @brief Sets the maximum size of the queue.
-     *
-     * This function sets the maximum number of elements that the queue can hold.
-     *
-     * @param size The maximum number of elements for the queue.
-     */
-    void Transmitter::setQueueSize(unsigned long size)
-    {
-        _maxQueueSize = size;
-    }
+    // Ein Produzent (dieser Kontext), ein Konsument (tick()). Der Kopf wird als ALLERLETZTES weitergesetzt,
+    // damit der Tick nie eine halb geschriebene Sequenz sieht. Keine Sperre nötig, keine Besitzübergabe.
+    uint32_t head = _ctrlQueueHead;
+    _ctrlQueue[head++ % TPUART_CTRL_QUEUE_SIZE] = (uint8_t)length;
 
-    Frame *Transmitter::currentFrame()
-    {
-        return _frame;
-    }
+    for (size_t i = 0; i < length; i++)
+        _ctrlQueue[head++ % TPUART_CTRL_QUEUE_SIZE] = codes[i];
 
-    bool Transmitter::isTransmitting()
-    {
-        return _state == TX_TRANSMIT;
-    }
+    _ctrlQueueHead = head;
+    return true;
+}
 
-    void Transmitter::resetWatchdogTimer()
-    {
-        _time = millis();
-    }
+TxState Transmitter::state() const
+{
+    return _state;
+}
+
+bool Transmitter::isTransmitting() const
+{
+    return _state != TxState::Idle;
+}
+
+uint32_t Transmitter::queueUsed() const
+{
+    return _queueHead - _queueFree;
+}
+
+uint32_t Transmitter::queueSize() const
+{
+    return TPUART_TX_QUEUE_COUNT;
+}
+
+bool Transmitter::confirmTimeout()
+{
+    if (!_confirmTimeout) return false;
+
+    _confirmTimeout = false;
+    return true;
+}
 
 } // namespace TPUart

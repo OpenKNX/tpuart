@@ -1,361 +1,154 @@
 #pragma once
-#include "TPUart/Types.h"
-#include <cstddef>
-#include <cstdlib>
-#include <cstring>
-// #ifdef TPUART_PRINT
+#include <stddef.h>
+#include <stdint.h>
+
 #include <string>
-// #endif
 
-// DLL services (device is transparent)
-#define L_DATA_STANDARD_IND 0x90
-#define L_DATA_EXTENDED_IND 0x10
-#define L_DATA_MASK 0xD3
-
-// Means that the frame is transmitted
-#define TP_FRAME_FLAG_TX 0b10000000
-
-// Means that the frame is answered with L_DATA_CON if success the TP_FRAME_FLAG_ACK is also set
-#define TP_FRAME_FLAG_DATA_CON 0b01000000
-
-// Means that the frame should be filtered by the device
-#define TP_FRAME_FLAG_FILTERED 0b00100000
-
-// // Means that the frame comes from the device itself
-// #define TP_FRAME_FLAG_ECHO 0b00010000
-
-// Means that the frame is processed by this device
-#define TP_FRAME_FLAG_ADDRESSED 0b00001000
-
-// Means that the frame has been acked with BUSY
-#define TP_FRAME_FLAG_ACK_BUSY 0b00000100
-
-// Means that the frame has been acked with NACK
-#define TP_FRAME_FLAG_ACK_NACK 0b00000010
-
-// Means that the frame has been acked
-#define TP_FRAME_FLAG_ACK 0b00000001
+#include "TPUart/Types.h"
 
 namespace TPUart
 {
-    class Frame
-    {
-      private:
-        const char *_data;
-        char _flags = 0;
-        bool _deleteData = false;
 
-      public:
-        Frame(const char *data) : _data(data) {}
-        Frame(const char *data, unsigned short size)
-        {
-            _deleteData = true;
-            _data = (const char *)malloc(size);
-            memcpy((char *)_data, data, size);
-        }
-        Frame(const char *data, bool deleteData) : _data(data), _deleteData(deleteData) {}
+// Übernommen aus Frame.h der alten Library - das ist die API, mit der der übrige KNX-Stack arbeitet.
+// Methodennamen und Semantik sind deshalb bewusst unverändert. Abweichungen gegenüber dem Original:
+//
+//  - DAS FRAME BESITZT SEINE DATEN, aber ohne Heap. Man sagt beim Anlegen, wie viele Zeichen gebraucht
+//    werden, und schreibt hinein - der Speicher steckt im Objekt. Die alte Klasse besaß ihn auch, nur per
+//    malloc und mit einem _deleteData-Flag; ohne Kopierkonstruktor hätte eine Kopie denselben Zeiger
+//    doppelt freigegeben. Hier gibt es weder Zeiger noch Freigabe: gefahrlos kopierbar, und eine Kopie
+//    behält ihre Daten auch, wenn das Original längst weg ist.
+//
+//    Der Preis ist die feste Größe (TPUART_BUFFER_SIZE): ein Frame ist immer so groß wie das größtmögliche
+//    Telegramm, egal wie kurz das echte ist. Angelegt wird es dort, wo es hingehört - auf dem STACK des
+//    Verbrauchers, für die Dauer eines Durchlaufs. Genau deshalb nicht auf dem Heap: der Empfangsweg würde
+//    sonst im Bustakt allozieren und freigeben, dauerhaft, neben den längerlebigen Blöcken der Sendeseite.
+//    Wer ein Frame aufheben will, kopiert es und weiß, was es kostet.
+//  - uint8_t statt char. Ob char vorzeichenbehaftet ist, ist implementierungsabhängig; mit uint8_t hängt
+//    keine Adress- oder Längenberechnung mehr daran.
+//  - Die tatsächlich empfangene Länge wird mitgeführt (length()). Nötig, weil eine Pause ein Telegramm
+//    vorzeitig beenden kann - size() sagt dann, wie lang es laut Kopf sein SOLLTE, length() wie viel
+//    wirklich ankam. Alle Zugriffe sind gegen length() abgesichert, damit ein abgeschnittenes Frame nicht
+//    über den Puffer hinaus liest.
+//  - isValid() liest das INVALID-Flag, statt die CRC8 jedes Mal neu zu rechnen: der Receiver bildet die
+//    Prüfsumme bereits inkrementell beim Einlesen und kennt zusätzlich die Fälle, die eine Neuberechnung
+//    gar nicht erkennen könnte (abgeschnitten, Längenbyte korrupt). calcCRC8() gibt es weiterhin, wer
+//    selbst nachrechnen will.
+//  - Nicht übernommen: checkCRC16CCITT()/checkCRC16SPI() - Extended-CRC ist eine bewusste Entscheidung
+//    gegen den Dienst, nicht eine offene Baustelle (Begründung in AGENTS.md) - sowie
+//    awaitDestination()/awaitSize(), reine Parser-Hilfen des alten Receivers, die der Receiver hier
+//    selbst erledigt. cemiSize()/cemiData() standen ebenfalls auf dieser Liste und sind zurück: der
+//    knx-Stack braucht sie, samt der Eigenheit mit dem malloc-Puffer (siehe unten).
+class Frame
+{
+  private:
+    uint8_t _data[TPUART_BUFFER_SIZE];
+    size_t _length; // tatsächlich empfangene Bytes - kann kleiner als size() sein
+    uint8_t _flags;
 
-        ~Frame()
-        {
-            if (_deleteData) free((char *)_data);
-        }
+    // Jeder Zugriff läuft hierüber: bei einem abgeschnittenen Frame liegen die hinteren Positionen gar
+    // nicht vor, und ohne diese Grenze würden destination() & Co. Datenmüll hinter dem Telegramm lesen.
+    uint8_t at(size_t pos) const;
 
-        // Frame(const Frame &other)
-        // {
-        //     const char *newData = (const char *)malloc(other.size());
-        //     // memcpy((char *)newData, (const char  *)*other._data, other.size());
-        // }
+  public:
+    // Legt ein Frame der gewünschten Länge an; der Inhalt wird anschließend über buffer() geschrieben.
+    // Länge über TPUART_BUFFER_SIZE wird gekappt - mehr kann kein gültiges Telegramm haben.
+    explicit Frame(size_t length, uint8_t flags = 0);
 
-        void addFlags(char flags)
-        {
-            _flags |= flags;
-        }
+    // Legt ein Frame an und KOPIERT die Daten hinein.
+    Frame(const uint8_t *data, size_t length, uint8_t flags = 0);
 
-        bool checkCRC16CCITT()
-        {
-            unsigned short crc = 0xFFFF;
-            unsigned short polynomial = 0x1021;
+    // KOMPAT: Signatur der alten Library (char statt uint8_t, keine Flags). Dort kopierte dieser
+    // Konstruktor ebenfalls - er setzte _deleteData und gab im Destruktor wieder frei.
+    Frame(const char *data, size_t length);
 
-            const unsigned short s = size();
-            for (unsigned short i = 0; i < s; i++)
-            {
-                crc ^= (_data[i] << 8);
-                for (int j = 0; j < 8; j++)
-                    if (crc & 0x8000)
-                        crc = (crc << 1) ^ polynomial;
-                    else
-                        crc <<= 1;
-            }
-            return ((_data[s] << 8) + _data[s + 1]) == crc;
-        }
+    // LESEZUGRIFF, und die Signatur ist die der alten Library: `const char *`, nicht `const uint8_t *`.
+    // Das ist keine Nachlässigkeit, sondern Pflicht - OFM-Network schreibt `const char *d = frame.data()`,
+    // und ein anderer Zeigertyp wäre dort ein Übersetzungsfehler. Über den Rückgabetyp lässt sich nicht
+    // überladen, deshalb heißt der Schreibzugriff buffer() und nicht ebenfalls data().
+    const char *data() const;
 
-        bool checkCRC16SPI()
-        {
-            // CRC-16/SPI-FUJITSU
-            unsigned short crc = 0x1D0F;
-            unsigned short polynomial = 0x1021;
+    uint8_t data(size_t pos) const;
 
-            const unsigned short s = size();
-            for (unsigned short i = 0; i < s; i++)
-            {
-                crc ^= (_data[i] << 8);
-                for (int j = 0; j < 8; j++)
-                    if (crc & 0x8000)
-                        crc = (crc << 1) ^ polynomial;
-                    else
-                        crc <<= 1;
-            }
-            return ((_data[s] << 8) + _data[s + 1]) == crc;
-        }
+    // Schreibzugriff auf den eigenen Speicher - für den, der das Frame befüllt. Es sind genau length()
+    // Bytes, mehr hat das Objekt nicht zugesagt.
+    uint8_t *buffer();
 
-        const char *data()
-        {
-            return _data;
-        }
+    // Wie viele Bytes tatsächlich empfangen wurden - nicht zu verwechseln mit size().
+    size_t length() const;
 
-        char data(unsigned short pos)
-        {
-            return _data[pos];
-        }
+    uint8_t flags() const;
+    void addFlags(uint8_t flags);
+    void resetFlags();
 
-        unsigned short destination()
-        {
-            return isExtended() ? (_data[4] << 8) + _data[5] : (_data[3] << 8) + _data[4];
-        }
+    bool isExtended() const;
+    bool isFrame() const;
 
-        unsigned short flags()
-        {
-            return _flags;
-        }
+    // Metadaten am Anfang des Frames plus die Prüfsumme am Ende.
+    uint8_t metadataSize() const;
 
-        /*
-         * Include the all metadata at the beginning of the frame and the checksum at the end.
-         */
-        unsigned char metadataSize()
-        {
-            return isExtended() ? 9 : 8;
-        }
+    uint8_t apduSize() const;
 
-        bool isExtended()
-        {
-            return (_data[0] & 0xD3) == 0x10;
-        }
+    // Gesamtlänge laut Kopf, inklusive Metadaten und APDU. Bei einem abgeschnittenen Frame größer als
+    // length() - dann ist das hier die Soll-, nicht die Ist-Länge.
+    uint16_t size() const;
 
-        bool isFrame()
-        {
-            return ((_data[0] & L_DATA_MASK) == L_DATA_STANDARD_IND || (_data[0] & L_DATA_MASK) == L_DATA_EXTENDED_IND);
-        }
+    // Die Übertragung wurde vorzeitig beendet (verifizierte Pause mitten im Frame).
+    bool isTruncated() const;
 
-        bool isGroupAddress()
-        {
-            return isExtended() ? (_data[1] >> 7) & 0b1 : (_data[5] >> 7) & 0b1;
-        }
+    uint16_t source() const;
+    uint16_t destination() const;
+    bool isGroupAddress() const;
+    bool isRepeated() const;
 
-        bool isRepeated()
-        {
-            return !(_data[0] & 0b100000);
-        }
+    // CRC-8/GSM-A: XOR über alles vor der Prüfsumme, invertiert.
+    uint8_t calcCRC8() const;
 
-        bool isFiltered()
-        {
-            return _flags & TP_FRAME_FLAG_FILTERED;
-        }
+    // Vom Receiver beim Einlesen entschieden, siehe Klassenkommentar.
+    bool isValid() const;
+    bool isInvalid() const;
 
-        void setFiltered()
-        {
-            _flags |= TP_FRAME_FLAG_FILTERED;
-        }
+    bool isFiltered() const;
+    void setFiltered();
 
-        /*
-         * Returns the total size of the frame, including the metadata and apdu.
-         */
-        unsigned short size()
-        {
-            return metadataSize() + apduSize();
-        }
+    bool isTransmitted() const;
+    void setTransmitted();
 
-        unsigned short source()
-        {
-            return isExtended() ? (_data[2] << 8) + _data[3] : (_data[1] << 8) + _data[2];
-        }
+    // Nur bei selbst gesendeten Telegrammen: die BCU hat den Versand bestätigt (L_Data.con).
+    bool isDataCon() const;
 
-        unsigned char apduSize()
-        {
-            return isExtended() ? (unsigned char)_data[6] : (unsigned char)(_data[5] & 0x0F);
-        }
+    // Wir haben dieses Frame selbst quittiert - im Unterschied zu einer bloß beobachteten Quittung.
+    bool isAddressed() const;
 
-        void resetFlags()
-        {
-            _flags = 0;
-        }
+    bool isAck() const;
+    bool isNack() const;
+    bool isBusy() const;
 
-        bool isValid(bool extended = false)
-        {
-            const unsigned short s = size() - 1;
-            return _data[s] == calcCRC8();
-        }
+    // WIR haben quittiert: setzt ADDRESSED zusammen mit ACK (+BUSY/NACK), identisch zur alten Library.
+    // ACK bedeutet durchgängig "dieses Telegramm wurde quittiert" - egal ob von uns, oder im Busmonitor
+    // auf dem Bus beobachtet, oder als Antwort auf ein selbst gesendetes Telegramm. ADDRESSED unterscheidet
+    // davon nur den ersten Fall.
+    void setAcknowledge(AckType acknowledge);
 
-        bool isAddressed()
-        {
-            return _flags & TP_FRAME_FLAG_ADDRESSED;
-        }
+    // Eine auf dem Bus BEOBACHTETE Quittung: ohne ADDRESSED, denn sie kam nicht von uns.
+    void setAcknowledge(bool busy, bool nack);
 
-        // CRC-8/GSM-A Poly
-        char calcCRC8()
-        {
-            char chksum = 0;
-            const unsigned short s = size() - 1;
-            for (unsigned short i = 0; i < s; i++)
-                chksum ^= _data[i];
-            return (char)~chksum;
-        }
+    // KOMPAT: die cEMI-Sicht auf das Telegramm, für die Schicht darüber (knx-Stack). Wie in der alten
+    // Library, inklusive ihrer Eigenheit: cemiData() liefert einen mit malloc angelegten Puffer, den DER
+    // AUFRUFER freigeben muss. Das ist der Grund, warum es als "nicht übernommen" begann - der Stack
+    // braucht es aber, also ist es zurück.
+    //
+    // Aufbau: cEMI erwartet Extended-Format mit zwei zusätzlichen Bytes am Anfang (0x29 = L_Data.ind,
+    // 0x00 = keine Zusatzinfo). Ein Standard-Telegramm wird dabei umsortiert, weil dort Länge und
+    // Hop-Count in einem Byte stecken. Die Prüfsumme fällt in beiden Fällen weg.
+    uint16_t cemiSize() const;
+    uint8_t *cemiData() const;
 
-        unsigned short awaitDestination()
-        {
-            // return isExtended() ? 6 : 5;
-            return 6; // Extended ist 6 und Standard ist 5, aber das isGroupFlag kommt 1 Byte später
-        }
+    // Die drei Textausgaben allozieren über std::string auf dem Heap - bewusst so aus der alten Library
+    // übernommen, damit die API identisch bleibt. Sie dürfen deshalb nur aus dem Hauptkontext gerufen
+    // werden, nie aus einem Interrupt.
+    std::string humanSource() const;
+    std::string humanDestination() const;
+    std::string printFrame() const;
+};
 
-        unsigned short awaitSize()
-        {
-            return isExtended() ? 7 : 6;
-        }
-
-        void setAcknowledge(AcknowledgeType acknowledge)
-        {
-            _flags &= ~(TP_FRAME_FLAG_ADDRESSED | TP_FRAME_FLAG_ACK | TP_FRAME_FLAG_ACK_BUSY | TP_FRAME_FLAG_ACK_NACK);
-
-            if (acknowledge == ACK_Addressed) _flags |= TP_FRAME_FLAG_ADDRESSED | TP_FRAME_FLAG_ACK;
-            if (acknowledge == ACK_Busy) _flags |= TP_FRAME_FLAG_ADDRESSED | TP_FRAME_FLAG_ACK | TP_FRAME_FLAG_ACK_BUSY;
-            if (acknowledge == ACK_Nack) _flags |= TP_FRAME_FLAG_ADDRESSED | TP_FRAME_FLAG_ACK | TP_FRAME_FLAG_ACK_NACK;
-        }
-
-        void setAcknowledge(bool busy = false, bool nack = false)
-        {
-            _flags |= TP_FRAME_FLAG_ACK;
-            if (busy) _flags |= TP_FRAME_FLAG_ACK_BUSY;
-            if (nack) _flags |= TP_FRAME_FLAG_ACK_NACK;
-        }
-
-        bool isInvalid()
-        {
-            return !isValid();
-        }
-
-        bool isAck()
-        {
-            return _flags & TP_FRAME_FLAG_ACK;
-        }
-
-        bool isNack()
-        {
-            return _flags & TP_FRAME_FLAG_ACK_NACK;
-        }
-
-        bool isBusy()
-        {
-            return _flags & TP_FRAME_FLAG_ACK_BUSY;
-        }
-
-        bool isTransmitted()
-        {
-            return _flags & TP_FRAME_FLAG_TX;
-        }
-
-        void setTransmitted()
-        {
-            _flags |= TP_FRAME_FLAG_TX;
-        }
-
-        /*
-         * Calculates the size of a CemiFrame. A CemiFrame has 2 additional bytes at the beginning.
-         * An additional byte is added to a standard frame, as this still has to be converted into an extendend.
-         */
-        unsigned short cemiSize()
-        {
-            return size() + (isExtended() ? 2 : 3) - 1; // -1 without CRC
-        }
-
-        /**
-         * Creates a buffer and converts the TPFrame into a CemiFrame.
-         * Important: After processing (i.e. also after using the CemiFrame), the reference must be released manually.
-         */
-        char *cemiData()
-        {
-            char *cemiBuffer = (char *)malloc(cemiSize());
-
-            // Das CEMI erwartet die Daten im Extended format inkl. zwei zusätzlicher Bytes am Anfang.
-            cemiBuffer[0] = 0x29;
-            cemiBuffer[1] = 0x0;
-            cemiBuffer[2] = _data[0];
-            if (isExtended())
-            {
-                memcpy(cemiBuffer + 2, _data, size() - 1); // -1 without CRC
-            }
-            else
-            {
-                cemiBuffer[3] = _data[5] & 0xF0;
-                memcpy(cemiBuffer + 4, _data + 1, 4);
-                cemiBuffer[8] = _data[5] & 0x0F;
-                memcpy(cemiBuffer + 9, _data + 6, cemiBuffer[8] + 2 - 1); // -1 without CRC
-            }
-
-            return cemiBuffer;
-        }
-
-        // #ifdef TPUART_PRINT
-        std::string humanSource()
-        {
-            unsigned short value = source();
-            char buffer[10];
-            sprintf(buffer, "%02i.%02i.%03i", (value >> 12 & 0b1111), (value >> 8 & 0b1111), (value & 0b11111111));
-            return buffer;
-        }
-
-        std::string humanDestination()
-        {
-            unsigned short value = destination();
-            char buffer[10];
-            if (isGroupAddress())
-                sprintf(buffer, "%02i/%02i/%03i", (value >> 11 & 0b11111), (value >> 8 & 0b111), (value & 0b11111111));
-            else
-                sprintf(buffer, "%02i.%02i.%03i", (value >> 12 & 0b1111), (value >> 8 & 0b1111), (value & 0b11111111));
-
-            return buffer;
-        }
-
-        std::string printFrame()
-        {
-            const unsigned short resultSize = (38 + 6 + (size() * 3));
-            std::string result;
-            result.reserve(resultSize);
-            result.append(humanSource());
-            result.append(" -> ");
-            result.append(humanDestination());
-            result.append(" [");
-            result.push_back(isTransmitted() ? 'T' : '_'); // Was transmitted by me
-            result.push_back(isAddressed() ? 'D' : '_');   // Was transmitted by me
-            result.push_back(isInvalid() ? 'I' : '_');     // Invalid
-            result.push_back(isExtended() ? 'E' : '_');    // Extended
-            result.push_back(isRepeated() ? 'R' : '_');    // Repeat
-            result.push_back(isFiltered() ? 'F' : '_');    // All ready received
-            result.push_back(isBusy() ? 'B' : '_');        // ACK + BUSY
-            result.push_back(isNack() ? 'N' : '_');        // ACK + NACK
-            result.push_back(isAck() ? 'A' : '_');         // ACK
-            result.append("] ( ");
-
-            char hexStr[3];
-            for (size_t i = 0; i < size(); i++)
-            {
-                if (i) result.push_back(' ');
-                std::sprintf(hexStr, "%02X", _data[i]);
-                result.append(hexStr);
-            }
-            result.append(" ) [");
-            result.append(std::to_string(size()));
-            result.append("]");
-            return result;
-        }
-        // #endif
-    };
-}; // namespace TPUart
+} // namespace TPUart

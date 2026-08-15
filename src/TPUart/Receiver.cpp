@@ -1,405 +1,703 @@
-// #pragma GCC optimize("O3")
 #include "TPUart/Receiver.h"
-#include "TPUart/DataLinkLayer.h"
 
-#ifndef TPUART_RX_TIMEOUT
-#define TPUART_RX_TIMEOUT 5
-#endif
+#include <string.h>
+
+#include <Arduino.h>
+
+#include "TPUart/DataLinkLayer.h"
+#include "TPUart/Interface/Abstract.h"
+#include "TPUart/Statistics.h"
+#include "TPUart/Transmitter.h"
 
 namespace TPUart
 {
-    Receiver::Receiver(DataLinkLayer &dll) : _dll(dll)
+
+// Jedes GÜLTIGE Frame passt in den Puffer: Standard = 8 + (Längen-Nibble, max 15) = 23,
+// Extended = 9 + (Längenbyte, max 254) = 263. Hier festgenagelt, damit ein Verkleinern des Puffers den
+// Build bricht statt still zu überlaufen. Ein Längenbyte von 255 ist reserviert und ergäbe 264 - dieser
+// Fall ist damit nicht abgedeckt, sondern wird zur Laufzeit als Fehler behandelt.
+static_assert(TPUART_BUFFER_SIZE >= 9 + 254, "TPUART_BUFFER_SIZE muss das größtmögliche gültige Extended-Frame fassen");
+
+// Ein einzelner Eintrag muss überhaupt in die Warteschlange passen, sonst käme nie etwas an.
+static_assert(TPUART_RX_QUEUE_SIZE > TPUART_BUFFER_SIZE + TPUART_RX_QUEUE_HEADER_SIZE, "TPUART_RX_QUEUE_SIZE muss mindestens ein größtmögliches Telegramm fassen");
+
+Receiver::Receiver(DataLinkLayer &dll) : _dll(dll) {}
+
+// ---------------------------------------------------------------------------------------------------
+// Zeitkritische Seite - läuft später aus einem Timer-Interrupt
+// ---------------------------------------------------------------------------------------------------
+
+void Receiver::process()
+{
+    if (!_dll._interface->available())
     {
+        checkPause();
+        return;
     }
 
-    void Receiver::process()
+    int value = _dll._interface->read();
+    if (value < 0)
     {
-        processTimeout();
+        checkPause();
+        return;
     }
 
-    /*
-     * Hier wird geprüft ob der SearchBuffer mit einem Timeout-Marker (Positionsangabe) hat.
-     * Gibt es einen solche Marker, wird geprüft, ob mehr Bytes erwartet werden als der Marker (Positionsangabe) erlaubt.
-     * Sollte das der Fall sein, wird das erste Zeichen verworfen und Marker um ein verschoben (processSearchBufferInvalid).
-     * Das wird solange wiederholt bis entweder der Marker nicht mehr vorhanden (0) ist oder die Anzahl der erwarteten Bytes kleiner ist als die Anzahl der Bytes im Buffer.
-     * Dadurch wird sicher gestellt, dass ein möglicherweise weiteres Frame im SearchBuffer nicht verloren geht.
-     */
-    void Receiver::processSearchBufferTimeout()
-    {
-        if (!_searchBuffer.timeout()) return;
-        if (_searchBuffer.timeout() >= _awaitBytes) return;
+    // Überlauf des Interfaces nur hier abfragen, nicht bei jedem Tick: entstehen kann er ausschließlich,
+    // während Daten fließen, und der Leerlaufpfad soll frei von Hardwarezugriffen bleiben. Eingesammelt
+    // wird er ausschließlich hier, damit der Hauptkontext das Interface nicht selbst anfassen muss - im
+    // Timer-Betrieb wäre das ein zweiter Zugriffskontext, und overflow() löscht beim RP2040 nebenbei das
+    // Hardware-Flag.
+    if (_dll._interface->overflow()) _dll.reportInterfaceOverflow();
 
-        if(_state == RX_FRAME_WAIT_ACKN)
-        {
-                _state = RX_FRAME_COMPLETE;
-                processCompleteFrame();
+    _dll._statistics.incrementRxReceivedBytes();
+
+    // Lebenszeichen der BCU. Jedes Byte zählt, nicht nur die Antwort auf eine Statusabfrage: reicht sie
+    // Bus-Verkehr durch, lebt sie offensichtlich.
+    _dll._lastReceivedAt = millis();
+
+    // Es fließen Daten - eine laufende Messung ist damit hinfällig.
+    _emptyStarted = false;
+
+    processByte((uint8_t)value);
+}
+
+// Wird nur aufgerufen, wenn das Interface aktuell nichts bereithält. Der Zeitpunkt der ersten solchen
+// Beobachtung wird festgehalten; erst wenn dieser Zustand TPUART_FRAME_WAIT_US lang ununterbrochen anhält,
+// ist es eine echte Pause auf dem Bus (und nicht bloß eine Lücke in unserer Abarbeitung).
+void Receiver::checkPause()
+{
+    // NICHTS IM GANGE, NICHTS ZU MESSEN. Eine Pause hat überhaupt nur dann eine Wirkung, wenn eine Sequenz
+    // offen ist: sie schließt ein angefangenes Telegramm ab, beendet einen Resync oder lässt eine
+    // ausbleibende Antwort auffliegen. Zwischen zwei Telegrammen steht die Maschine auf Idle, und dort gibt
+    // es nichts zu beenden - die Telegrammlänge kommt aus dem Längenbyte, nicht aus dem Timing.
+    //
+    // Das ist zugleich der billigste Leerlaufpfad, den es hier geben kann: auf einem ruhigen Bus ist Idle
+    // der Normalzustand, und ein Tick kostet dann einen Vergleich statt eines micros()-Zugriffs. Und es
+    // macht einen Merker "schon ausgelöst" überflüssig - handleVerifiedPause() endet in jedem Zweig bei
+    // Idle, kann also von hier aus kein zweites Mal erreicht werden.
+    if (_state == RxState::Idle) return;
+
+    uint32_t now = micros();
+
+    if (!_emptyStarted)
+    {
+        _emptyStarted = true;
+        _emptySince = now;
+        return;
+    }
+
+    // Ein fertiges Telegramm wartet noch auf seine Antwort - im Busmonitor die Quittung vom Bus, beim
+    // eigenen Versand das L_Data.con. Die trifft später ein, als die Telegrammgrenze erkennbar wäre,
+    // dieser Zustand bekommt deshalb die längere Frist.
+    uint32_t threshold = (_state == RxState::FrameAck) ? TPUART_FRAME_ACK_US : TPUART_FRAME_WAIT_US;
+
+    if ((uint32_t)(now - _emptySince) < threshold) return;
+
+    handleVerifiedPause();
+}
+
+// Eine verifizierte Pause ist eine echte Frame-Grenze - danach ist der Bytestrom in jedem Fall wieder
+// synchron. Sie beendet damit sowohl einen laufenden Resync als auch eine angebrochene Sequenz.
+//
+// JEDER ZWEIG ENDET IN IDLE, und genau daran hängt, dass checkPause() oben abkürzen darf: ein zweites Mal
+// ist von dort aus nicht zu erreichen. Der default-Zweig ist damit unerreichbar und bleibt nur als
+// Vollständigkeit stehen. Wer hier einen Zweig ergänzt, der NICHT in Idle endet, hebt diese Zusage auf.
+void Receiver::handleVerifiedPause()
+{
+    switch (_state)
+    {
+        // Das Frame wartete noch auf seine Antwort (Quittung im Busmonitor bzw. L_Data.con zum eigenen
+        // Versand). Beide kommen rund 15 Bitzeiten nach dem Frame und damit deutlich vor dieser Frist -
+        // bleiben sie bis hierher aus, gab es keine. Das Telegramm wird ohne Quittungs-Flags gemeldet.
+        // Der Sendeweg wird hier NICHT freigegeben: bei Wiederholungen kann die Bestätigung noch kommen,
+        // darum kümmert sich der Wachhund im Transmitter.
+        case RxState::FrameAck:
+            completeSequence(0, RxState::Idle);
+            return;
+
+        // Die Pause hat die Übertragung vorzeitig beendet: das Frame ist unvollständig und damit kaputt.
+        // Gemeldet wird trotzdem, was angekommen ist. Ein Resync ist danach NICHT nötig - die Pause ist
+        // genau die Grenze, die ein Resync erst suchen würde.
+        case RxState::Frame:
+        case RxState::Control:
+            completeSequence(TP_FRAME_FLAG_INVALID, RxState::Idle);
+            return;
+
+        // Ein Poll-Telegramm, das hier ankommt, ist in aller Regel NICHT abgeschnitten: der Chip reicht
+        // regulär nur das Steuerbyte durch, der Rest des Zyklus bleibt auf dem Bus (siehe
+        // L_POLL_DATA_IND). Genau dieser Fall darf nicht als Fehler gemeldet werden, sonst zählte jeder
+        // Poll-Umlauf als kaputtes Telegramm. Steht dagegen schon mehr im Puffer, lief der Zyklus zum Host
+        // und wurde unterwegs abgeschnitten - etwa weil ein Slot unbeantwortet blieb.
+        case RxState::Poll:
+            completeSequence(_bufferPos > 1 ? TP_FRAME_FLAG_INVALID : 0, RxState::Idle);
+            return;
+
+        // Das Ende des Resyncs. Die verworfenen Bytes werden nicht gemeldet.
+        case RxState::Resync:
+            resetSequence(RxState::Idle);
+            return;
+
+        default:
+            return;
+    }
+}
+
+void Receiver::processByte(uint8_t value)
+{
+    switch (_state)
+    {
+        // Position im Bytestrom unbekannt - alles verwerfen bis zur nächsten verifizierten Pause. Die
+        // Bytes werden nicht einmal gepuffert, sie interessieren niemanden mehr. Gezählt werden sie
+        // trotzdem: sie sind der Unterschied zwischen "kaputt, aber gemeldet" und "nie gesehen".
+        case RxState::Resync:
+            _dll._statistics.incrementRxDroppedBytes();
+            return;
+
+        case RxState::Control:
+            _buffer[1] = value;
+            _bufferPos = 2;
+            completeSequence(0, RxState::Idle);
+            return;
+
+        // Erwartet wird die Antwort zum fertigen Telegramm. Sie landet NICHT im Telegramm - das Frame
+        // bleibt unangetastet, die Antwort wird über die Flags mitgegeben.
+        case RxState::FrameAck:
+            // Busmonitor: die Quittung vom Bus (Figure 35).
+            if (_dll.isBusMonitor() && (value & L_ACKN_MASK) == L_ACKN_IND)
+            {
+                // Beide Bit-Paare sind invertiert zu lesen: gesetzte Maskenbits heißen "nicht busy"/"nicht nack".
+                bool nack = !(value & L_ACKN_NACK_MASK);
+                bool busy = !(value & L_ACKN_BUSY_MASK);
+                _flags |= acknowledgeFlags(nack ? AckType::Nack : (busy ? AckType::Busy : AckType::Addressed));
+
+                completeSequence(0, RxState::Idle);
                 return;
-        }
-        processSearchBufferInvalid(4);
-    }
-
-    /*
-     * Diese Funktion prüft ob im SearchBuffer Daten vorhanden sind aber keine neuen Daten im Empfangspuffer des Interaces.
-     * Wenn das der Fall ist, wird die aktuell Position im SearchBuffer markiert.
-     */
-    void Receiver::processTimeout()
-    {
-        // Vorprüfung: Damit nicht unnötig ein lock geholt wird (Sortiert nach Rechenaufwand)
-        if (_searchBuffer.timeout() == _searchBuffer.position()) return;
-        if (_dll._interface->available()) return;
-        if (millis() - _lastReceivedTime < TPUART_RX_TIMEOUT) return;
-
-        _dll.rxLock(true);
-        size_t timeout = 0;
-        // Wiederholung der Vorprüfung
-        if (_searchBuffer.timeout() != _searchBuffer.position() && !_dll._interface->available() && millis() - _lastReceivedTime >= TPUART_RX_TIMEOUT)
-        {
-            timeout = _searchBuffer.position();
-            _searchBuffer.timeout(timeout);
-        }
-        _dll.rxUnlock();
-
-#ifdef TPUART_RX_TIMEOUT_DEBUG
-        if (timeout) _dll.printError("TIMEOUT: %u %u", millis() - _lastReceivedTime, timeout);
-#endif
-    }
-
-    /*
-     * Liest die Daten aus dem Interface aus, packt es in den SearchBuffer und startet die Verarbeitung.
-     */
-    bool Receiver::processReceviedByte()
-    {
-        if (!_dll.rxLock()) return false;
-        if (_dll._interface->overflow())
-        {
-            _invalid = true;
-            _dll._rxInterfaceOverflow = true;
-            _dll._statistics.incrementRxUartOverflow();
-        }
-        const int value = _dll._interface->read();
-
-        if (value != -1)
-        {
-            _lastReceivedTime = millis();
-
-            const uint start = micros();
-            _dll._statistics.incrementRxReceivedBytes();
-            pushSearchBuffer(value);
-            uint duration = micros() - start;
-            _dll._statsDuration += duration;
-            _dll._statsDurationCount = _dll._statsDurationCount + 1;
-            if (duration > _dll._statsDurationMax) _dll._statsDurationMax = duration;
-            if (duration < _dll._statsDurationMin) _dll._statsDurationMin = duration;
-        }
-
-        _dll.rxUnlock();
-        return true;
-    }
-
-    /*
-     * Wird bei jedem neuen Byte aufgerufen falls ein Frame noch auf ein Acknowledge wartet.
-     * Sollte ein L_DATA_CON oder L_ACKN_IND empfangen werden, wird das Frame als bestätigt markiert.
-     * Anschließend wird das Frame abgeschlossen und in den FrameBuffer geschrieben (auch wenn kein Ack gekommen ist).
-     */
-    void Receiver::processSearchBufferAcknowledge()
-    {
-        if (_state != RX_FRAME_WAIT_ACKN) return;
-
-        const char value = _searchBuffer.get(_awaitBytes - 1);
-
-        bool acknowledge = false;
-        if ((value & L_DATA_CON_MASK) == L_DATA_CON)
-        {
-            if ((value ^ L_DATA_CON_MASK) >> 7)
-            {
-                _searchBuffer.frame().setAcknowledge();
-            }
-            acknowledge = true;
-            _dll.getTransmitter().finalize();
-        }
-        else if ((value & L_ACKN_MASK) == L_ACKN_IND)
-        {
-            const bool isBusy = !(value & L_ACKN_BUSY_MASK);
-            const bool isNack = !(value & L_ACKN_NACK_MASK);
-            _searchBuffer.frame().setAcknowledge(isBusy, isNack);
-            acknowledge = true;
-        }
-
-        processCompleteFrame(acknowledge);
-    }
-
-    void Receiver::processCompleteFrame(bool acknowledge)
-    {
-        if (_state == RX_FRAME_COMPLETE || _state == RX_FRAME_WAIT_ACKN)
-        {
-            unsigned short size = _searchBuffer.frame().size();
-            if (!_dll.isMonitoring() && _dll._modeExtendedCRC) size += 2;
-            if (acknowledge) size++; // Es hängt noch ein ACKN oder DATA_CON dran
-            _dll.pushRxFrameBuffer(_searchBuffer.frame());
-            _searchBuffer.frame().resetFlags();
-
-            _dll._statistics.incrementRxFrameBytes(_searchBuffer.frame().size());
-            // _dll._statistics.incrementRxControlBytes(size - _searchBuffer.frame().size());
-            _dll._statistics.incrementRxFrames();
-
-            _searchBuffer.move(size);
-            _awaitBytes = 1;
-            _state = RX_IDLE;
-
-            // Wenn der buffer leer ist, kann auch das invalid flag zurückgesetzt werden
-            //_dll.printError("FV! %u %u %u", _dll._interface->available(), _searchBuffer.position(), _awaitBytes);
-            if (!_dll._interface->available())
-            {
-                if (_searchBuffer.empty())
-                {
-                    _invalid = false;
-                }
-            }
-        }
-        else
-        {
-            if (_searchBuffer.position()) processSearchBufferInvalid(1);
-        }
-    }
-
-    void Receiver::processSearchBuffer()
-    {
-        if (_searchBuffer.empty()) return;
-        processSearchBufferTimeout();
-
-        if (!sufficientlyBytes()) return;
-
-        processSearchBufferAcknowledge();
-        if (_searchBuffer.empty()) return;
-
-        if (_searchBuffer.frame().isFrame())
-            processSearchBufferFrame();
-
-        else if (_invalid)
-            processSearchBufferInvalid(2);
-        else
-            processControlBytes();
-
-        // next
-        processSearchBuffer();
-    }
-
-    void Receiver::processSearchBufferInvalid(int x)
-    {
-        while (_searchBuffer.position())
-        {
-            char value = _searchBuffer.get(0);
-            //_dll.printError("IVB1: %02X  - H:%u I:%u P:%u T:%u A:%u", value, x, _invalid, _searchBuffer.position(), _searchBuffer.timeout(), (uint)_awaitBytes);
-            _lastDiscarded = millis();
-            asm volatile("" ::: "memory");
-            _discardedBytes.push(value);
-            _searchBuffer.move(1);
-            _dll._statistics.incrementRxDiscardedBytes();
-
-            if (_searchBuffer.frame().isFrame()) break;
-        }
-
-        _searchBuffer.frame().resetFlags();
-        _state = RX_IDLE;
-        _invalid = true;
-        _awaitBytes = 1;
-    }
-
-    void Receiver::processSearchBufferFrame()
-    {
-        Frame &frame = _searchBuffer.frame();
-
-        if (_state == RX_IDLE) _state = RX_FRAME;
-
-        if (_state == RX_FRAME)
-        {
-            _awaitBytes = frame.awaitDestination();
-
-            if (!sufficientlyBytes()) return;
-
-            // Adresse - SET ACKn
-            // _dll.printMessage("    DST ADDRESS %s", frame.humanDestination().c_str());
-            if (_dll.getTransmitter().awaitResponse())
-            {
-                // _dll.printMessage("      awaitResponse %i", _searchBuffer.position());
-                if (!((frame.data(0) ^ _dll.getTransmitter().currentFrame()->data(0)) & ~0x20) && frame.destination() == _dll.getTransmitter().currentFrame()->destination() && frame.source() == _dll.getTransmitter().currentFrame()->source())
-                {
-                    frame.setTransmitted();
-                    // _dll.getTransmitter().resetWatchdogTimer();
-                }
             }
 
-            if (!_dll.isMonitoring())
+            // Eigener Versand: die Bestätigung der BCU. Zwei Aussagen, zwei Flags - das wurde hier erst
+            // zusammengeworfen, was "keine Bestätigung" und "negative Bestätigung" unterscheidbar machte:
+            //   DATA_CON - es KAM eine Bestätigung (fehlt sie, lief die Frist ab, s. handleVerifiedPause)
+            //   ACK      - und sie war positiv, das Telegramm wurde auf dem Bus also quittiert
+            // Damit ist auch der dritte Fall der ACK-Bedeutung belegt: "quittiert - von wem auch immer",
+            // hier als Antwort auf ein selbst gesendetes Telegramm.
+            //
+            // BUSY bleibt dabei ungesetzt, und das ist keine Auslassung: der L_Data.con trägt genau EIN
+            // Bit (NCN5130 Table 13: "z = positive ('1') or negative ('0') confirmation"; Siemens S. 31
+            // gleichlautend). Die BCU hat ihre Wiederholungen selbst abgearbeitet - bis zu 3x nach NACK,
+            // bis zu 3x nach BUSY - und meldet nur das Endergebnis. N steht hier deshalb für "nicht
+            // positiv quittiert", was ein NACK ebenso einschließt wie ein erschöpftes BUSY oder gar keine
+            // Antwort. Die echte Unterscheidung gibt es nur im Busmonitor, wo das rohe Quittungsbyte
+            // durchkommt (siehe oben).
+            if ((value & L_DATA_CON_MASK) == L_DATA_CON)
             {
-                AcknowledgeType acknowledge = frame.isTransmitted() ? ACK_None : _dll.checkAcknowledge(frame.destination(), frame.isGroupAddress());
-                if (acknowledge != ACK_None)
-                {
-                    _dll.getTransmitter().sendAcknowledge(acknowledge);
-                    frame.setAcknowledge(acknowledge);
-                }
+                // ACK heißt hier "es liegt eine Quittung vor" - die gibt es, sobald überhaupt eine
+                // Bestätigung kam. N qualifiziert sie als negativ. Dieselbe Kombination liefert
+                // acknowledgeFlags() für AckType::Nack, die Flags bedeuten also dasselbe wie beim
+                // Busmonitor und bei der eigenen Quittung.
+                uint8_t flags = TP_FRAME_FLAG_DATA_CON | TP_FRAME_FLAG_ACK;
+                if (!(value & 0x80)) flags |= TP_FRAME_FLAG_ACK_NACK;
+
+                // ERST melden, dann freigeben: completeSequence() fragt den Transmitter nach dem Echo, und
+                // das setzt einen belegten Sendeweg voraus - andernfalls fehlte dem eigenen Telegramm das
+                // TX-Flag.
+                completeSequence(flags, RxState::Idle);
+
+                _dll._transmitter.confirmed(); // Sendeweg frei, egal wie die Bestätigung ausfiel
+                return;
             }
 
-            _state = RX_FRAME_DESTINATION;
+            // Im 8-Bit-UART-Modus geht dem L_Data.con ein U_FrameState.ind voraus (NCN5130 S. 42). Es wird
+            // hier verworfen und weiter auf die Bestätigung gewartet - es gehört nicht zum Telegramm.
+            if ((value & U_FRAME_STATE_MASK) == U_FRAME_STATE_IND) return;
+
+            // Etwas Anderes - typischerweise der Anfang einer WIEDERHOLUNG, deren Echo genauso zurückkommt
+            // wie das erste. Das fertige Telegramm wird gemeldet, und das Byte anschließend ganz normal
+            // weiterverarbeitet: es ist der Anfang von etwas Neuem, nicht Müll. Ein Resync wie früher
+            // würde hier das komplette Wiederholungs-Echo verwerfen.
+            completeSequence(0, RxState::Idle);
+            processByte(value);
+            return;
+
+        case RxState::Frame:
+            processFrameByte(value);
+            return;
+
+        case RxState::Poll:
+            processPollByte(value);
+            return;
+
+        case RxState::Idle:
+        {
+            bool isFrameStart = (value & L_DATA_MASK) == L_DATA_STANDARD_IND || (value & L_DATA_MASK) == L_DATA_EXTENDED_IND;
+
+            if (!isFrameStart)
+            {
+                processControlByte(value);
+                return;
+            }
+
+            resetSequence(RxState::Frame);
+            processFrameByte(value);
+            return;
         }
 
-        if (_state == RX_FRAME_DESTINATION)
+        default:
+            return;
+    }
+}
+
+void Receiver::processFrameByte(uint8_t value)
+{
+    // Das Byte, das jetzt geschrieben wird, ist die Prüfsumme, sobald die Frame-Größe bekannt ist und dies
+    // die letzte erwartete Position ist - es fließt NICHT in die laufende CRC ein, sondern wird nur mit
+    // ihr verglichen (inkrementelle CRC8, kein erneuter Durchlauf am Ende nötig).
+    bool isChecksumByte = _frameSize > 0 && (_bufferPos == _frameSize - 1);
+
+    // Die Grenze ist Absicherung, kein Fall: _frameSize ist auf TPUART_BUFFER_SIZE geprüft (darüber gilt
+    // das Frame als kaputt), Steuersequenzen sind höchstens 2 Byte, im Resync wird gar nicht gepuffert.
+    // Sie bleibt trotzdem stehen - ein Schreibzugriff hinter den Puffer träfe die States und die Callbacks.
+    if (_bufferPos < TPUART_BUFFER_SIZE) _buffer[_bufferPos] = value;
+    _bufferPos++;
+
+    if (!isChecksumByte) _crc ^= value;
+
+    if (_frameSize == 0)
+    {
+        bool extended = (_buffer[0] & L_DATA_MASK) == L_DATA_EXTENDED_IND;
+        size_t headerBytesNeeded = extended ? 7 : 6;
+
+        if (_bufferPos >= headerBytesNeeded)
         {
-            // Frame size
-            _awaitBytes = frame.awaitSize();
-            if (!sufficientlyBytes()) return;
+            size_t metadataSize = extended ? 9 : 8;
+            uint8_t apduSize = extended ? _buffer[6] : (_buffer[5] & 0x0F);
+            _frameSize = metadataSize + apduSize;
 
-            _awaitBytes = frame.size();
+            // Passt nur dann nicht in den Puffer, wenn das Längenbyte den reservierten Wert 255 trägt -
+            // die Länge ist damit korrupt und das Frame-Ende unbekannt. Weiterzusammeln wäre Raten, also
+            // wird das bisher Empfangene als kaputt gemeldet und neu aufgesetzt. Standard-Frames können
+            // diesen Zweig nie erreichen (max. 23 Byte).
+            if (_frameSize > TPUART_BUFFER_SIZE)
+            {
+                completeSequence(TP_FRAME_FLAG_INVALID, RxState::Resync);
+                return;
+            }
 
-            if (_dll._modeExtendedCRC) _awaitBytes += 2;
+            // Genau hier wird die Frame-Länge erstmals bekannt - der Zweig läuft daher pro Frame exakt
+            // einmal, ein "schon geackt"-Flag ist nicht nötig. Zugleich der früheste Zeitpunkt, zu dem
+            // die Entscheidung überhaupt fallen kann: Ziel, Adresstyp UND Restlänge stehen erst jetzt fest.
+            sendAcknowledge();
+        }
+    }
 
-            _state = RX_FRAME_SIZE;
+    if (_frameSize > 0 && _bufferPos == _frameSize)
+    {
+        bool valid = (uint8_t)(~_crc) == _buffer[_frameSize - 1];
+
+        // Bei fehlerhafter Prüfsumme ist unklar, wo das Frame wirklich endete - vielleicht war schon das
+        // Längenbyte verfälscht. Erst nach einer verifizierten Pause kann wieder sicher aufgesetzt werden.
+        if (!valid)
+        {
+            completeSequence(TP_FRAME_FLAG_INVALID, RxState::Resync);
+            return;
         }
 
-        if (_state == RX_FRAME_SIZE)
+        // Auf eine Antwort wird in zwei Fällen gewartet, und es ist derselbe Vorgang: im Busmonitor folgt
+        // dem Frame die Quittung vom Bus (L_Ackn.ind), beim eigenen Telegramm die Bestätigung der BCU
+        // (L_Data.con). Erst damit ist das Telegramm vollständig beschrieben.
+        bool echo = _dll._transmitter.isEcho(_buffer, _bufferPos);
+
+        // Das Echo ist zugleich ein Lebenszeichen für den laufenden Versand: der Chip legt das Telegramm
+        // gerade auf den Bus, die Bestätigung kann also noch nicht gekommen sein. Bei einer Wiederholung
+        // kommt es erneut - und schiebt damit den Wachhund weiter, der sonst mitten in eine laufende
+        // Übertragung greifen würde.
+        if (echo) _dll._transmitter.echoReceived();
+
+        if (_dll.isBusMonitor() || echo)
         {
-            if (!sufficientlyBytes()) return;
+            _state = RxState::FrameAck;
+            return;
+        }
 
-            bool valid = frame.isValid();
+        completeSequence(0, RxState::Idle);
+    }
+}
 
-            // don't check CRC if the frame is not valid
-            if (valid && _dll._modeExtendedCRC)
-            {
-                if (_dll._bcuType == BCU_NCN5120 && !frame.checkCRC16CCITT()) valid = false;
-                if (_dll._bcuType == BCU_TPUART2 && !frame.checkCRC16SPI()) valid = false;
-            }
+// Ein Poll-Telegramm - bewusst nach demselben Muster gebaut wie processFrameByte(), damit beide gleich zu
+// lesen sind: Byte ablegen, Länge aus dem Kopf bestimmen, am Ende abschließen. Die Unterschiede sind der
+// Aufbau des Kopfes (Steuerbyte, Quelle 2, Poll-Adresse 2, Slot Count, Prüfsumme) und dass die Prüfsumme
+// mitten in der Sequenz steht statt am Ende - die Slots dahinter deckt sie nicht ab.
+//
+// HIER WIRD NIE QUITTIERT. Ein Poll trägt keinen Adresstyp und erwartet kein Acknowledge; geantwortet wird
+// mit dem eigenen Slot-Byte, und dafür ist U_PollingState.req zuständig, das diese Library nicht benutzt.
+//
+// Der Normalfall endet nicht hier, sondern in handleVerifiedPause(): meist bleibt es bei dem einen
+// Steuerbyte, weil der Chip den Rest gar nicht durchreicht (siehe L_POLL_DATA_IND).
+void Receiver::processPollByte(uint8_t value)
+{
+    bool isChecksumByte = _bufferPos == L_POLL_DATA_HEADER_SIZE - 1;
 
-            if (valid)
-            {
-                // _dll.printMessage("    COMPLETED VALID %i %i", frame.size(), _awaitBytes);
+    // Wie im Frame-Pfad reine Absicherung: die Sequenz ist auf 7 + 15 Byte begrenzt, ein Poll passt immer.
+    if (_bufferPos < TPUART_BUFFER_SIZE) _buffer[_bufferPos] = value;
+    _bufferPos++;
 
-                // Wait for a DATA_CON or ACKN
-                if (_dll.isMonitoring() || frame.isTransmitted())
-                {
-                    _awaitBytes = _awaitBytes + 1; // warte auf noch ein byte welches hoffentlich ein ACKN oder DATA_CON ist
-                    _state = RX_FRAME_WAIT_ACKN;
-                    return;
-                }
+    if (!isChecksumByte) _crc ^= value;
 
-                _state = RX_FRAME_COMPLETE;
-                processCompleteFrame();
-            }
+    if (isChecksumByte)
+    {
+        // Der Slot-Count steht direkt vor der Prüfsumme und legt fest, wie viele Bytes noch folgen.
+        uint8_t slots = _buffer[L_POLL_DATA_HEADER_SIZE - 2];
+
+        // Zwei Gründe, dem Kopf nicht zu glauben: mehr Slots, als es Slotnummern gibt, oder eine falsche
+        // Prüfsumme. In beiden Fällen ist das Ende der Sequenz unbekannt - weiterzuzählen wäre Raten, also
+        // Resync wie bei einem korrupten Längenbyte.
+        if (slots > L_POLL_DATA_MAX_SLOTS || (uint8_t)(~_crc) != value)
+        {
+            completeSequence(TP_FRAME_FLAG_INVALID, RxState::Resync);
+            return;
+        }
+
+        _frameSize = L_POLL_DATA_HEADER_SIZE + slots;
+    }
+
+    // Alle Slots da - fertig, und zwar OHNE auf eine Pause zu warten. Das ist der einzige Grund, warum
+    // diese Sequenz überhaupt gezählt wird.
+    if (_frameSize > 0 && _bufferPos == _frameSize) completeSequence(0, RxState::Idle);
+}
+
+// Sobald Zieladresse, Adresstyp und Restlänge feststehen, entscheidet der Callback über das Acknowledge und
+// das U_Ackn.req geht sofort raus - noch mitten im laufenden Frame, denn der Chip legt den
+// Immediate-Acknowledge direkt hinter dem Checksum-Byte auf den Bus. Das lässt den TxState unberührt: ein
+// Acknowledge ist kein Telegrammversand, sondern geht zwischendurch raus.
+void Receiver::sendAcknowledge()
+{
+    // Im Busmonitor ist der Chip transparent und quittiert grundsätzlich nichts - ein U_Ackn.req von uns
+    // hätte dort nichts verloren und würde den passiven Mitschnitt verfälschen.
+    if (_dll.isBusMonitor()) return;
+
+    // HIER STEHT BEWUSST KEINE ECHO-PRÜFUNG, obwohl während eines eigenen Versands jedes gesendete Oktett
+    // vom Chip zurückkommt (Datenblatt S. 42: "Each transmitted data octet ... will also be transmitted
+    // back to the host controller") und als ganz normales Frame einläuft. Sie wäre in beide Richtungen
+    // wirkungslos:
+    //
+    //   AN SICH SELBST SCHICKT MAN NICHTS. Das Ziel unseres eigenen Telegramms ist ein anderes Gerät oder
+    //   eine Gruppe, die wir senden - der Callback unten sagt dazu "nicht für mich", und damit endet die
+    //   Sache von selbst, ohne Quittung und ohne ADDRESSED.
+    //
+    //   UND SELBST WENN er "für mich" sagte (ein Gerät darf eine Gruppenadresse hören, auf die es auch
+    //   sendet): schickt der Host ein U_Ackn.req, während der Chip gerade selbst sendet, ignoriert der
+    //   Chip es und setzt die Quittungs-Flags mit dem nächsten eintreffenden Frame ohnehin zurück. Auf
+    //   dem Bus passiert also nichts.
+    //
+    // Eine Prüfung "ist der Sendeweg belegt" wäre übrigens auch aktiv schädlich gewesen: TxState::Await
+    // hält bis zur Bestätigung an, und in dieser Zeit wäre kein einziges FREMDES Telegramm mehr quittiert
+    // worden.
+
+    // Die Entscheidung wird IMMER eingeholt, auch wenn gleich klar wird, dass nicht mehr quittiert werden
+    // kann: sie beantwortet zwei verschiedene Fragen. "Ist das Telegramm für uns" (-> ADDRESSED) gilt
+    // unabhängig davon, ob wir es rechtzeitig bestätigen konnten - der Aufrufer soll das Telegramm auch
+    // dann als an ihn gerichtet erkennen. Nur die Quittung selbst (ACK/BUSY/NACK) hängt am Versand.
+    bool extended = (_buffer[0] & L_DATA_MASK) == L_DATA_EXTENDED_IND;
+    bool isGroupAddress = extended ? (_buffer[1] & 0x80) != 0 : (_buffer[5] & 0x80) != 0;
+    uint16_t destination = extended ? (uint16_t)((_buffer[4] << 8) | _buffer[5]) : (uint16_t)((_buffer[3] << 8) | _buffer[4]);
+
+    AckType acknowledge = _dll.checkAcknowledge(destination, isGroupAddress);
+    if (acknowledge == AckType::None) return;
+
+    _flags |= TP_FRAME_FLAG_ADDRESSED;
+
+    // BUSY-MODUS: JETZT SCHWEIGEN WIR, und zwar genau deshalb, weil der Chip die Arbeit übernimmt.
+    // "During this time and when autoacknowledge is active, NCN5130 rejects the frames whose destination
+    // address corresponds to the stored physical address by sending the BUSY acknowledge" (S. 35) - die
+    // Absage geht also raus, nur eben aus der Hardware.
+    //
+    // Ein U_Ackn.req von uns würde sie nicht ergänzen, sondern den Modus BEENDEN: "BUSY mode is deactivated
+    // immediately if the host controller confirms a frame by sending U_Ackn.req" (S. 35), und S. 38/40
+    // nennen den Dienst neben U_QuitBusy.req ausdrücklich als zweiten Ausschalter. Das gilt für JEDES
+    // U_Ackn.req, auch eines mit gesetztem BUSY-Bit - der Modus überlebte sonst kein einziges an uns
+    // gerichtetes Telegramm.
+    //
+    // BEIDE Bedingungen müssen stehen. Ohne aktive Auto-Quittung hat U_SetBusy.req laut Datenblatt "no
+    // effect" - dann antwortet weder der Chip noch wir, und aus der Absage würde vollständiges Schweigen.
+    //
+    // Was NICHT der Chip abdeckt: Gruppenadressen und, bei einem Koppler, fremde Einzeladressen. Die
+    // bleiben in diesen 700ms unquittiert, und der Absender wiederholt. Genau das ist der Zweck des
+    // Modus - Gegendruck erzeugen, nicht Telegramme annehmen.
+    if (_dll.isBusyMode() && _dll.isAutoAcknowledge()) return;
+
+    // DIE AUTO-QUITTUNG DES CHIPS IST EIN FALLBACK, KEIN ERSATZ. Sie greift, wenn der Host nicht
+    // rechtzeitig antwortet - sie nimmt ihm die Antwort aber nicht ab. Wer eine gesetzte Adresse als
+    // "der Chip macht das schon" liest und deshalb selbst schweigt, quittiert am Ende gar nicht:
+    // die Adressauswertung des Chips deckt nur seine EIGENE physikalische Adresse ab, während der
+    // Callback auch Gruppenadressen und - bei einem Koppler - fremde Einzeladressen bejaht.
+    //
+    // Genau dieser Fehler stand hier: ein `if (_dll.isAutoAcknowledge()) return;`. Die Folge war im Log
+    // unmittelbar zu sehen - Telegramme kamen mit ADDRESSED, aber ohne ACK herein, und der Absender
+    // wiederholte sie dreimal, weil niemand auf dem Bus quittiert hatte. Die alte Library hat an dieser
+    // Stelle IMMER quittiert; das war kein Versäumnis, sondern richtig.
+    //
+    // Der Preis ist bekannt und hinnehmbar: auf dem NCN beendet ein U_Ackn.req einen aktiven BUSY-Modus
+    // (p.35). Der wird hier von niemandem benutzt, und die alte Library lebte seit Jahren damit.
+    // _autoAcknowledge bleibt als Auskunft über den Chipzustand erhalten - es steuert nur nichts mehr.
+
+    // Liegen im Interface schon so viele Bytes bereit, wie von diesem Frame überhaupt noch ausstehen, dann
+    // ist das Telegramm inklusive Prüfsummen-Oktett bereits vollständig eingetroffen - auf dem Bus also
+    // längst durch und sein Acknowledge-Fenster zu. Ein jetzt gesendetes U_Ackn.req käme nicht nur zu spät,
+    // es würde vom Chip dem nächsten Telegramm zugeordnet und damit ein fremdes Frame fälschlich bestätigen.
+    // Die Grenze ist >= und nicht >: bei Gleichheit ist das Frame eben schon komplett da. Und weil ein
+    // Folgetelegramm frühestens 50 Bitzeiten später beginnen darf, gilt die Gleichheit auch nach einem
+    // BELIEBIG langen Rückstand - mit > würde also genau der Stall passender Länge das ACK durchlassen,
+    // das die Prüfung verhindern soll. Im Normalbetrieb bremst das nichts: dort liegen 0-1 Bytes bereit,
+    // während mindestens 2 ausstehen.
+    if (_dll._interface->available() >= (_frameSize - _bufferPos))
+    {
+        _dll._statistics.incrementAcknowledgesSuppressed();
+        return;
+    }
+
+    // Geschrieben wird im Transmitter - dort liegt aller schreibende Zugriff auf das Interface.
+    if (!_dll._transmitter.sendAcknowledge(acknowledge)) return;
+
+    _flags |= acknowledgeFlags(acknowledge);
+
+    // Ein abgesetztes U_Ackn.req beendet den Busy-Modus im Chip (S. 35). Hierher kommt nur, wer die Sperre
+    // oben passiert hat - also gab es keine aktive Auto-Quittung und der Modus war ohnehin wirkungslos.
+    // Gemeldet wird es trotzdem, damit unser Merker nicht einen Zustand behauptet, den der Chip nicht hat.
+    if (_dll.isBusyMode()) _dll.reportBusyModeCancelled();
+}
+
+// Steuerbytes sind laut Datenblatt (Table 13, "Control Services") immer genau 1 Byte lang und
+// selbsterklärend - mit einer Ausnahme: U_SystemStat.ind bringt ein zweites Byte mit.
+void Receiver::processControlByte(uint8_t value)
+{
+    _buffer[0] = value;
+    _bufferPos = 1;
+
+    // Kein Steuerbyte, sondern der Anfang eines Poll-Telegramms (siehe L_POLL_DATA_IND). Es als 1-Byte-
+    // Sequenz abzuschließen würde die Folgebytes als Anfang neuer Sequenzen lesen lassen - bis hin zu
+    // einem ungewollten ACK auf eine aus Poll-Bytes zusammengesetzte Adresse. Ab hier zählt deshalb
+    // processPollByte() mit, statt auf eine Pause zu warten.
+    if (value == L_POLL_DATA_IND)
+    {
+        resetSequence(RxState::Poll);
+        processPollByte(value);
+        return;
+    }
+
+    // Nur die NCN512x-Reihe kennt diesen Dienst, und sie schickt ihn ausschließlich als Antwort auf ein
+    // U_SystemState.req - also nur auf requestState() hin. Beim TPUART2 wäre 0x4B etwas anderes -
+    // ohne diese Abfrage würde dort das Folgebyte mitverschluckt. Die alte Library hat genauso geprüft.
+    if (value == U_SYSTEM_STAT_IND && _dll.bcuType() == BcuType::Ncn5120)
+    {
+        _state = RxState::Control; // 2. Byte folgt noch
+        return;
+    }
+
+    // Der Chip meldet seine Betriebsarten. Für die Auto-Quittung ist das eine Bestätigung, keine Nachricht:
+    // dass sie mit der Adresse aktiv wird, weiß applyConfiguration() schon beim Absetzen - und muss es auch
+    // wissen, weil dieser Dienst nur beim NCN existiert. Gilt aber trotzdem der Chip: was er hier meldet,
+    // ist der wahre Zustand, auch wenn er dem Flag widerspricht.
+    if ((value & U_CONFIGURE_MASK) == U_CONFIGURE_IND) _dll.configureIndication(value);
+
+    // Ein Reset - von wem auch immer ausgelöst: vom Wachhund des Transmitters, von reset() aus der
+    // Anwendung, oder von der BCU selbst. In jedem Fall ist ihr Sendepuffer leer und ihr Zustand definiert.
+    // Unterschieden wird deshalb NICHT, wer den Reset veranlasst hat: liegt noch ein Telegramm im
+    // Sendepuffer, beginnt es einfach von vorn; liegt keines, holt der Tick das nächste aus der
+    // Warteschlange.
+    if (value == U_RESET_IND) _dll.resetIndication();
+
+    // Bestätigung des eigenen Versands. Sie wird hier freigegeben und nicht erst in
+    // DataLinkLayer::handleControlEntry(): _txState darf nur EINEN Schreiber haben, und das ist der Tick.
+    // Über den Ringpuffer käme die Freigabe zudem erst, wenn der Hauptloop wieder dran ist - der Sendeweg
+    // bliebe unnötig lange belegt.
+    if ((value & L_DATA_CON_MASK) == L_DATA_CON) _dll._transmitter.confirmed();
+
+    completeSequence(0, RxState::Idle);
+}
+
+// Der Anfang einer neuen Sequenz - und die EINZIGE Stelle, an der dieser Satz Felder zurückgesetzt wird.
+// Vorher stand er dreimal ausgeschrieben da (Sequenzstart, Resync, Abschluss), was ihn zu einer Falle machte:
+// wer ein Feld dazunimmt, muss es sonst an drei Stellen mitnehmen, und die vergessene fällt erst als
+// nachwirkender Zustand im nächsten Telegramm auf.
+void Receiver::resetSequence(RxState nextState)
+{
+    _bufferPos = 0;
+    _frameSize = 0;
+    _crc = 0;
+    _flags = 0;
+    _state = nextState;
+}
+
+// Bricht eine laufende Sequenz ab und geht in den Resync. War NICHTS im Gange (Idle), gibt es auch nichts
+// abzubrechen: es liegen keine Folgebytes einer angefangenen Sequenz aus, die als Anfang von etwas Neuem
+// fehlgedeutet werden könnten - die als Nächstes eintreffenden Bytes werden ganz normal interpretiert. Bei
+// Resync läuft die Verwerfung ohnehin schon. Einmal blind IMMER in Resync zu gehen hat genau das kaputt
+// gemacht: die Reset-Antwort und das erste Frame nach einem Moduswechsel landeten als Datenmüll im Resync.
+void Receiver::forceResync()
+{
+    if (_state == RxState::Idle || _state == RxState::Resync) return;
+
+    // Die angebrochene Sequenz wird verworfen, nicht gemeldet - sie ist Folge unserer eigenen Umschaltung.
+    // Ihre Bytes zählen als verworfen, denn gesehen hat sie niemand.
+    _dll._statistics.incrementRxDroppedBytes((uint32_t)_bufferPos);
+
+    resetSequence(RxState::Resync);
+}
+
+// Schiebt die fertige Sequenz in den Ringpuffer und macht den Empfangspuffer sofort wieder frei. Nichts
+// wartet hier auf einen Abnehmer - genau deshalb kann tick() ohne Unterbrechung weiterlaufen.
+void Receiver::completeSequence(uint8_t flags, RxState nextState)
+{
+    // Was der Sequenz unterwegs zugewachsen ist (siehe _flags), plus was der Aufrufer mitbringt.
+    flags |= _flags;
+
+    size_t length = _bufferPos < TPUART_BUFFER_SIZE ? _bufferPos : TPUART_BUFFER_SIZE;
+
+    if (length > 0)
+    {
+        // Frame oder Steuerbyte-Sequenz? Dieselbe Prüfung, die beim ersten Byte entschieden hat.
+        bool isFrame = (_buffer[0] & L_DATA_MASK) == L_DATA_STANDARD_IND || (_buffer[0] & L_DATA_MASK) == L_DATA_EXTENDED_IND;
+
+        if (isFrame && _dll._transmitter.isEcho(_buffer, _bufferPos)) flags |= TP_FRAME_FLAG_TX;
+
+        if (isFrame)
+        {
+            // Gemeldet wird es in beiden Fällen - der Unterschied ist nur, ob es in Ordnung war. Davon
+            // klar getrennt sind die im Resync verworfenen Bytes, die nie jemand zu sehen bekommt.
+            if (flags & TP_FRAME_FLAG_INVALID)
+                _dll._statistics.incrementRxInvalidFrames();
             else
-            {
-                // _dll.printMessage("INVALID FRAME");
-                // String tmp;
-                // tmp.reserve(1024);
-                // for (size_t i = 0; i < _searchBuffer.position(); i++)
-                // {
-                //     char t2[3];
-                //     snprintf(t2, 3, "%02X ", _searchBuffer.get(i));
-                //     tmp += String(t2) + " ";
-                // }
-                // _dll.printMessage("      %s", tmp.c_str());
-                processSearchBufferInvalid(3);
-            }
-        }
-    }
-
-    bool Receiver::pushSearchBuffer(const char value)
-    {
-        // _dll.printMessage("pushSearchBuffer: %02X", value);
-        if (!_searchBuffer.add(value))
-        {
-            _dll._rxSearchBufferOverflow = true;
-            _dll._statistics.incrementRxSearchBufferOverflow();
-            return false;
+                _dll._statistics.incrementRxFrames();
         }
 
-        processSearchBuffer();
-
-        return true;
-    }
-
-    void Receiver::reset()
-    {
-        _searchBuffer.clear();
-        _state = RX_IDLE;
-        _awaitBytes = 1;
-        _invalid = false;
-    }
-
-    unsigned short Receiver::getAwaitBytes()
-    {
-        return _awaitBytes;
-    }
-
-    unsigned short Receiver::getSearchBufferPosition()
-    {
-        return _searchBuffer.position();
-    }
-
-    inline bool Receiver::sufficientlyBytes()
-    {
-        return _searchBuffer.position() >= _awaitBytes;
-    }
-
-    void Receiver::processControlBytes()
-    {
-        const char value = _searchBuffer.get(0);
-        uint8_t count = 1;
-        // _dll.printMessage("processControlBytes %02X", value);
-
-        if (value == U_RESET_IND)
-        {
-            _dll.receivedReset();
-        }
-        else if (value == 0xFF || value == 0xFE || value == 0xFD || value == 0xFC)
-        {
-        }
-        else if (value == U_STOP_MODE_IND && _dll._bcuType == BCU_NCN5120)
-        {
-            // Maybe trigger an requestSystemState to get SystemState faster
-        }
-        else if ((value & U_STATE_MASK) == U_STATE_IND)
-        {
-            _dll.receivedState(value);
-        }
-        else if (value == U_SYSTEM_STAT_IND && _dll._bcuType == BCU_NCN5120)
-        {
-            if (_searchBuffer.position() < 2)
-            {
-                _awaitBytes = 2;
-                return;
-            }
-            // _dll.printMessage("U_SYSTEM_STAT_IND %02X", _searchBuffer.get(1));
-            _dll._systemState.update(_searchBuffer.get(1));
-            count = 2;
-        }
-        else if (_dll.isMonitoring() && (value == 0xFF || value == 0xFD))
-        {
-        }
-        else if ((value & U_CONFIGURE_MASK) == U_CONFIGURE_IND)
-        {
-            _dll.receivedConfiguration(value);
-        }
-        else if ((value & L_DATA_CON_MASK) == L_DATA_CON)
-        {
-            _dll.getTransmitter().finalize();
-        }
-
-        else if ((value & L_ACKN_MASK) == L_ACKN_IND)
-        {
-        }
-
+        // POLL ZÄHLT ZU DEN FRAME-BYTES, bekommt aber keine eigene Kategorie: es sind Bytes vom Bus wie
+        // die eines Telegramms, und ein Zähler, den in der Praxis nie jemand ungleich null sieht, wäre nur
+        // eine Zeile mehr in jeder Statistikausgabe. Bei den Telegramm-ZÄHLERN steht es bewusst nicht
+        // dabei - ein Poll ist kein Telegramm, es geht auch nicht über deliverFrame() nach oben.
+        if (isFrame || _buffer[0] == L_POLL_DATA_IND)
+            _dll._statistics.incrementRxFrameBytes((uint32_t)length);
         else
+            _dll._statistics.incrementRxControlBytes((uint32_t)length);
+
+        pushEntry(_buffer, length, flags);
+    }
+
+    resetSequence(nextState);
+}
+
+// Ist kein Platz mehr, wird der Eintrag verworfen und NICHT etwa der älteste überschrieben: was schon
+// angenommen wurde, bleibt. Der Verlust wird über queueOverflow() einmalig gemeldet.
+bool Receiver::pushEntry(const uint8_t *data, size_t length, uint8_t flags)
+{
+    uint32_t needed = TPUART_RX_QUEUE_HEADER_SIZE + length;
+    uint32_t used = _queueHead - _queueTail;
+
+    if (TPUART_RX_QUEUE_SIZE - used < needed)
+    {
+        _dll.reportRxQueueOverflow();
+        return false;
+    }
+
+    uint32_t head = _queueHead;
+    _queue[head++ % TPUART_RX_QUEUE_SIZE] = (uint8_t)(length & 0xFF);
+    _queue[head++ % TPUART_RX_QUEUE_SIZE] = (uint8_t)(length >> 8);
+    _queue[head++ % TPUART_RX_QUEUE_SIZE] = flags;
+
+    for (size_t i = 0; i < length; i++)
+        _queue[head++ % TPUART_RX_QUEUE_SIZE] = data[i];
+
+    // Erst ganz zum Schluss sichtbar machen - vorher könnte loop() einen halben Eintrag sehen.
+    _queueHead = head;
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Gemütliche Seite - läuft aus dem Hauptloop
+// ---------------------------------------------------------------------------------------------------
+
+void Receiver::processQueue()
+{
+    while (_queueTail != _queueHead)
+    {
+        uint32_t tail = _queueTail;
+
+        size_t length = _queue[tail++ % TPUART_RX_QUEUE_SIZE];
+        length |= (size_t)_queue[tail++ % TPUART_RX_QUEUE_SIZE] << 8;
+        uint8_t flags = _queue[tail++ % TPUART_RX_QUEUE_SIZE];
+
+        // Der Produzent stellt nur Längen <= TPUART_BUFFER_SIZE ein, im geordneten Betrieb kann das hier
+        // also nicht greifen. Es bleibt trotzdem stehen, weil die Folge sonst maximal unangenehm wäre:
+        // length ist 16 Bit breit, _deliverBuffer aber ein 263 Byte großes MEMBER - ein überlanger Wert
+        // würde die States, die Puffer und die std::function-Callbacks überschreiben. Ein einzelner
+        // korrupter Eintrag darf nicht das ganze Objekt zerlegen, also: Ring verwerfen und weitermachen.
+        if (length > TPUART_BUFFER_SIZE)
         {
-            // Unexpected
-            _lastDiscarded = millis();
-            asm volatile("" ::: "memory");
-            _discardedBytes.push(value);
-            _dll._statistics.incrementRxDiscardedBytes();
-            // _dll.printMessage("IVB2: %02X", value);
-            _invalid = true;
+            // NICHT über _queueOverflow melden - das hieße "der Ring war voll", und das ist etwas ganz
+            // anderes als "der Ring enthält Unsinn". Hier läuft ohnehin der Hauptkontext, also geht die
+            // Meldung direkt raus, mit dem Wert, an dem sich der Fehler festmachen lässt.
+            _dll.printError("RX queue corrupt: entry length %u - queue dropped", (unsigned)length);
+
+            _queueTail = _queueHead;
+            return;
         }
 
-        // if (!_invalid) _dll._statistics.incrementRxControlBytes(count);
-        _searchBuffer.move(count);
-        _awaitBytes = 1;
+        // Das Frame hält seinen Speicher selbst und liegt hier auf dem STACK - für die Dauer dieses
+        // Durchlaufs. Hineinkopiert wird einzeln, weil der Eintrag im Ring umbrechen kann.
+        Frame frame(length, flags);
+        uint8_t *data = frame.buffer();
+
+        for (size_t i = 0; i < length; i++)
+            data[i] = _queue[tail++ % TPUART_RX_QUEUE_SIZE];
+
+        // ERST JETZT den Platz im Ring freigeben - aber noch VOR dem Callback: was der Verbraucher braucht,
+        // liegt jetzt in seinem eigenen Frame, und wie lange er damit beschäftigt ist, geht den Tick nichts
+        // mehr an. Bliebe der Eintrag bis zum Ende des Callbacks stehen, liefe der Ring genau dann voll,
+        // wenn der Hauptloop ohnehin hängt.
+        _queueTail = tail;
+
+        // Frame oder Steuerbyte? Frame::isFrame() prüft dasselbe erste Byte, das beim Einlesen schon
+        // entschieden hat - ein eigenes Flag dafür braucht es nicht.
+        if (!frame.isFrame())
+        {
+            _dll.handleControlEntry((const uint8_t *)frame.data(), length);
+            continue;
+        }
+
+        // Wiederholungserkennung. Geprüft (und gemerkt) wird JEDES gültige Telegramm, markiert nur eine
+        // Wiederholung - ohne den Vergleichswert des Originals wäre die Wiederholung nicht als solche zu
+        // erkennen. Kaputte Telegramme bleiben außen vor: ihr Inhalt ist nicht verlässlich, ein
+        // Fingerabdruck darüber wäre wertlos und würde den Eintrag des Absenders verderben. Die alte
+        // Library kam gar nicht erst in die Verlegenheit - sie hat kaputte Telegramme verworfen statt sie
+        // zu melden.
+        if (frame.isValid())
+        {
+            bool seen = _dll._repetitionFilter.check(frame);
+
+            if (seen && frame.isRepeated())
+            {
+                frame.setFiltered();
+                _dll._statistics.incrementRxRepetitions();
+            }
+        }
+
+        _dll.deliverFrame(frame);
     }
+}
+
+RxState Receiver::state() const
+{
+    return _state;
+}
+
+// --- KOMPAT, siehe Header: beides DUMMY -----------------------------------------------------------------
+
+unsigned short Receiver::getSearchBufferPosition() const
+{
+    return 0;
+}
+
+unsigned short Receiver::getAwaitBytes() const
+{
+    return 0;
+}
 
 } // namespace TPUart
