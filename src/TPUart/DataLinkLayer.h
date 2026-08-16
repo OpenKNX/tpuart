@@ -124,6 +124,17 @@ class DataLinkLayer
     TickDriver _tickDriver;
     uint32_t _tickIntervalUs = TPUART_TICK_INTERVAL_US;
 
+    // Zeitstempel des vorigen tick(), allein für die Taktmessung (siehe Statistics::recordTick). Gehört dem
+    // Tick, wird von niemandem sonst angefasst. 0 heißt "noch kein Vorgänger" - begin() setzt ihn zurück,
+    // damit die Pause zwischen zwei Betriebsphasen nicht als Aussetzer erscheint.
+    uint32_t _tickLastUs = 0;
+
+    // Überwachung der ERREICHTEN Taktrate (siehe checkTickRate). Reiner Hauptkontext - gelesen wird nur
+    // der Tickzähler der Statistik, geschrieben hier. _tickRateCheckedAt == 0 heißt "noch kein Bezugspunkt".
+    uint32_t _tickRateCheckedAt = 0;
+    uint32_t _tickRateLastTicks = 0;
+    bool _tickRateReported = false;
+
     // Der Tick kommt von außen (siehe setExternalTick). Dann hält sich process() heraus.
     bool _externalTick = false;
 
@@ -343,6 +354,10 @@ class DataLinkLayer
     // Nimmt den Busy-Modus nach TPUART_BUSY_MODE_MS von selbst zurück - siehe dort und die Implementierung.
     void checkBusyMode();
 
+    // Meldet einen Antrieb, der die Untergrenze des Busses reißt - siehe die Implementierung. Aus loop(),
+    // begrenzt sich selbst auf ein Fenster von TPUART_TICK_RATE_WINDOW_MS.
+    void checkTickRate();
+
     // Aus dem Tick: ein U_Ackn.req ist rausgegangen. Siehe _busyModeCancelled.
     void reportBusyModeCancelled();
 
@@ -394,6 +409,12 @@ class DataLinkLayer
     // Läuft der eigene Antrieb gerade? Falsch heißt: tick() muss von außen kommen. Auf Plattformen ohne
     // Timer-Unterstützung ist das immer der Fall (TickDriver::supported()).
     bool hasTickDriver() const;
+
+    // Die EINGESTELLTE Taktrate, nicht die erreichte - was tatsächlich herauskommt, sagt
+    // Statistics::getTicks() gegen die Laufzeit. Die beiden auseinanderzuhalten ist der ganze Zweck:
+    // hasTickDriver() sagt, WER tickt, dieser Wert, wie schnell es gedacht war, und der Zähler, was daraus
+    // geworden ist.
+    uint32_t tickInterval() const;
 
     // KOMPAT: beendet den Betrieb und schließt das Interface. Der Parameter der alten Fassung
     // (deleteUart) fehlt bewusst - der DataLinkLayer besitzt das Interface nicht und darf es nicht

@@ -26,6 +26,10 @@
 #endif
 #endif
 
+// NUR AUF DER HARDWARE. Nativ gibt es kein Serial, und Unitys Vorgabe (putchar auf stdout) ist genau
+// richtig - die Umleitung unten würde dort nur auf etwas zeigen, das es nicht gibt.
+#ifdef ARDUINO
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -44,5 +48,7 @@ extern "C"
 #ifdef __cplusplus
 }
 #endif
+
+#endif // ARDUINO
 
 #endif // UNITY_CONFIG_H

@@ -49,6 +49,23 @@ void Transmitter::process()
     // konnte. Der Telegrammpfad muss dann warten, sonst belegt er den Platz, auf den der Steuercode wartet.
     if (processCtrlQueue()) return;
 
+    // IM BUSMONITOR RUHT DER GANZE SENDEPFAD - Telegrammbytes wie Wachhund. Der Wächter steht deshalb VOR
+    // dem Await-Zweig und vor der Zustandsprüfung, nicht nur in startNextTransmission():
+    //
+    //   - Ein Telegramm, das beim Umschalten bereits LÄUFT (_state == Transmit), schöbe sonst seine
+    //     restlichen Oktette in einen Chip, der sie laut Tabelle 11 (S. 32) ignoriert - U_L_DataStart/
+    //     Cont/End.req sind dort "I".
+    //   - Steht der Versand in Await, käme das L_Data.con im Busmonitor nicht mehr. Der Wachhund liefe ab
+    //     und schickte U_Reset.req - und DER BEENDET DEN BUSMONITOR, ohne dass irgendwo steht warum. Der
+    //     Anwender schaltet ihn ein und er ist zehn Sekunden später weg.
+    //
+    // Beides bleibt einfach stehen: in Transmit greift der Wachhund ohnehin nicht (seine Frist wird erst
+    // beim Übergang nach Await aufgezogen), und in Await friert er hier ein. Verlassen wird der Busmonitor
+    // nur per Reset, und dessen U_Reset.ind startet ein anstehendes Telegramm von vorn - es geht nichts
+    // verloren. Die Steuercode-Warteschlange oben ist bewusst NICHT betroffen: über sie geht der Reset raus,
+    // der der einzige Weg hinaus ist.
+    if (_dll.isBusMonitor()) return;
+
     // Das Telegramm ist raus, es fehlt die Bestätigung der BCU. Sie kommt als L_Data.con und wird im
     // Empfangspfad ausgewertet (Receiver::processControlByte) - hier bleibt nur die Notbremse, damit ein
     // ausbleibendes L_Data.con den Sendeweg nicht für immer belegt.
@@ -65,6 +82,7 @@ void Transmitter::process()
         if (!writeByte(U_RESET_REQ)) return;
 
         _dll._statistics.incrementTxControlBytes();
+        _dll._statistics.incrementTxConfirmTimeouts();
         _awaitSince = millis();
         _confirmTimeout = true; // gemeldet wird das aus loop(), hier darf nichts nach außen
 
@@ -223,7 +241,7 @@ bool Transmitter::sendAcknowledge(AckType acknowledge)
 
     if (!writeByte((uint8_t)(U_ACKN_REQ | (uint8_t)acknowledge))) return false;
 
-    _dll._statistics.incrementAcknowledgesSent();
+    _dll._statistics.incrementTxAcknowledges();
     return true;
 }
 
@@ -248,6 +266,43 @@ void Transmitter::restart()
     if (_state == TxState::Idle) return; // nichts unterwegs - dann gibt es auch nichts zu wiederholen
 
     beginTransmission();
+}
+
+// Räumt den gesamten Sendeweg: die laufende Übertragung UND alles, was noch in der Warteschlange steht.
+// Gebraucht wird das beim Wechsel in den Busmonitor. Der Chip nimmt dort keine Telegrammdienste mehr an,
+// und was er von einem laufenden Telegramm schon geschluckt hat, ist mit dem Moduswechsel hinfällig - ein
+// halbes Telegramm später fortzusetzen oder zu wiederholen ergibt keinen Sinn, auf dem Bus hat nie jemand
+// einen Anfang gesehen. Deshalb ABBRECHEN und nicht wie in restart() von vorn beginnen.
+//
+// LÄUFT IM TICK, und daran hängt die Korrektheit gleich zweifach:
+//   - _state behält genau einen Schreiber. Aus dem Hauptkontext ginge es nicht, dort kollidierte es mit
+//     confirmed() und echoReceived(), die der Empfangspfad aus demselben Tick heraus ruft.
+//   - _queueTail ebenso. Der naheliegende Weg - der Hauptkontext leert die Warteschlange, weil dort der
+//     Heap zu Hause ist - war ein Wettlauf: er müsste _queueTail schreiben, und die Bedingung dafür
+//     ("im Busmonitor fasst der Tick die Warteschlange nicht an") kann der Tick zwischen Prüfung und
+//     Schreiben aufheben, indem eine U_Reset.ind eintrifft und _busMonitor löscht. Auf dem ESP32 läuft
+//     der Tick echt parallel, das ist also kein reines Verdrängungsproblem.
+// Der Index wird hier nur VORGEZOGEN; freigegeben wird der Heap wie immer aus loop()
+// (releaseSentTelegrams()), für das die übersprungenen Einträge schlicht wie abgeholte aussehen.
+//
+// _chipOffsetValid wird mit zurückgesetzt, weil der Offset im Register des Chips liegt und über den
+// Moduswechsel hinweg nicht mehr als bekannt gelten darf - dieselbe Überlegung wie in beginTransmission().
+//
+// Ein Telegramm, das der Hauptkontext GERADE einstellt, kann diesem Zugriff entgehen: ist _queueHead noch
+// nicht veröffentlicht, bleibt der Eintrag stehen und ginge nach dem Verlassen des Busmonitors hinaus.
+// Das Fenster ist ein paar Instruktionen breit und ohne Sperre nicht zu schließen; sendFrame() lehnt im
+// Busmonitor ohnehin ab, es braucht also ein sendFrame(), das die Prüfung unmittelbar vor dem Umschalten
+// passiert hat.
+void Transmitter::abort()
+{
+    _queueTail = _queueHead;
+
+    if (_state == TxState::Idle) return;
+
+    _bufferPos = 0;
+    _frameSize = 0;
+    _chipOffsetValid = false;
+    _state = TxState::Idle;
 }
 
 // Verglichen wird das VOLLSTÄNDIGE Telegramm - eine Prefix-Fassung für den halb eingelaufenen Fall gab es
@@ -343,6 +398,10 @@ bool Transmitter::sendFrame(const uint8_t *data, size_t length)
     entry._length = (uint16_t)(length + 1);
 
     _queueHead = _queueHead + 1; // erst jetzt ist der Eintrag für den Tick sichtbar
+
+    // Gemessen gegen _queueFree und nicht gegen _queueTail: belegt ist ein Platz, bis der Hauptkontext ihn
+    // freigegeben hat, und genau daran wird oben auch die Vollprüfung gemacht.
+    _dll._statistics.updateTxQueuePeakFrames(_queueHead - _queueFree);
     return true;
 }
 
@@ -383,6 +442,8 @@ bool Transmitter::queueControl(const uint8_t *codes, size_t length)
         _dll.reportControlOverflow();
         return false;
     }
+
+    _dll._statistics.updateTxControlQueuePeakBytes(used + needed);
 
     // Ein Produzent (dieser Kontext), ein Konsument (tick()). Der Kopf wird als ALLERLETZTES weitergesetzt,
     // damit der Tick nie eine halb geschriebene Sequenz sieht. Keine Sperre nötig, keine Besitzübergabe.

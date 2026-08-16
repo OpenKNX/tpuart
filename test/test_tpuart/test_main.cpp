@@ -37,6 +37,7 @@ using namespace TPUart;
 //
 // DER UNTERSCHIED IST DIE LETZTE: bei PlatformIO steht dort Serial.end(), und das meldet auf dem RP2040
 // den USB-CDC vom Bus ab, während der Testläufer noch liest. Hier bleibt die Verbindung offen.
+#ifdef ARDUINO
 extern "C"
 {
     void unityOutputStart(unsigned long baudrate) { Serial.begin(baudrate); }
@@ -50,6 +51,7 @@ extern "C"
         Serial.flush();
     }
 }
+#endif
 
 // ---------------------------------------------------------------------------------------------------
 // Fixture und Helfer
@@ -78,6 +80,18 @@ struct Fixture
 
     Fixture() : _dll(_interface)
     {
+        // DIE ZUSTELLUNG MUSS BILLIG SEIN, und das ist keine Kosmetik. Mit setTickInterval(0) laufen Tick
+        // und Loop serialisiert: was der Callback kostet, liegt zwischen dem Tick, der das letzte Byte einer
+        // Sequenz verbraucht, und dem nächsten, der die Leere bemerkt und _emptySince setzt. Diese Kosten
+        // verschieben also die Pausenerkennung nach hinten.
+        // Ohne das Reservieren wuchs _frames während eines Falls um und kopierte dabei jeden Eintrag samt
+        // seines Vektors neu - sprunghaft teuer, und genau dadurch fiel
+        // test_confirmation_after_broken_echo_arrives_after_pause auf dem RP2040 in etwa der Hälfte der
+        // Läufe durch: die Pause wurde erst erkannt, nachdem das L_Data.con schon eingetroffen und im
+        // Resync verworfen war. Auf dem ESP32 war die Reserve groß genug, dort fiel es nie auf.
+        _frames.reserve(64);
+        _errors.reserve(32);
+
         // KEIN eigener Takt: process() führt den Tick dann synchron aus, und jeder Fall bestimmt selbst,
         // wann wie oft getickt wird. Muss vor begin() stehen, sonst startet dort der Timer.
         _dll.setTickInterval(0);
@@ -90,7 +104,7 @@ struct Fixture
             captured._isFrame = frame.isFrame();
             captured._source = frame.source();
             captured._destination = frame.destination();
-            _frames.push_back(captured);
+            _frames.push_back(std::move(captured)); // verschieben, nicht den Datenvektor erneut kopieren
         });
 
         _dll.registerCheckAcknowledge([this](uint16_t destination, bool isGroupAddress) {
@@ -110,11 +124,50 @@ struct Fixture
     }
 
     // Die einzige Stelle, an der Zeit vergeht. Alles andere ist reine Zustandsprüfung.
+    //
+    // AUF DER HARDWARE läuft die echte Uhr, und getickt wird so schnell, wie der Prozessor durch die
+    // Schleife kommt. Damit misst die Sammlung dort tatsächliche Fristen - das ist ihr eigentlicher Wert.
+    //
+    // NATIV gibt es keine echte Zeit, also wird sie gestellt: die Uhr rückt in festen Schritten vor, und
+    // zwischen zwei Schritten läuft ein process(). Die Schrittweite IST damit die Tickrate. 50µs liegen
+    // deutlich unter dem 500µs-Vorgabetakt der Library und weit unter der Bytezeit des Busses (1354µs),
+    // die Pausenerkennung sieht also feiner auf als auf jeder echten Plattform - was Fälle durchgehen
+    // lässt, die auf der Hardware knapp scheitern würden. Der native Lauf prüft die Protokolllogik, nicht
+    // das Zeitverhalten.
     void pump(uint32_t ms)
     {
+#ifdef ARDUINO
         uint32_t until = millis() + ms;
         while ((int32_t)(millis() - until) < 0)
             _dll.process();
+#else
+        constexpr uint32_t STEP_US = 50;
+
+        for (uint32_t elapsed = 0; elapsed < ms * 1000; elapsed += STEP_US)
+        {
+            tpuartNativeClockUs() += STEP_US;
+            _dll.process();
+        }
+#endif
+    }
+
+    // ZEIT VERGEHT, ABER ES WIRD NICHT GETICKT - das Gegenstück zu pump(). Nur so lässt sich ein
+    // ausgehungerter Antrieb nachstellen, und genau darauf sitzt der Wächter in checkTickRate().
+    void idle(uint32_t ms)
+    {
+#ifdef ARDUINO
+        uint32_t until = millis() + ms;
+        while ((int32_t)(millis() - until) < 0)
+            _dll.loop();
+#else
+        constexpr uint32_t STEP_US = 50;
+
+        for (uint32_t elapsed = 0; elapsed < ms * 1000; elapsed += STEP_US)
+        {
+            tpuartNativeClockUs() += STEP_US;
+            _dll.loop();
+        }
+#endif
     }
 
     // Verbindungsaufnahme durchspielen. Die Baudratensuche liest das Interface DIREKT (nicht über den
@@ -391,6 +444,80 @@ static void test_resync_recovers_at_next_frame()
     TEST_ASSERT_EQUAL(1, fx->_frames.size());
     TEST_ASSERT_TRUE(fx->_frames[0]._valid);
     TEST_ASSERT_EQUAL_HEX16(0x1102, fx->_frames[0]._source);
+}
+
+// Der Resync-ZÄHLER beantwortet eine andere Frage als die verworfenen Bytes: wie oft die Position im
+// Bytestrom verloren ging, nicht wie viel es gekostet hat. Zwei kaputte Telegramme sind zwei Resyncs,
+// ganz gleich wie viele Bytes dazwischen anfielen.
+static void test_resyncs_are_counted()
+{
+    fx->connect();
+
+    TEST_ASSERT_EQUAL(0, fx->_dll.getStatistics().getRxResyncs());
+
+    std::vector<uint8_t> broken = standardFrame();
+    broken.back() ^= 0xFF;
+
+    fx->feedAndSettle(broken);
+    TEST_ASSERT_EQUAL(1, fx->_dll.getStatistics().getRxResyncs());
+
+    fx->feedAndSettle(broken);
+    TEST_ASSERT_EQUAL(2, fx->_dll.getStatistics().getRxResyncs());
+
+    // Ein GÜLTIGES Telegramm loest keinen aus - sonst zaehlte der Wert den Normalbetrieb mit.
+    fx->feedAndSettle(standardFrame(0x1102));
+    TEST_ASSERT_EQUAL(2, fx->_dll.getStatistics().getRxResyncs());
+}
+
+// Der Höchststand zeigt die Auslegung, bevor etwas überläuft. Ein Telegramm im Ring belegt seine Länge
+// plus den Kopf des Eintrags; abgeholt wird es erst im nächsten loop().
+static void test_rx_queue_peak_is_tracked()
+{
+    fx->connect();
+
+    TEST_ASSERT_EQUAL(0, fx->_dll.getStatistics().getRxQueuePeakBytes());
+
+    fx->feedAndSettle(standardFrame());
+
+    uint32_t peak = fx->_dll.getStatistics().getRxQueuePeakBytes();
+
+    TEST_ASSERT_TRUE(peak >= 9);                     // 9 Oktette Telegramm ...
+    TEST_ASSERT_TRUE(peak <= TPUART_RX_QUEUE_SIZE);  // ... und niemals mehr, als der Ring fasst
+}
+
+// Die Fehlerbits eines U_State.ind werden nur verodert und beim Ausgeben gelöscht - erst die Zähler
+// unterscheiden "einmal" von "dauernd". EINZELN, weil es fünf verschiedene Diagnosen sind: ein Telegramm
+// mit zwei gesetzten Bits erhöht auch zwei Zähler.
+static void test_chip_errors_are_counted_individually()
+{
+    fx->connect();
+
+    const Statistics &st = fx->_dll.getStatistics();
+
+    TEST_ASSERT_EQUAL(0, st.getChipProtocolErrors());
+    TEST_ASSERT_EQUAL(0, st.getChipTemperatureWarnings());
+
+    // U_State.ind ohne Fehlerbits: die drei Kennbits allein.
+    uint8_t clean[] = {U_STATE_IND};
+    fx->feedAndSettle(std::vector<uint8_t>(clean, clean + 1));
+    TEST_ASSERT_EQUAL(0, st.getChipProtocolErrors());
+
+    // Ein Bit.
+    uint8_t pe[] = {(uint8_t)(U_STATE_IND | U_STATE_PROTOCOL_ERROR)};
+    fx->feedAndSettle(std::vector<uint8_t>(pe, pe + 1));
+    TEST_ASSERT_EQUAL(1, st.getChipProtocolErrors());
+    TEST_ASSERT_EQUAL(0, st.getChipTemperatureWarnings());
+
+    // Zwei Bits in EINER Meldung - beide Zähler rücken vor. Genau deshalb ist die Zahl der Meldungen aus
+    // den fünf Zählern nicht ableitbar.
+    uint8_t both[] = {(uint8_t)(U_STATE_IND | U_STATE_PROTOCOL_ERROR | U_STATE_TEMPERATURE_WARNING)};
+    fx->feedAndSettle(std::vector<uint8_t>(both, both + 1));
+    TEST_ASSERT_EQUAL(2, st.getChipProtocolErrors());
+    TEST_ASSERT_EQUAL(1, st.getChipTemperatureWarnings());
+
+    TEST_ASSERT_EQUAL(0, st.getChipSlaveCollisions());
+    TEST_ASSERT_EQUAL(0, st.getChipReceiveErrors());
+    TEST_ASSERT_EQUAL(0, st.getChipTransmitErrors());
 }
 
 // Eine markierte Wiederholung desselben Telegramms wird als solche erkannt - gemeldet trotzdem, damit ein
@@ -696,7 +823,7 @@ static void test_poll_is_never_acknowledged()
 
     fx->feedAndSettle(poll);
 
-    TEST_ASSERT_EQUAL(0, fx->_dll.getStatistics().getAcknowledgesSent());
+    TEST_ASSERT_EQUAL(0, fx->_dll.getStatistics().getTxAcknowledges());
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -714,7 +841,7 @@ static void expectAddressedAcknowledge(const std::vector<uint8_t> &frame, uint16
 
     fx->feedAndSettle(frame);
 
-    TEST_ASSERT_EQUAL(1, fx->_dll.getStatistics().getAcknowledgesSent());
+    TEST_ASSERT_EQUAL(1, fx->_dll.getStatistics().getTxAcknowledges());
     TEST_ASSERT_TRUE(fx->written({(uint8_t)(U_ACKN_REQ | U_ACKN_REQ_ADDRESSED)}));
     TEST_ASSERT_EQUAL_HEX16(destination, fx->_lastAckDestination);
     TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_ADDRESSED) != 0);
@@ -736,9 +863,19 @@ static void test_unaddressed_frame_is_not_acknowledged()
     fx->connect();
     fx->_ackAnswer = AckType::None;
 
-    fx->feedAndSettle(standardFrame());
+    // OHNE ZEITRASTER, also mit vollem Rückstand: das Telegramm liegt beim ersten Tick schon komplett im
+    // Interface. Damit läuft dieser Fall genau in die Bedingung von test_acknowledge_is_suppressed_when_behind
+    // hinein - und darf trotzdem NICHTS zählen. Der Callback wird vor der Rückstandsprüfung gefragt
+    // (Receiver::sendAcknowledge), ein abgelehntes Telegramm kommt dort also gar nicht an.
+    //
+    // Das ist keine Feinheit, sondern das, was den Zähler überhaupt lesbar macht: zählte er mit, zeigte ein
+    // Gerät ohne eigene Adressen Rückstände in Höhe des gesamten Busverkehrs an, und ein echter Rückstand
+    // wäre darin nicht mehr zu finden.
+    fx->feed(standardFrame(), 0);
+    fx->pump(6);
 
-    TEST_ASSERT_EQUAL(0, fx->_dll.getStatistics().getAcknowledgesSent());
+    TEST_ASSERT_EQUAL(0, fx->_dll.getStatistics().getTxAcknowledges());
+    TEST_ASSERT_EQUAL(0, fx->_dll.getStatistics().getTxAcknowledgesSuppressed());
     TEST_ASSERT_EQUAL(0, fx->_interface.writtenBytes().size());
     TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_ADDRESSED) == 0);
 }
@@ -754,8 +891,8 @@ static void test_acknowledge_is_suppressed_when_behind()
     fx->feed(standardFrame(), 0);
     fx->pump(6);
 
-    TEST_ASSERT_EQUAL(0, fx->_dll.getStatistics().getAcknowledgesSent());
-    TEST_ASSERT_EQUAL(1, fx->_dll.getStatistics().getAcknowledgesSuppressed());
+    TEST_ASSERT_EQUAL(0, fx->_dll.getStatistics().getTxAcknowledges());
+    TEST_ASSERT_EQUAL(1, fx->_dll.getStatistics().getTxAcknowledgesSuppressed());
 
     // Gemeldet wird das Telegramm trotzdem, und ADDRESSED bleibt: an wen es gerichtet war, ändert die
     // ausgefallene Quittung nicht.
@@ -774,7 +911,7 @@ static void expectOwnAcknowledge(AckType answer, uint8_t expectedRequest, uint8_
 
     fx->feedAndSettle(standardFrame());
 
-    TEST_ASSERT_EQUAL(1, fx->_dll.getStatistics().getAcknowledgesSent());
+    TEST_ASSERT_EQUAL(1, fx->_dll.getStatistics().getTxAcknowledges());
     TEST_ASSERT_TRUE(fx->written({expectedRequest}));
 
     TEST_ASSERT_EQUAL(1, fx->_frames.size());
@@ -826,7 +963,7 @@ static void expectMonitoredAcknowledge(int ackByte, uint8_t expectedFlags)
 
     TEST_ASSERT_EQUAL(1, fx->_frames.size());
     TEST_ASSERT_EQUAL_HEX8(expectedFlags, fx->_frames[0]._flags);
-    TEST_ASSERT_EQUAL(0, fx->_dll.getStatistics().getAcknowledgesSent());
+    TEST_ASSERT_EQUAL(0, fx->_dll.getStatistics().getTxAcknowledges());
 }
 
 static void test_monitor_frame_without_acknowledge()
@@ -861,7 +998,210 @@ static void test_bus_monitor_never_acknowledges()
 
     fx->feedAndSettle(standardFrame());
 
-    TEST_ASSERT_EQUAL(0, fx->_dll.getStatistics().getAcknowledgesSent());
+    TEST_ASSERT_EQUAL(0, fx->_dll.getStatistics().getTxAcknowledges());
+}
+
+// Bringt die Vorrichtung in den Busmonitor und räumt die Mitschrift ab, sodass die Fälle danach nur noch
+// gegen das prüfen, was IM Modus rausgeht. Der Modus gilt erst als aktiv, wenn der Tick U_Busmon.req
+// tatsächlich abgesetzt hat - deshalb das Takten dazwischen.
+static void enterMonitor()
+{
+    fx->connect();
+
+    TEST_ASSERT_TRUE(fx->_dll.startMonitoring());
+    fx->pump(5);
+    TEST_ASSERT_TRUE(fx->_dll.isBusMonitor());
+
+    fx->_interface.clearWrittenBytes();
+    fx->_errors.clear();
+}
+
+// Tabelle 11 (S. 32) führt U_L_DataStart/Cont/End im Busmonitor als "I" - der Chip ignoriert sie. Also
+// gar nicht erst annehmen.
+static void test_monitor_rejects_send_frame()
+{
+    enterMonitor();
+
+    std::vector<uint8_t> frame = standardFrame();
+    TEST_ASSERT_FALSE(fx->_dll.sendFrame(frame.data(), frame.size() - 1));
+
+    fx->pump(30);
+    TEST_ASSERT_TRUE(fx->_interface.writtenBytes().empty());
+}
+
+// Der interessante Fall ist NICHT das Ablehnen beim Einreihen, sondern ein Telegramm, das VOR dem
+// Umschalten in die Warteschlange kam: es liegt beim Umschalten noch da und ginge ohne abort() später
+// raus - und zwar dann, wenn es längst überholt ist.
+static void test_monitor_drops_queued_telegram()
+{
+    fx->connect();
+
+    std::vector<uint8_t> frame = standardFrame();
+    TEST_ASSERT_TRUE(fx->_dll.sendFrame(frame.data(), frame.size() - 1));
+
+    TEST_ASSERT_TRUE(fx->_dll.startMonitoring());
+    fx->pump(40);
+    TEST_ASSERT_TRUE(fx->_dll.isBusMonitor());
+
+    // Der Busmonitor wird nur per Reset verlassen. Danach darf das verworfene Telegramm NICHT nachträglich
+    // auftauchen - genau das wäre der Unterschied zwischen "verworfen" und bloß "eingefroren".
+    fx->_interface.clearWrittenBytes();
+    TEST_ASSERT_TRUE(fx->_dll.reset());
+    fx->pump(5);
+    fx->_interface.addByte((char)U_RESET_IND, 0);
+    fx->pump(40);
+
+    for (uint8_t value : fx->_interface.writtenBytes())
+        TEST_ASSERT_TRUE((value & 0x80) == 0); // kein U_L_Data*-Positionsbyte
+}
+
+// Ein Telegramm, das beim Umschalten bereits LÄUFT. Ohne den Abbruch schöbe der Tick die restlichen
+// Oktette weiter raus und wartete am Ende auf ein L_Data.con, das nie kommt - nach dem Ablauf der Frist
+// ginge ein U_Reset.req raus, der den Busmonitor beendete.
+static void test_monitor_aborts_running_transmission()
+{
+    fx->connect();
+
+    std::vector<uint8_t> frame = standardFrame(0x1101, 0x0801, 15); // 23 Oktette, dauert mehrere Ticks
+    TEST_ASSERT_TRUE(fx->_dll.sendFrame(frame.data(), frame.size() - 1));
+
+    fx->pump(4); // ein paar Oktette sind jetzt draußen, das Telegramm ist aber nicht fertig
+    TEST_ASSERT_TRUE(fx->_interface.writtenBytes().size() > 0);
+
+    TEST_ASSERT_TRUE(fx->_dll.startMonitoring());
+    fx->pump(10);
+    TEST_ASSERT_TRUE(fx->_dll.isBusMonitor());
+
+    fx->_interface.clearWrittenBytes();
+    fx->pump(60);
+
+    TEST_ASSERT_TRUE(fx->_interface.writtenBytes().empty());
+
+    // Die Zustandsprüfung ist der eigentliche Punkt: dass nichts mehr rausgeht, besorgt schon der Wächter
+    // in Transmitter::process(). Nur Idle belegt, dass die Übertragung wirklich ABGEBROCHEN wurde und nicht
+    // bloß eingefroren - sonst liefe sie nach dem Reset als halbes Telegramm weiter.
+    TEST_ASSERT_EQUAL(TxState::Idle, fx->_dll.getTransmitter().state());
+}
+
+// U_State.req ist im Busmonitor "I": ignoriert, OHNE Antwort. Die Abfrage wäre also nicht nur wirkungslos,
+// sie verunreinigte auch eine Spur, die passiv sein soll.
+static void test_monitor_suppresses_state_request()
+{
+    enterMonitor();
+
+    TEST_ASSERT_FALSE(fx->_dll.requestState());
+
+    fx->pump(TPUART_STATE_INTERVAL_MS + 200); // mehr als ein Abfrageintervall
+    TEST_ASSERT_TRUE(fx->_interface.writtenBytes().empty());
+}
+
+// U_SetBusy.req/U_QuitBusy.req sind im Busmonitor "I". Busmon an heißt Busy aus.
+static void test_monitor_rejects_busy_mode()
+{
+    enterMonitor();
+
+    TEST_ASSERT_FALSE(fx->_dll.busyMode(true));
+
+    fx->pump(30);
+    TEST_ASSERT_TRUE(fx->_interface.writtenBytes().empty());
+}
+
+// Busmon an heißt Busy aus - der Chip nimmt im Modus keine Telegramme mehr an, ein Modus, der das
+// Quittieren nur ersetzt, kann es dort nicht geben.
+//
+// Der zweite Teil ist der wichtigere: OHNE die Abmeldung liefe checkBusyMode() in eine Sackgasse. Nach
+// Ablauf der Frist ruft es busyMode(false), und das lehnt im Busmonitor ab - _busyModeSince bliebe stehen
+// und der Versuch wiederholte sich bei jedem loop(), endlos.
+static void test_monitor_clears_busy_mode()
+{
+    fx->connect();
+
+    TEST_ASSERT_TRUE(fx->_dll.busyMode(true));
+    fx->pump(5);
+    TEST_ASSERT_TRUE(fx->_dll.isBusyMode());
+
+    TEST_ASSERT_TRUE(fx->_dll.startMonitoring());
+    fx->pump(5);
+    TEST_ASSERT_TRUE(fx->_dll.isBusMonitor());
+
+    fx->_interface.clearWrittenBytes();
+    fx->pump(TPUART_BUSY_MODE_MS + 100); // über die Frist hinaus
+
+    TEST_ASSERT_FALSE(fx->_dll.isBusyMode());
+    TEST_ASSERT_TRUE(fx->_interface.writtenBytes().empty()); // kein U_QuitBusy.req in die passive Spur
+}
+
+// Im Busmonitor ist der Chip durchsichtig und quittiert nichts. Das Flag beschreibt den Chip, nicht
+// unseren Wunsch - es muss also mit umschalten.
+static void test_monitor_clears_auto_acknowledge()
+{
+    fx->connect();
+
+    TEST_ASSERT_TRUE(fx->_dll.setOwnAddress(0x1101));
+    fx->pump(20);
+    TEST_ASSERT_TRUE(fx->_dll.isAutoAcknowledge());
+
+    TEST_ASSERT_TRUE(fx->_dll.startMonitoring());
+    fx->pump(5);
+
+    TEST_ASSERT_FALSE(fx->_dll.isAutoAcknowledge());
+}
+
+// U_SetAddress.req ist im Busmonitor "I". Die Konfiguration wird deshalb NICHT abgesetzt - aber auch nicht
+// verworfen: die Epoche bleibt offen, und nach dem Verlassen holt der erste loop() sie nach. Ginge sie
+// verloren, verlöre das Gerät stillschweigend die Quittung für alles, was an seine Adresse geht.
+static void test_monitor_defers_configuration()
+{
+    enterMonitor();
+
+    // FALSE ist hier richtig und heißt "jetzt nicht abgesetzt", nicht "abgelehnt": der Wert ist gemerkt
+    // und die Epoche offen. Dieselbe Antwort gibt setOwnAddress() auch, wenn die Steuerwarteschlange
+    // gerade voll war - der zweite Teil dieses Falls prüft, dass darauf wirklich das Nachholen folgt.
+    TEST_ASSERT_FALSE(fx->_dll.setOwnAddress(0x1101));
+    TEST_ASSERT_EQUAL_HEX16(0x1101, fx->_dll.ownAddress());
+
+    fx->pump(30);
+    TEST_ASSERT_TRUE(fx->_interface.writtenBytes().empty());
+
+    TEST_ASSERT_TRUE(fx->_dll.reset());
+    fx->pump(5);
+    fx->_interface.addByte((char)U_RESET_IND, 0);
+    fx->pump(40);
+
+    // Jetzt muss die Adresse draußen sein - nachgeholt, nicht vergessen.
+    const std::vector<uint8_t> &written = fx->_interface.writtenBytes();
+    bool found = false;
+    for (size_t i = 0; i + 3 < written.size(); i++)
+        if (written[i] == U_NCN5120_SET_ADDRESS_REQ && written[i + 1] == 0x11 && written[i + 2] == 0x01) found = true;
+
+    TEST_ASSERT_TRUE(found);
+}
+
+// DER FALL, DER DEN MODUS SONST NACH FÜNF SEKUNDEN SELBST BEENDET. Die Verbindungsüberwachung ruht auf
+// zwei Beinen - Busverkehr und der sekündlichen Statusabfrage -, und im Busmonitor bricht das zweite weg.
+// Auf einem ruhigen Bus liefe die Frist deshalb zwangsläufig ab, der Reconnect schickte U_Reset.req, und
+// der beendet den Busmonitor.
+//
+// Der zweite Teil prüft das Verlassen: _lastReceivedAt ist nach der Stille beliebig alt, zwischen unserem
+// U_Reset.req und der U_Reset.ind darf trotzdem kein Abbruch gemeldet werden.
+static void test_monitor_survives_silence_and_exits_cleanly()
+{
+    enterMonitor();
+
+    fx->pump(TPUART_CONNECTION_TIMEOUT_MS + 500); // länger als die Frist, ohne ein einziges Byte
+
+    TEST_ASSERT_TRUE(fx->_dll.isConnected());
+    TEST_ASSERT_TRUE(fx->_dll.isBusMonitor());
+    TEST_ASSERT_TRUE(fx->_interface.writtenBytes().empty()); // kein Reconnect-Reset
+
+    TEST_ASSERT_TRUE(fx->_dll.reset());
+    fx->pump(5);
+    fx->_interface.addByte((char)U_RESET_IND, 0);
+    fx->pump(20);
+
+    TEST_ASSERT_FALSE(fx->_dll.isBusMonitor());
+    TEST_ASSERT_TRUE(fx->_dll.isConnected());
+    TEST_ASSERT_EQUAL(0, fx->_errors.size());
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -1194,6 +1534,26 @@ static void test_missing_confirmation_triggers_reset()
         if (written[i] == U_RESET_REQ) sawReset = true;
 
     TEST_ASSERT_TRUE_MESSAGE(sawReset, "Wachhund hat keinen Reset abgesetzt");
+
+    // Der Wachhund-Fall ist der EINZIGE Sendefehler, der gezählt wird. Ein negatives L_Data.con ist
+    // keiner: es sagt nur, dass auf dem Bus niemand quittiert hat - eine Aussage über den Bus, nicht über
+    // die Strecke zum Chip. Hier dagegen kam gar keine Antwort.
+    TEST_ASSERT_EQUAL(1, fx->_dll.getStatistics().getTxConfirmTimeouts());
+}
+
+// Auf einem ruhigen Bus ohne ein einziges Byte laeuft die Verbindungsueberwachung ab. Der Zaehler macht
+// sichtbar, was sonst nur als einmalige Konsolenmeldung vorbeikommt - im Feld die Antwort auf "haengt die
+// BCU?".
+static void test_connection_loss_is_counted()
+{
+    fx->connect();
+
+    TEST_ASSERT_EQUAL(0, fx->_dll.getStatistics().getConnectionLosses());
+
+    fx->pump(TPUART_CONNECTION_TIMEOUT_MS + 500);
+
+    TEST_ASSERT_FALSE(fx->_dll.isConnected());
+    TEST_ASSERT_EQUAL(1, fx->_dll.getStatistics().getConnectionLosses());
 }
 
 // Ein zu langes Telegramm wird abgelehnt, nicht abgeschnitten.
@@ -1220,7 +1580,97 @@ static void test_interface_overflow_is_counted()
     fx->feed(&byte, 1);
     fx->pump(6);
 
-    TEST_ASSERT_EQUAL(1, fx->_dll.getStatistics().getInterfaceOverflows());
+    TEST_ASSERT_EQUAL(1, fx->_dll.getStatistics().getRxInterfaceOverflows());
+}
+
+// DER TAKT MISST SICH SELBST. Ohne diese Zähler war der Antrieb der einzige Wert der Schicht, den man
+// nicht ablesen konnte - man sah nur seine Folgen und musste auf die Ursache raten.
+static void test_tick_rate_is_measured()
+{
+    fx->connect();
+    fx->_dll.getStatistics().reset();
+
+    fx->pump(5);
+
+    // Der Fall prüft die Größenordnung, nicht die Zahl: nativ tickt pump() in festen 50µs-Schritten (also
+    // genau 100 mal), auf der Hardware so schnell wie der Prozessor durch die Schleife kommt - dort sind es
+    // deutlich mehr. Beides muss durch dieselbe Zusicherung passen.
+    TEST_ASSERT_GREATER_THAN(50, fx->_dll.getStatistics().getTicks());
+    TEST_ASSERT_GREATER_THAN(0, fx->_dll.getStatistics().getTickGapMaxUs());
+}
+
+// DIE PAUSE ZWISCHEN ZWEI BETRIEBSPHASEN IST KEIN AUSSETZER. Ohne das Zurücksetzen von _tickLastUs in
+// begin() stünde die Zeit zwischen end() und begin() für immer als Höchstwert in getTickGapMaxUs() - der
+// Wert wäre damit dauerhaft unbrauchbar, und zwar genau auf einem Gerät, das die BCU neu verbindet.
+static void test_tick_gap_survives_restart()
+{
+    fx->connect();
+    fx->pump(5);
+
+    fx->_dll.end();
+    fx->pump(20); // hier tickt nichts - genau diese Lücke darf nicht gezählt werden
+    fx->_dll.getStatistics().reset();
+
+    fx->_dll.begin(BcuType::Ncn5120);
+    fx->pump(5);
+
+    // 20ms wären als Lücke unübersehbar; alles unter einer Millisekunde beweist, dass sie nicht drinsteckt.
+    TEST_ASSERT_LESS_THAN(1000, fx->_dll.getStatistics().getTickGapMaxUs());
+}
+
+// DER RÜCKSTAND IM INTERFACE, in seiner ursprünglichen Einheit. Kommen alle Bytes auf einmal (gapUs 0),
+// liegen sie beim ersten Tick vollständig bereit - genau das Bild, das ein ausgehungerter Tick erzeugt.
+static void test_interface_backlog_is_measured()
+{
+    fx->connect();
+    fx->_dll.getStatistics().reset();
+
+    std::vector<uint8_t> frame = standardFrame();
+    fx->feed(frame, 0);
+    fx->pump(1);
+
+    TEST_ASSERT_EQUAL(frame.size(), fx->_dll.getStatistics().getRxInterfacePeakBytes());
+}
+
+// EIN ZU LANGSAMER ANTRIEB MUSS SICH MELDEN. Das ist die Lehre aus einem Fehler, der im Router Stunden
+// gekostet hat: die Taktrate lag bei 457/s statt 2000/s, und sichtbar war davon ausschließlich der
+// Folgeschaden - 12% unterdrückte Quittungen. Die Ursache stand nirgends.
+//
+// Der Wächter misst die ERREICHTE Rate, nicht die eingestellte, greift also bei jedem Antrieb. Gemeldet
+// wird einmal je Störung; erholt sich die Rate, wird der Melder wieder scharf.
+static void test_slow_tick_is_reported()
+{
+    fx->connect();
+    fx->pump(5); // setzt den Bezugspunkt des Wächters
+    fx->_errors.clear();
+
+    // Zeit vergeht ohne einen einzigen Tick - der schlimmste Fall, und zugleich der, der ohne
+    // ausdrückliche Behandlung eine Division durch null wäre.
+    // ZWEI Fenster, nicht eines: das erste endet mit den Ticks aus connect() im Zähler und ist damit
+    // grenzwertig, und es setzt den Bezugspunkt neu. Erst das zweite ist garantiert tickfrei.
+    fx->idle(TPUART_TICK_RATE_WINDOW_MS * 2 + 100);
+
+    TEST_ASSERT_EQUAL(1, fx->_errors.size());
+    TEST_ASSERT_TRUE(fx->_errors[0].find("Tick") != std::string::npos);
+
+    // EINMAL, NICHT JE FENSTER: die Meldung ist eine Diagnose, keine Dauerbeobachtung. Bliebe sie stehen,
+    // liefe die Konsole eines betroffenen Geräts voll und die eigentliche Ursache ginge darin unter.
+    // ZWEI Fenster, nicht eines: das erste endet mit den Ticks aus connect() im Zähler und ist damit
+    // grenzwertig, und es setzt den Bezugspunkt neu. Erst das zweite ist garantiert tickfrei.
+    fx->idle(TPUART_TICK_RATE_WINDOW_MS * 2 + 100);
+    TEST_ASSERT_EQUAL(1, fx->_errors.size());
+}
+
+// Läuft der Antrieb wie vorgesehen, darf der Wächter SCHWEIGEN. Ohne diesen Fall wäre ein Wächter, der
+// grundsätzlich meldet, genauso "grün" wie der richtige - und im Betrieb dann reines Rauschen.
+static void test_healthy_tick_is_not_reported()
+{
+    fx->connect();
+    fx->_errors.clear();
+
+    fx->pump(TPUART_TICK_RATE_WINDOW_MS + 100);
+
+    TEST_ASSERT_EQUAL(0, fx->_errors.size());
 }
 
 // Reicht der Platz im Sendepuffer nicht für die ganze Steuersequenz, muss sie WARTEN statt zerteilt zu
@@ -1252,38 +1702,25 @@ static void test_bus_load_counts_only_frame_bytes()
 {
     fx->connect();
 
-    uint32_t before = fx->_dll.getStatistics().getRxBusBytes();
+    uint32_t before = fx->_dll.getStatistics().getRxFrameBytes();
 
     uint8_t control = U_RESET_IND;
     fx->feed(&control, 1);
     fx->pump(6);
 
-    TEST_ASSERT_EQUAL(before, fx->_dll.getStatistics().getRxBusBytes());
+    TEST_ASSERT_EQUAL(before, fx->_dll.getStatistics().getRxFrameBytes());
 
     fx->feedAndSettle(standardFrame());
 
-    TEST_ASSERT_EQUAL(before + 9, fx->_dll.getStatistics().getRxBusBytes());
+    TEST_ASSERT_EQUAL(before + 9, fx->_dll.getStatistics().getRxFrameBytes());
 }
 
 // ---------------------------------------------------------------------------------------------------
 
-void setup()
+// DIE LISTE DER FÄLLE, für beide Einstiegspunkte dieselbe - auf der Hardware ruft setup() sie, nativ
+// main(). Das ist die einzige Stelle, die von einem Fall weiß.
+static int runAllTests()
 {
-    // AUF DEN LESER WARTEN, nicht bloß pauschal schlafen. Nach dem Upload zählt sich der USB-CDC neu auf,
-    // und der Testläufer öffnet den Port erst danach - wer vorher losschreibt, verliert die ersten Zeilen.
-    // Genau das war zu sehen: ein Lauf meldete 23 Fälle statt 24, der erste fehlte einfach.
-    //
-    // Serial.begin() steht hier, obwohl UNITY_OUTPUT_START() es ohnehin täte: sonst gäbe es nichts, worauf
-    // sich warten ließe. Der Zeitausstieg ist dafür da, dass die Sammlung auch ohne angeschlossenen Leser
-    // durchläuft - etwa wenn jemand die Firmware nur flasht und mitliest.
-    Serial.begin(115200);
-
-    uint32_t until = millis() + 5000;
-    while (!Serial && (int32_t)(millis() - until) < 0)
-        delay(10);
-
-    delay(500); // dem Leser Zeit lassen, wirklich zu lesen - das Öffnen allein genügt ihm nicht
-
     UNITY_BEGIN();
 
     RUN_TEST(test_connect_reports_connected);
@@ -1298,6 +1735,9 @@ void setup()
     RUN_TEST(test_bad_checksum_extended_maximal);
     RUN_TEST(test_truncated_frame_is_reported_as_invalid);
     RUN_TEST(test_resync_recovers_at_next_frame);
+    RUN_TEST(test_resyncs_are_counted);
+    RUN_TEST(test_rx_queue_peak_is_tracked);
+    RUN_TEST(test_chip_errors_are_counted_individually);
     RUN_TEST(test_repeated_frame_is_filtered);
     RUN_TEST(test_fragment_then_pause_then_valid_frame);
     RUN_TEST(test_fragment_without_pause_swallows_next_frame);
@@ -1326,6 +1766,15 @@ void setup()
     RUN_TEST(test_monitor_frame_with_acknowledge);
     RUN_TEST(test_monitor_frame_with_nack);
     RUN_TEST(test_monitor_frame_with_busy);
+    RUN_TEST(test_monitor_rejects_send_frame);
+    RUN_TEST(test_monitor_drops_queued_telegram);
+    RUN_TEST(test_monitor_aborts_running_transmission);
+    RUN_TEST(test_monitor_suppresses_state_request);
+    RUN_TEST(test_monitor_rejects_busy_mode);
+    RUN_TEST(test_monitor_clears_busy_mode);
+    RUN_TEST(test_monitor_clears_auto_acknowledge);
+    RUN_TEST(test_monitor_defers_configuration);
+    RUN_TEST(test_monitor_survives_silence_and_exits_cleanly);
 
     RUN_TEST(test_send_frame_produces_correct_sequence);
     RUN_TEST(test_send_standard_minimal);
@@ -1341,12 +1790,52 @@ void setup()
     RUN_TEST(test_confirmation_after_broken_echo_is_lost_without_pause);
     RUN_TEST(test_confirmation_after_broken_echo_arrives_after_pause);
     RUN_TEST(test_missing_confirmation_triggers_reset);
+    RUN_TEST(test_connection_loss_is_counted);
 
+    RUN_TEST(test_tick_rate_is_measured);
+    RUN_TEST(test_tick_gap_survives_restart);
+    RUN_TEST(test_interface_backlog_is_measured);
+    RUN_TEST(test_slow_tick_is_reported);
+    RUN_TEST(test_healthy_tick_is_not_reported);
     RUN_TEST(test_interface_overflow_is_counted);
     RUN_TEST(test_control_sequence_is_never_split);
     RUN_TEST(test_bus_load_counts_only_frame_bytes);
 
-    UNITY_END();
+    return UNITY_END();
+}
+
+#ifndef ARDUINO
+
+// NATIVER EINSTIEGSPUNKT. Kein setup()/loop(), keine serielle Schnittstelle - Unity schreibt hier auf
+// stdout, und der Rückgabewert entscheidet über Erfolg oder Fehlschlag des Laufs.
+int main(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    return runAllTests();
+}
+
+#else
+
+void setup()
+{
+    // AUF DEN LESER WARTEN, nicht bloß pauschal schlafen. Nach dem Upload zählt sich der USB-CDC neu auf,
+    // und der Testläufer öffnet den Port erst danach - wer vorher losschreibt, verliert die ersten Zeilen.
+    // Genau das war zu sehen: ein Lauf meldete 23 Fälle statt 24, der erste fehlte einfach.
+    //
+    // Serial.begin() steht hier, obwohl UNITY_OUTPUT_START() es ohnehin täte: sonst gäbe es nichts, worauf
+    // sich warten ließe. Der Zeitausstieg ist dafür da, dass die Sammlung auch ohne angeschlossenen Leser
+    // durchläuft - etwa wenn jemand die Firmware nur flasht und mitliest.
+    Serial.begin(115200);
+
+    uint32_t until = millis() + 5000;
+    while (!Serial && (int32_t)(millis() - until) < 0)
+        delay(10);
+
+    delay(500); // dem Leser Zeit lassen, wirklich zu lesen - das Öffnen allein genügt ihm nicht
+
+    runAllTests();
 }
 
 // Nach UNITY_END() ist inhaltlich nichts mehr zu tun - die Schleife hält nur die Verbindung offen und
@@ -1402,3 +1891,5 @@ void loop()
 
     delay(10);
 }
+
+#endif // ARDUINO

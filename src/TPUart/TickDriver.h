@@ -3,6 +3,27 @@
 
 #if defined(ARDUINO_ARCH_RP2040)
     #include <pico/time.h>
+
+// PRIORITÄT DES TICK-INTERRUPTS auf dem RP2040. Numerisch KLEINER heißt höher; das SDK setzt beim
+// Hochlauf alles auf PICO_DEFAULT_IRQ_PRIORITY (0x80), und auf dem Cortex-M0+ zählen nur die oberen
+// 2 Bit - es gibt also genau vier Stufen: 0x00, 0x40, 0x80, 0xC0.
+//
+// WARUM ÜBERHAUPT: ein Interrupt verdrängt auf Cortex-M sehr wohl einen anderen (dafür steht das N in
+// NVIC), aber NUR bei echt höherer Priorität - GLEICHE Priorität verdrängt nicht. Solange wir auf 0x80
+// mitschwimmen, wartet der Tick auf jeden anderen Handler, der gerade läuft, und das sind alle.
+//
+// WARUM 0x40 UND NICHT 0x00: im gesamten SDK-Quellbaum gibt es genau einen expliziten
+// irq_set_priority()-Aufruf, und der setzt die Hintergrundarbeit des Netzwerkstacks nach UNTEN
+// (async_context_threadsafe_background auf PICO_LOWEST_IRQ_PRIORITY). Über 0x80 sitzt damit niemand,
+// 0x40 genügt also. 0x00 nähme nur USB und DMA die Luft, ohne etwas hinzuzugewinnen.
+//
+// WAS ES NICHT LÖST: PRIMASK. noInterrupts(), save_and_disable_interrupts() und
+// critical_section_enter_blocking() sperren unabhängig von der Priorität. Wer eine solche Klammer lange
+// hält, hält auch uns an - dagegen hilft nur ein Tick auf dem anderen Kern, denn PRIMASK ist pro Kern.
+// Flash-Schreibvorgänge bleiben in jedem Fall ein Loch, weil sie zusätzlich den zweiten Kern parken.
+    #ifndef TPUART_RP2040_TICK_IRQ_PRIORITY
+        #define TPUART_RP2040_TICK_IRQ_PRIORITY 0x40
+    #endif
 #elif defined(ARDUINO_ARCH_ESP32)
     #include <esp_timer.h>
 #endif
@@ -44,6 +65,25 @@ class DataLinkLayer;
     #define TPUART_TICK_INTERVAL_US 500
 #endif
 
+// AB HIER IST DER ANTRIEB GRUNDSÄTZLICH ZU LANGSAM, und die Zahl kommt aus dem Bus statt aus der
+// Konfiguration: ein Tick bewegt ein Byte je Richtung, ein TP1-Zeichen dauert 1,354ms (9600 Baud,
+// 13 Bitzeiten). Liegt der mittlere Tickabstand darüber, holt die Schicht weniger Bytes ab als der Bus im
+// Vollausbau liefert - dann füllen sich die Puffer, bis etwas überläuft, und keine Puffergröße hilft
+// dagegen. Das ist deshalb keine Empfehlung, sondern eine Untergrenze.
+//
+// DataLinkLayer::checkTickRate() misst dagegen die ERREICHTE Rate und meldet, wenn sie darüber liegt. Der
+// Wert ist bewusst nicht der eingestellte Takt: dass jemand 500µs wollte und 2200µs bekommt, ist die eine
+// Frage - ob das Ergebnis überhaupt für den Bus reicht, die andere und wichtigere.
+#ifndef TPUART_TICK_SLOW_US
+    #define TPUART_TICK_SLOW_US 1354
+#endif
+
+// Fenster, über das gemittelt wird. Lang genug, dass eine einzelne lange Runde im Hauptloop nichts
+// auslöst - der Ausreißer steht in getTickGapMaxUs(), hier geht es um den Dauerzustand.
+#ifndef TPUART_TICK_RATE_WINDOW_MS
+    #define TPUART_TICK_RATE_WINDOW_MS 2000
+#endif
+
 // EIGENER ANTRIEB FÜR tick(), von der Library selbst aufgesetzt.
 //
 // Das Warum steht im Klassenkommentar des DataLinkLayer: tick() bearbeitet pro Aufruf genau ein Byte je
@@ -78,6 +118,20 @@ class TickDriver
 
 #if defined(ARDUINO_ARCH_RP2040)
     repeating_timer_t _timer;
+
+    // EIGENER ALARM-POOL, statt des Default-Pools. Zwei Gründe, und beide zählen: die Callbacks EINES
+    // Pools laufen aus einem gemeinsamen IRQ-Handler und damit serialisiert - wer sonst noch drinhängt,
+    // verzögert uns um seine Laufzeit. Und nur ein eigener Pool hat einen eigenen Hardware-Alarm, dessen
+    // Priorität sich anheben lässt (siehe TPUART_RP2040_TICK_IRQ_PRIORITY).
+    //
+    // Einmal angelegt und behalten: start() kann nach einem end()/begin() erneut laufen, und je Durchlauf
+    // einen Pool zu erzeugen wäre ein Leck - alarm_pool_create() allokiert.
+    alarm_pool_t *_pool = nullptr;
+
+    // Ein einziger Timer je Pool, mehr wird hier nie eingehängt.
+    static constexpr uint32_t POOL_MAX_TIMERS = 1;
+
+    void claimOwnPool();
     static bool onTimer(repeating_timer_t *timer);
 #elif defined(ARDUINO_ARCH_ESP32)
     esp_timer_handle_t _timer = nullptr;

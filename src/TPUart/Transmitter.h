@@ -243,6 +243,10 @@ class Transmitter
     // Ein Reset hat den Sendepuffer der BCU geräumt: ein laufendes Telegramm beginnt von vorn.
     void restart();
 
+    // Räumt den Sendeweg: laufende Übertragung abbrechen und die Warteschlange verwerfen (Wechsel in den
+    // Busmonitor). NUR aus dem Tick - die Begründung steht an der Definition.
+    void abort();
+
     // Ist die übergebene Sequenz das Echo unseres eigenen Telegramms? Der Chip gibt jedes gesendete Oktett
     // an den Host zurück (NCN5130 S. 42), das eigene Telegramm läuft also wie ein fremdes ein. Verlangt
     // wird ein VOLLSTÄNDIGES Telegramm - gebraucht wird die Antwort erst, wenn eines fertig ist (TX-Flag,

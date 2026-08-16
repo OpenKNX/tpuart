@@ -355,11 +355,36 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
     (`Transmitter::process()` fragt nach 2, mit Offsetbyte nach 3, und schreibt sie zusammen), ein
     Tick liefert also ein ganzes Oktett - 1146µs Leitungszeit bei 19200, 572µs bei 38400, beides
     länger als der 500µs-Tick. Die Leitung bleibt der Engpass, und das ist der Sinn.
-  - **RP2040**: Hardware-Timer aus dem Vorgabe-Alarmpool, `tick()` läuft **im Interrupt**. Nur
+  - **RP2040**: Hardware-Timer, `tick()` läuft **im Interrupt**. Nur
     zulässig, weil beide brauchbaren Interfaces ISR-sicher schreiben (`RP2040` über seinen
     Software-TX-Ring, `ArduinoSerial` über `uart_putc_raw()`). Flash-Schreibvorgänge sind keine
     Gefahr: `rp2040_arduino_platform.cpp` klammert sie in `noInterrupts()`/`idleOtherCore()`, der
     Tick pausiert also, statt aus abgeschaltetem XIP zu laufen.
+    **Er hängt in einem EIGENEN Alarmpool, nicht im Vorgabepool**, und das aus zwei Gründen, die beide
+    gemessen sind: die Callbacks *eines* Pools laufen aus einem gemeinsamen IRQ-Handler und damit
+    serialisiert, und nur ein eigener Pool hat einen eigenen Hardware-Alarm, dessen Priorität sich
+    anheben lässt. Sie steht auf `TPUART_RP2040_TICK_IRQ_PRIORITY` (0x40) statt auf den 0x80, die das SDK
+    beim Hochlauf jedem IRQ gibt.
+    **Der Grund dafür ist eine Feinheit des Cortex-M, die leicht falsch erinnert wird**: ein Interrupt
+    verdrängt dort sehr wohl einen anderen (dafür steht das N in NVIC), aber **nur bei echt höherer
+    Priorität - gleiche Priorität verdrängt nicht**. Solange der Tick auf 0x80 mitschwimmt, wartet er auf
+    jeden anderen laufenden Handler, und das sind alle. 0x40 genügt und 0x00 wäre falsch: im gesamten
+    SDK-Quellbaum gibt es genau *einen* expliziten `irq_set_priority()`-Aufruf, und der setzt die
+    Hintergrundarbeit des Netzwerkstacks nach **unten** (`async_context_threadsafe_background` auf
+    `PICO_LOWEST_IRQ_PRIORITY`). Über 0x80 sitzt also niemand; 0x00 nähme nur USB und DMA die Luft.
+    Beachte, dass daraus zugleich folgt, dass **der Netzwerkstack den Tick gar nicht blockieren kann** -
+    eine Vermutung, die hier ausführlich verfolgt und am Quelltext widerlegt wurde.
+    **Keine der bequemen SDK-Funktionen ist für eine Library benutzbar**: `alarm_pool_create()` macht ein
+    *hard assert*, wenn der Alarm schon vergeben ist, und
+    `alarm_pool_create_with_unused_hardware_alarm()` ebenso, wenn gar keiner frei ist - ein Absturz statt
+    eines meldbaren Fehlschlags. `hardware_alarm_claim_unused(false)` ist der einzige Weg, der einen
+    Misserfolg zurückgibt, deshalb wird damit geprüft, sofort wieder freigegeben und erst dann erzeugt
+    (`claimOwnPool()`). Schlägt irgendetwas davon fehl, bleibt `_pool` auf `nullptr` und es läuft wie
+    vorher über den Vorgabepool - der Umbau kann also nicht schlechter sein als sein Vorgänger.
+    **Was Priorität NICHT löst, ist `PRIMASK`**: `noInterrupts()`, `save_and_disable_interrupts()` und
+    `critical_section_enter_blocking()` sperren unabhängig davon. Dagegen hülfe nur ein Tick auf dem
+    zweiten Kern, denn PRIMASK ist pro Kern - und selbst der nicht gegen `idleOtherCore()`, das der
+    Flash-Pfad zusätzlich benutzt.
   - **ESP32**: `esp_timer`, `tick()` läuft im **Timer-Task**. Ein echter Interrupt scheidet aus -
     `uart_write_bytes()` nimmt einen Treiber-Mutex. Bewusst auch kein festgenagelter Task mit
     `delayMicroseconds()` (so machte es das frühere Diagnosewerkzeug): das kostet einen ganzen Kern,
@@ -597,8 +622,71 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
      in den `Resync` und fraß damit nach jedem Moduswechsel stillschweigend diese Antwort plus das
      erste Telegramm danach - ein echter Fehler, keine Entwurfsentscheidung. `Resync` wird ebenfalls
      in Ruhe gelassen (verwirft ohnehin schon).
-  Im Busmonitor ist der Chip durchsichtig und quittiert nichts, `sendAcknowledge()` steigt dort also
-  sofort aus - ein `U_Ackn.req` dort abzusetzen verfälschte eine Spur, die passiv sein soll.
+  **Was im Busmonitor überhaupt noch wirkt, steht in Tabelle 11 des NCN5130-Datenblatts (S. 32), und
+  danach richten sich die Wächter im Code.** Die Tabelle führt je Dienst `E` (wird ausgeführt), `I`
+  (wird ignoriert, *ohne* Rückmeldung an den Host) oder `R` (abgelehnt mit Protokollfehler). Im
+  Busmonitor sind `I`: `U_State.req`, `U_SystemStat.req`, `U_SetBusy.req`/`U_QuitBusy.req`,
+  `U_SetAddress.req`, `U_SetRepetition.req`, `U_Configure.req`, `U_Ackn.req`, `U_PollingState.req` und
+  `U_L_DataStart/Cont/End.req`. `E` bleiben nur `U_Reset.req`, `U_StopMode.req`/`U_ExitStopMode.req`
+  und `U_IntRegWr.req`/`U_IntRegRd.req`. Dazu die Fußnote, die erklärt warum: *"Bus Monitor state is
+  not a separate state. It is applied on top of Normal, Stop, Sync or Power-Up State."*
+  Daraus folgen fünf Sperren, und alle fünf sind aus demselben Grund da - was der Chip ohnehin
+  ignoriert, gehört nicht in eine Spur, die passiv sein soll:
+  - `sendAcknowledge()` steigt sofort aus.
+  - `requestState()` liefert `false`, ohne etwas einzureihen. Das deckt zugleich `stopMode()` und
+    `powerControl()` ab, die es zum Sichtbarmachen ihrer Wirkung rufen - die Dienste selbst wirken
+    (beide `E`), nur die Rückmeldung bleibt aus, `SystemState` steht also für die Dauer still.
+  - `busyMode()` liefert `false`. Es abzusetzen behauptete sonst über `_busyModeSince` einen Zustand,
+    den der Chip gar nicht angenommen hat.
+  - `applyConfiguration()` liefert `false`, ohne etwas abzusetzen. Die Konfigurationsepoche bleibt
+    damit offen und wird nach dem Verlassen nachgeholt - was sich trifft, denn verlassen wird der
+    Modus nur per Reset, und der löscht die Konfiguration im Chip ohnehin.
+  - `Transmitter::process()` kehrt um, **vor** dem `Await`-Zweig und vor der Zustandsprüfung.
+  **Der gesamte Sendeweg wird beim Umschalten geräumt, nicht eingefroren** - `Transmitter::abort()`,
+  gerufen aus `controlByteSent(U_BUSMON_REQ)`. Das umfasst beides: die laufende Übertragung und die
+  Warteschlange. Ein halb abgesetztes Telegramm später fortzusetzen ergibt keinen Sinn (auf dem Bus
+  hat nie jemand einen Anfang gesehen, und der Chip hat es mit dem Moduswechsel ohnehin verworfen) -
+  darin unterscheidet sich `abort()` von `restart()`, das nach einem Reset von vorn beginnt. Und eine
+  eingefrorene Warteschlange ginge beim Verlassen auf einen Schlag hinaus, mit Telegrammen, die dann
+  längst überholt sind.
+  **Es läuft im Tick, und daran hängt die Korrektheit gleich zweifach.** `_txState` behält einen
+  Schreiber - aus dem Hauptkontext kollidierte es mit `confirmed()`/`echoReceived()` aus dem
+  Empfangspfad. Und `_queueTail` ebenso: der naheliegende Weg, den Hauptkontext die Warteschlange
+  leeren zu lassen, weil dort der Heap zu Hause ist, **war ein Wettlauf und wurde zurückgenommen** -
+  er müsste `_queueTail` schreiben, und die Bedingung dafür ("im Busmonitor fasst der Tick die
+  Warteschlange nicht an") kann der Tick zwischen Prüfung und Schreiben aufheben, indem eine
+  `U_Reset.ind` eintrifft und `_busMonitor` löscht. Auf dem ESP32 läuft der Tick echt parallel, das
+  ist also kein reines Verdrängungsproblem. `abort()` zieht deshalb nur `_queueTail` bis an
+  `_queueHead` vor; freigegeben wird der Heap wie immer aus `loop()`, für das die übersprungenen
+  Einträge wie abgeholte aussehen.
+  **Busmon an heißt Busy aus, und Auto-Quittung aus.** Der Chip nimmt im Modus keine Telegramme mehr
+  an und quittiert nichts; ein Busy-Modus, der das Quittieren nur ersetzt, kann es dort nicht geben,
+  und heraus kommt man ohnehin nur per Reset. Der Zustand ist also nicht unbekannt, sondern bekannt
+  weg - `controlByteSent(U_BUSMON_REQ)` setzt `_autoAcknowledge` auf falsch und meldet den Busy-Modus
+  über `reportBusyModeCancelled()` ab. **Gemeldet statt selbst gelöscht**, weil `_busyModeSince` dem
+  Hauptkontext gehört (`busyMode()`, `checkBusyMode()`) und ein zweiter Schreiber aus dem Tick der
+  teurere Fehler wäre; den Weg gibt es für genau diesen Zweck schon. Ohne ihn liefe `checkBusyMode()`
+  in eine Sackgasse: nach Ablauf der Frist ruft es `busyMode(false)`, und das lehnt im Busmonitor jetzt
+  ab - `_busyModeSince` bliebe stehen und der Versuch wiederholte sich endlos.
+  **Beim Verlassen wird `_lastReceivedAt` neu aufgezogen** (in `controlByteSent(U_RESET_REQ)`, solange
+  `_busMonitor` noch steht). Weil die Überwachung während des Modus ruht, ist der Zeitstempel auf
+  einem ruhigen Bus beliebig alt - und Busmonitor auf ruhigem Bus ist der Normalfall. Zwischen dem
+  `U_Reset.req` und der `U_Reset.ind`, die ihn beantwortet, liegt zwar nur etwa eine Millisekunde,
+  aber ein `loop()` genau dort meldete einen Verbindungsabbruch, den es nie gab. Dieselbe Vorsorge
+  steht aus demselben Grund schon in `connectDetected()`.
+  **Und die Verbindungsüberwachung ruht** (`processConnectionState()` kehrt früh um). Sie ruht auf
+  zwei Beinen - Busverkehr als Lebenszeichen und die sekündliche Statusabfrage -, und im Busmonitor
+  bricht das zweite weg, weil `U_State.req` dort `I` ist und keine Antwort erzeugt. Auf einem ruhigen
+  Bus liefe die 5s-Frist deshalb *zwangsläufig* ab, `connectionLost()` setzte den Reconnect in Gang,
+  und dessen `U_Reset.req` beendete den Busmonitor: er hielte nie länger als fünf Sekunden. Der Preis
+  ist, dass eine im Busmonitor ausfallende BCU unbemerkt bleibt, bis der Modus verlassen wird - bei
+  einem passiven Modus hinnehmbar.
+  Dasselbe Muster beim Sendepfad: der Wächter steht vor dem `Await`-Zweig, weil ein Telegramm, das
+  beim Umschalten schon auf die Bestätigung wartet, sonst nach `TPUART_TX_CONFIRM_TIMEOUT_MS` den
+  Wachhund auslöste - und der schickt `U_Reset.req`, beendet also wieder den Busmonitor. Angefangene
+  Telegramme frieren stattdessen ein und laufen nach dem Reset von vorn.
+  Die Steuercode-Warteschlange ist bewusst von keiner Sperre betroffen: über sie geht der Reset
+  hinaus, und der ist der einzige Weg heraus.
   Was der Modus einbringt, ist die Quittung *vom Bus*: `RxState::FrameAck` wartet nach einem
   CRC-gültigen Telegramm ein Byte länger und faltet es
   in die Flags des Telegramms, oder meldet es ohne `ACK`, wenn zuerst die bestätigte Pause zuschlägt -
@@ -658,8 +746,9 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   Telegramm, einen Resync, eine ausbleibende Antwort), und zwischen zwei Telegrammen gibt es nichts
   zu beenden; die Länge kommt aus dem Längenoktett, nicht aus der Zeit. Das ist zugleich der
   billigste verfügbare Leerlaufpfad: auf einem ruhigen Bus ist `Idle` der Normalzustand, ein Tick
-  kostet dann einen Vergleich statt eines `micros()`-Aufrufs, und der Leerlauftick ist auf **einen**
-  MMIO-Zugriff herunter (den DMA-Zähler in `available()`).
+  spart dort den `micros()`-Aufruf der Pausenmessung und kostet stattdessen einen Vergleich.
+  (Die Abkürzung spart nicht mehr *jeden* Zeitzugriff: seit der Taktmessung liest `tick()` selbst
+  einmal `micros()` - siehe den Leerlaufpfad weiter unten.)
   Zwei Felder bleiben: `_emptySince` + `_emptyStarted` - seit wann das Interface nichts mehr liefert,
   und ob diese Messung überhaupt läuft. Das zweite trägt: der Bezugspunkt muss die *erste*
   Beobachtung von Stille sein, nicht das zuletzt gelesene Byte, sonst hielte ein stehengebliebener
@@ -722,14 +811,20 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   und die Steuerbytes, er beschleunigt den Empfang nicht. Bei 100µs sind das ~13 Ticks je Byte, und
   ein Byte je Tick hat reichlich Reserve.
 - **Der Leerlaufpfad muss so kurz wie möglich bleiben**, denn bei 100µs ist er der mit Abstand am
-  häufigsten ausgeführte Code hier. Heutige Gestalt, gemessen auf dem RP2040: zwei MMIO-Lesevorgänge
-  (der DMA-Transferzähler in `available()` und `micros()` in `checkPause()`, solange ein Pausenfenster
-  läuft) plus etwa ein Dutzend Vergleiche - deutlich unter 100 von den ~13.300 Takten, die bei 133MHz
-  je Tick zur Verfügung stehen, also rund 0,5% CPU. Die Reihenfolge der Wächter ist bewusst gewählt:
-  `_initialized` und `_connected` zuerst, dann `_interface.available()`, und auf der TX-Seite
-  `_txState == Idle` vor allem anderen. Muss das je billiger werden, sind die zwei naheliegenden
-  Kandidaten, den `micros()`-Aufruf in `checkPause()` durch einen Tickzähler zu ersetzen und dem
-  Leerlaufpfad eine Ja/Nein-Abfrage statt der vollen Anzahl von `available()` zu geben.
+  häufigsten ausgeführte Code hier. Heutige Gestalt, gemessen auf dem RP2040: zwei bis drei
+  MMIO-Lesevorgänge (`micros()` für die Taktmessung, der DMA-Transferzähler in `available()`, und
+  `micros()` in `checkPause()`, solange ein Pausenfenster läuft) plus etwa ein Dutzend Vergleiche -
+  deutlich unter 100 von den ~13.300 Takten, die bei 133MHz je Tick zur Verfügung stehen, also rund
+  0,5% CPU. Die Reihenfolge der Wächter ist bewusst gewählt: `_initialized` und `_connected` zuerst,
+  dann `_interface.available()`, und auf der TX-Seite `_txState == Idle` vor allem anderen. Muss das
+  je billiger werden, sind die zwei naheliegenden Kandidaten, den `micros()`-Aufruf in `checkPause()`
+  durch einen Tickzähler zu ersetzen und dem Leerlaufpfad eine Ja/Nein-Abfrage statt der vollen
+  Anzahl von `available()` zu geben.
+  **Der erste `micros()`-Aufruf ist eine bewusste Abkehr von "so wenig wie möglich"**, und er steht
+  ausdrücklich *vor* allen weiteren Abbrüchen in `tick()`: gemessen werden soll der **Antrieb**, also
+  wie oft wir gerufen werden, nicht wie oft wir etwas zu tun hatten. Er kostet rund 0,1% CPU und
+  bezahlt damit den einzigen Wert dieser Schicht, der sich vorher überhaupt nicht ablesen ließ. Wie
+  teuer das Raten stattdessen war, steht bei `getTicks()` in `Statistics.h`.
 - **Das Interface gehört `tick()` allein.** Sobald der Timer-Antrieb läuft, darf nichts von außen
   `Interface::Abstract` anfassen - das wäre ein zweiter Zugriffskontext auf dieselben Zähler und
   Hardwareregister, und `RP2040::overflow()` löscht als Nebenwirkung sogar das Overrun-Flag des UART.
@@ -876,15 +971,155 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   `tick()` hochgezählt und aus dem Hauptkontext gelesen, daher
   `volatile` und einfache Inkremente - ein Schreiber je Zähler. `reset()` aus dem Hauptkontext kann
   mit einem Inkrement kollidieren; für eine Statistik wird das hingenommen statt gesperrt.
+  **Das Namensschema ist verbindlich**: Richtungspräfix immer (`getRx…`/`getTx…`), die Einheit steht
+  im Namen (`…Frames` zählt Telegramme, `…Bytes` zählt Bytes, `…Overflows`/`…Losses` zählen
+  Ereignisse), nichts wird abgekürzt. Wer einen Zähler ergänzt, hält sich daran - sonst ist in einem
+  Jahr wieder unklar, ob ein `getInterfaceOverflows` den Empfang oder den Versand meint (es war der
+  Empfang, daher heißt er heute `getRxInterfaceOverflows`).
+  **Eine Zahl, ein Name.** `getRxFrameBytes()` und `getRxBusBytes()` lieferten dasselbe Feld unter
+  zwei Namen - genau die Doppelung, die diese Klasse an ihrem Vorgänger kritisiert. `getRxFrameBytes()`
+  ist die echte Methode, `getRxBusBytes()` nur noch KOMPAT.
+  **Der KOMPAT-Block enthält ausschließlich Namen, die es in v1 schon gab und die ein Verbraucher
+  aufruft.** Neue Namen bekommen dort *nichts*: solange 2.0 in Arbeit ist, kann sich auf sie noch
+  niemand stützen, sie dürfen also direkt heißen, wie sie heißen sollen. Nicht nachgerüstet werden die
+  drei ungenutzten Dubletten aus v1 (`getRxOverflowInterface`, `getRxOverflowFrameBuffer`,
+  `getRxOverflowSearchBuffer`) - dort gab es jedes dieser Ereignisse unter zwei Namen, und die
+  Verbraucher rufen durchweg nur die eine Schreibweise.
+  **Gesendete Telegrammbytes gibt es bewusst nicht als eigenen Zähler**, sie sind ableitbar - aber
+  nicht so einfach, wie es aussieht: die Quittung geht ebenfalls über `Transmitter::writeByte()` und
+  steckt damit in `getTxBytes()`. Richtig ist
+  `getTxBytes() - getTxControlBytes() - getTxAcknowledges()`, denn eine Quittung ist genau ein Byte.
+  **Ereignis und Umfang sind zwei Fragen.** `getRxResyncs()` zählt, wie oft die Position im Bytestrom
+  verloren ging, `getRxDroppedBytes()` was es gekostet hat - drei Resyncs zu je 5 Byte und einer zu 15
+  ergeben dieselbe Byte-Zahl bei völlig verschiedenem Befund. Gezählt wird an der einen Stelle, an der
+  alle Wege in den Resync zusammenlaufen (`resetSequence()`); doppelt zählt dabei nichts, weil
+  `forceResync()` bei bereits laufendem Resync früh umkehrt.
+  **Die Fehler, die der Chip selbst meldet, werden einzeln gezählt** - `getChipSlaveCollisions()`,
+  `getChipReceiveErrors()`, `getChipTransmitErrors()`, `getChipProtocolErrors()`,
+  `getChipTemperatureWarnings()`. Nötig ist das, weil `_stateErrors` die Bits aus `U_State.ind` nur
+  ODER-akkumuliert und beim Ausgeben löscht: der Chip meldet jedes Ereignis genau einmal, "einmal vor
+  Stunden" und "dauernd" sähen dort gleich aus. Einzeln statt als Summe, weil es fünf verschiedene
+  Diagnosen sind - eine stehende Übertemperaturwarnung ist etwas anderes als gelegentliche Kollisionen.
+  Ein gemeinsamer Zähler über alle fünf fehlt **bewusst** - er sagte nichts, was diese hier nicht
+  besser sagen, und wäre nachträglich auch nicht zu bilden, weil ein `U_State.ind` mehrere Bits zugleich
+  tragen kann. Die Zuordnung Bit → Zähler steht im `DataLinkLayer`, nicht in `Statistics` - dafür
+  braucht es die Protokollkonstanten, und die Zählerklasse soll keine kennen. Kein `Rx`/`Tx`-Präfix:
+  das sind Zustände des Chips, keine Richtung von uns aus (TE und SC entstehen beim Senden auf dem Bus,
+  RE beim Empfangen - ein gemeinsames Präfix wäre in jedem Fall falsch).
+  **Höchststände statt nur Überläufe.** `getRxQueuePeakBytes()`, `getTxControlQueuePeakBytes()` und
+  `getTxQueuePeakFrames()` beantworten die Auslegungsfrage, *bevor* etwas überläuft - ein
+  Überlaufzähler sagt nur, dass es zu spät war. Sie hängen sich an einen Füllstand an, der an der
+  jeweiligen Stelle ohnehin ausgerechnet wird, es kommt also nur ein Vergleich dazu. Die Einheit steht
+  im Namen, weil sie nicht dieselbe ist: RX- und Steuerring zählen Bytes, die Sendequeue Telegramme.
+  Zu lesen sind sie gegen `TPUART_RX_QUEUE_SIZE`, `TPUART_CTRL_QUEUE_SIZE` und
+  `TPUART_TX_QUEUE_COUNT`.
+  **Gezählt werden Probleme, nicht Vorgänge.** Deshalb gibt es `getConnectionLosses()` und
+  `getTxConfirmTimeouts()`, aber keinen Zähler für Resets und keinen für negative Bestätigungen: ein
+  negatives `L_Data.con` sagt nur, dass auf dem Bus niemand quittiert hat - eine Aussage über den Bus,
+  kein Fehler der Strecke. `getTxConfirmTimeouts()` zählt dagegen den Fall, in dem **überhaupt keine**
+  Bestätigung kam und der Wachhund die BCU zurücksetzen musste; das zeigt auf den Chip oder die
+  Verkabelung. Resets zu zählen wurde verworfen, weil allein die Baudratenerkennung mehrere schickt -
+  ohne Ursache ist die Zahl wertlos.
   **Der Unterschied, auf den es ankommt: kaputte Telegramme und verworfene Bytes sind nicht
   dasselbe** und werden getrennt gezählt. Ein kaputtes Telegramm *wurde gemeldet* (mit
   `TP_FRAME_FLAG_INVALID` - CRC-Fehler, von einer Pause abgeschnitten, beschädigtes Längenoktett), der
-  Verbraucher hat es also gesehen. Verworfene Bytes hat nie jemand gesehen: alles, was während
-  `Resync` verbraucht wurde, plus die Reste einer von einem Moduswechsel abgebrochenen Sequenz. Ein
-  gemeinsamer Zähler "verworfen" für beides wäre unbrauchbar - führe ihn nicht ein.
-  `getAcknowledgesSuppressed()` lohnt die Beobachtung: er zählt den Fall "wir liegen hinter dem Bus",
+  Verbraucher hat es also gesehen. Verworfene Bytes hat nie jemand gesehen, und dafür gibt es drei
+  Quellen: alles, was während `Resync` verbraucht wurde; die Reste einer von einem Moduswechsel
+  abgebrochenen Sequenz; und ein fertiger Eintrag, für den im RX-Ring kein Platz mehr war. Ein
+  gemeinsamer Zähler "verworfen" für kaputte Telegramme und verlorene Bytes wäre unbrauchbar - führe
+  ihn nicht ein.
+  **Die Kategorien sind keine Zerlegung**: ein mangels Ringplatz verworfenes Telegramm steht mit
+  seinen Bytes auch in `getRxFrameBytes()`, denn über den Bus kam es, und daran hängt die Buslast.
+  `getTxAcknowledgesSuppressed()` lohnt die Beobachtung: er zählt den Fall "wir liegen hinter dem Bus",
   was korrektes Verhalten ist und kein Fehler - ein steigender Wert heißt aber, dass der Tick nicht oft
-  genug drankommt.
+  genug drankommt. **Er ist dabei nicht durch Fremdverkehr aufgebläht**: `sendAcknowledge()` fragt den
+  Quittungs-Callback *vor* der Rückstandsprüfung, ein abgelehntes Telegramm kommt also gar nicht bis
+  dorthin. Ohne diese Reihenfolge zeigte ein Gerät ohne eigene Adressen Rückstände in Höhe des gesamten
+  Busverkehrs an, und ein echter Rückstand wäre darin nicht mehr zu finden - festgehalten in
+  `test_unaddressed_frame_is_not_acknowledged`, das den Fall bewusst *mit* vollem Rückstand fährt.
+- **Der Takt misst sich selbst** (`getTicks()`, `getTickGapMaxUs()`, `getRxInterfacePeakBytes()`), und
+  das ist die Antwort auf ein wiederkehrendes Problem: der Antrieb ist die Voraussetzung für alles in
+  dieser Schicht, war aber der einzige Wert, den man **nicht ablesen konnte**. Sichtbar waren nur seine
+  Folgen - unterdrückte Quittungen, Interface-Überläufe -, und die Ursache musste geraten werden.
+  Drei Werte, weil sie drei verschiedene Krankheitsbilder trennen, und erst zusammen ergeben sie eine
+  Diagnose:
+  - `getTicks()` gegen die Laufzeit ist die **mittlere** Rate. Deutlich unter dem eingestellten Soll
+    heißt: der eigene Antrieb läuft gar nicht, der Hauptloop tickt - dasselbe sagt `hasTickDriver()`.
+  - `getTickGapMaxUs()` ist der **schlechteste** je gemessene Abstand, absichtlich nie gemittelt: ein
+    einziger zu langer Aussetzer ist genau der Fall, der ein Quittungsfenster zerstört. Ein guter
+    Mittelwert bei schlechtem Maximum heißt, der Antrieb stimmt, wird aber zwischendurch blockiert.
+  - `getRxInterfacePeakBytes()` ist derselbe Befund in der Einheit, in der er entsteht: 0-1 ist gesund
+    (der Bus liefert höchstens alle 1,354ms ein Byte, der Tick holt alle 500µs eines ab), ab 2 wird bei
+    Byte 6 die Quittung unterdrückt. Kostenlos erhoben, weil `Receiver::process()` `available()` ohnehin
+    fragt.
+  Die Grenze, die zählt, ist **~2700µs**: darüber ist ein Standardtelegramm vollständig eingetroffen,
+  bevor der Tick bei Byte 6 die Entscheidung trifft.
+  `_tickLastUs` gehört dem Tick und wird in `begin()` zurückgesetzt - die Pause zwischen `end()` und
+  `begin()` ist kein Aussetzer des Antriebs, und ohne das Zurücksetzen stünde sie für immer als
+  Höchstwert da, ausgerechnet auf einem Gerät, das die BCU neu verbindet (`test_tick_gap_survives_restart`).
+  `DataLinkLayer::tickInterval()` liefert dazu das **eingestellte** Soll. Die drei Auskünfte sind
+  bewusst getrennt: `hasTickDriver()` sagt, *wer* tickt, `tickInterval()`, wie schnell es *gedacht* war,
+  und `getTicks()`, was daraus *geworden* ist.
+- **Und der Antrieb meldet sich selbst, wenn er die Untergrenze reißt** (`checkTickRate()`, aus `loop()`,
+  Fenster `TPUART_TICK_RATE_WINDOW_MS` = 2000). Das ist die Lehre aus dem Fall, der diese ganze Messung
+  ausgelöst hat: im Router lag die Rate bei 457/s statt 2000/s, und **sichtbar war davon ausschließlich der
+  Folgeschaden** - 12% unterdrückte Quittungen und ein Rückstand von 7 Byte. Die Ursache stand nirgends;
+  sie war nur auf ausdrückliche Nachfrage über `hasTickDriver()` zu erfahren, und danach fragt im Betrieb
+  niemand. Nach dem Umschalten auf den eigenen Timer: 0 unterdrückte Quittungen, unverändert am
+  Protokollpfad.
+  Zwei Entwurfsentscheidungen daran sind tragend:
+  - **Gemessen wird die ERREICHTE Rate, nicht die eingestellte.** Ein Wächter auf `hasTickDriver()` hätte
+    genau den Fall verfehlt, in dem jemand absichtlich selbst tickt (`setExternalTick`) und dabei zu langsam
+    ist - und das war hier fast der Fall.
+  - **Die Schwelle kommt aus dem Bus, nicht aus der Konfiguration**: `TPUART_TICK_SLOW_US` ist 1354, die
+    Zeichenzeit auf TP1. Ein Tick bewegt ein Byte je Richtung; liegt der mittlere Abstand darüber, holt die
+    Schicht weniger Bytes ab, als der Bus im Vollausbau liefert (738 Byte/s), und **keine Puffergröße hilft
+    dagegen**. Unterhalb ist alles gut, oberhalb ist es grundsätzlich kaputt - das ist keine Empfehlung,
+    sondern eine Untergrenze.
+  Gemeldet wird **einmal je Störung**, nicht je Fenster; erholt sich die Rate, wird der Melder wieder
+  scharf. Der Fall "gar kein Tick im Fenster" ist ausdrücklich behandelt, er wäre sonst eine Division durch
+  null. Zwei Testfälle hängen daran, und der zweite ist der wichtigere:
+  `test_slow_tick_is_reported` und `test_healthy_tick_is_not_reported` - ein Wächter, der grundsätzlich
+  meldet, wäre ohne den zweiten genauso "grün" wie der richtige und im Betrieb reines Rauschen.
+  **Ein guter Mittelwert schließt das Problem nicht aus**, und im Router steckten dahinter *zwei*
+  verschiedene Ursachen, die sich im blossen Höchstwert nicht unterscheiden ließen - erst
+  `getTickSlowGaps()` hat sie getrennt:
+  - **Dauerhaft, 2-4 mal je Sekunde**: ein gleichrangiger Interrupt auf 0x80. Behoben durch den eigenen
+    Alarmpool mit angehobener Priorität (siehe `TickDriver`), Ergebnis 0 slow über 26000 Ticks bei einem
+    Höchstwert von 520µs gegen 500µs Intervall.
+  - **Einmalig und riesig**: ein Flash-Schreibvorgang. **Auf BEIDEN Plattformen gemessen** - RP2040
+    53176µs, ESP32 40033µs -, es ist also keine Eigenheit des einen Ports. Der Mechanismus unterscheidet
+    sich, die Wirkung nicht: der RP2040 sperrt über `noInterrupts()`/`idleOtherCore()` das XIP (PRIMASK
+    wirkt unabhängig von jeder IRQ-Priorität, und `idleOtherCore()` parkt Kern 1 gleich mit - ein Tick
+    dort wäre also ebenfalls betroffen), beim ESP32 wird der Instruction-Cache abgeschaltet und der
+    `esp_timer`-Task kann nicht aus dem Flash laufen. Aus der Library heraus ist beides nicht behebbar.
+    **Die Dauer, die die Anwendung für den Speichervorgang meldet, ist NICHT der Stillstand** - sie
+    beantwortet eine andere Frage, und beide Zahlen sind für sich richtig. Gemeldet wird die Dauer des
+    integritätskritischen Fensters: so lange muss die Stromversorgung bei einem Ausfall überbrücken,
+    damit die Daten vollständig geschrieben sind. Auf dem RP2040 wird der Schreibbereich VORAB gelöscht
+    und der Erase des alten Blocks läuft danach - das kritische Fenster ist damit kurz ("2ms"), der
+    Tick-Stillstand umfasst aber auch den nachgelagerten Erase (53176µs). Auf dem ESP32 fallen beide
+    zusammen ("47ms" gegen 40033µs), weil der Erase dort im Schreibvorgang steckt.
+    Für die Auslegung von Fristen dieser Schicht zählt der Stillstand, nicht die gemeldete Schreibdauer.
+  **Was ein solcher Stillstand kostet, ist für Puffer und Quittung VERSCHIEDEN**, und die Messung oben
+  zeigte nur deshalb keinen Schaden, weil der Bus fast leer war - das ist kein Freibrief:
+  - **Der Empfangspuffer hält, und das ist rechenbar.** Die DMA ist eigenständig und füllt den Ring
+    weiter, während die CPU steht; sie braucht keine Interrupts. 52ms bei voller Buslast (738 Byte/s)
+    sind 38 Byte gegen einen 256-Byte-Ring - überlaufen würde er erst bei rund 350ms.
+  - **Die Quittung hält nicht - und mehr als sie kann auch nicht verlorengehen.** Jedes Telegramm, dessen
+    Byte 6 in das Fenster fällt, verliert seine Quittung; bei voller Last sind das drei bis vier je
+    Stillstand. Dass in der Messung keines betroffen war, lag daran, dass nur 3% des Verkehrs an dieses
+    Gerät gerichtet waren und der Bus ruhig lag - Glück, kein Verdienst.
+    **Das Telegramm selbst geht dabei nicht verloren**: es liegt im Ring, wird nach dem Stillstand
+    zerlegt und ausgeliefert, und die Wiederholungen des Absenders kommen ebenfalls an (als `FILTERED`
+    markiert). Die Kosten liegen beim ABSENDER - drei Wiederholungen Busbandbreite und eine Übertragung,
+    die er für gescheitert hält, obwohl sie ankam. Empfangsverlust setzt einen Ringüberlauf voraus, und
+    der bräuchte die oben gerechneten ~350ms.
+  Zugleich ist es der Beleg dafür, dass die Pausenerkennung richtig aufgehängt ist: `_emptySince` misst ab
+  der ersten Beobachtung von Stille, ein 52ms-Stillstand des Ticks wird also nicht als Buspause
+  missdeutet.
+  Der Wächter schweigt zu beidem zu Recht, sobald der Mittelwert stimmt - dafür gibt es
+  `getTickGapMaxUs()` und `getTickSlowGaps()` daneben.
   `getBusLoad()` hat die Einheit Byte je Sekunde und ist ein **gleitender Mittelwert** über
   `BUS_LOAD_WINDOW` (3) Sekunden, fortgeschaltet alle `BUS_LOAD_SLICE_MS` (1000). Beide sind feste
   `static constexpr`-Member, keine überschreibbaren Makros - sie beschreiben eine Anzeige, keine
@@ -1202,15 +1437,40 @@ Ausdrücklich zurückgestellt (Entscheidung des Anwenders, nicht vergessen):
 
 ## Build-Umgebungen
 
-`platformio.ini` hat **zwei Envs, und beide sind Testumgebungen**: `pico_test` und `esp32_test`. Eine
-Produktions-Env gibt es bewusst nicht - dieses Repository ist eine Library, kein Programm. Gebaut und
-geprüft wird ausschließlich über `pio test`:
+`platformio.ini` hat **drei Envs, und alle drei sind Testumgebungen**: `pico_test`, `esp32_test` und
+`native_test`. Eine Produktions-Env gibt es bewusst nicht - dieses Repository ist eine Library, kein
+Programm. Gebaut und geprüft wird ausschließlich über `pio test`:
 
 ```
 pio test -e pico_test
 pio test -e esp32_test
+pio test -e native_test                                       (auf dem PC, ohne Gerät)
 pio test -e pico_test --without-uploading --without-testing   (nur übersetzen, ohne Gerät)
 ```
+
+**`native_test` ist eine Ergänzung, kein Ersatz.** Es fährt dieselben Fälle gegen dieselbe Library,
+aber mit **gestellter Uhr**: `pump()` dreht die Zeit in 50µs-Schritten weiter, statt zu warten. Der
+ganze Durchlauf kostet damit rund zwei Sekunden statt fünfundzwanzig, und die beiden
+Fünf-Sekunden-Fälle kosten gar nichts mehr.
+Was dabei **wegfällt, ist das Zeitverhalten selbst** - und daran ist hier schon ein Fehler
+aufgefallen, den eine gestellte Uhr wegdefiniert (siehe die Zustellkosten der Testvorrichtung weiter
+unten). Die Schrittweite *ist* die Tickrate; 50µs liegen unter dem 500µs-Vorgabetakt und weit unter
+der Bytezeit des Busses, die Pausenerkennung sieht nativ also feiner auf als auf jeder echten
+Plattform. Ein Fall, der nativ besteht, kann auf Hardware knapp scheitern. **Vor einer Freigabe zählen
+die Hardwareläufe.**
+Möglich ist das **ohne eine Zeile Änderung in `src/`**: die Library benutzt aus Arduino nur `millis()`
+und `micros()`, und die plattformgebundenen Teile schalten sich über ihre eigenen
+`ARDUINO_ARCH_*`-Klammern selbst ab (`Interface/RP2040.cpp`, `ESP32.cpp`, und `TickDriver.cpp` hat
+einen `#else`-Zweig, der `supported()` auf `false` setzt). Den Ersatz liefert
+`test/test_tpuart/native/Arduino.h`; nur diese Env nimmt den Ordner über `-I` in den Suchpfad, in den
+Hardware-Envs liegt das echte `Arduino.h` davor.
+Der Schim ist **header-only, und das ist Bedingung**: eine `.cpp` dort würde PlatformIO in *jeder* Env
+mitübersetzen (der Testordner wird rekursiv gebaut) und den Hardware-Envs ein zweites `millis()`
+verpassen. Der Zählerstand steckt deshalb in einem funktionslokalen `static`.
+Was nativ nicht mitläuft, ist `interface_check.cpp` - es instanziiert `ArduinoSerial<decltype(Serial1)>`
+und die Plattform-Interfaces, und beides gibt es dort nicht. Die Env braucht einen **Host-Compiler im
+`PATH`** (`g++` oder `clang++`); fehlt er, scheitert sie beim Übersetzen, ohne die anderen beiden zu
+berühren.
 
 `pio run` ist **kein Einstiegspunkt** und scheitert im Linker mit `undefined reference to 'setup'`:
 `setup()` und `loop()` kommen aus `test/test_tpuart/test_main.cpp`, und dieser Ordner wird nur bei
@@ -1250,9 +1510,27 @@ Sammlung auch unbeaufsichtigt läuft); ohne das fehlt der erste Fall regelmäßi
 Lauf hält `loop()` die Verbindung offen und nimmt zwei Tasten entgegen: `r` fährt die Sammlung erneut,
 `b` setzt den RP2040 in den Bootloader.
 
-**Beide Plattformen sind verifiziert**, nicht nur gebaut: 51 von 51 auf `pico_test` und dieselben 51
-auf `esp32_test` (dort ~25s). Da die Fälle echte Fristen ausmessen, ist gerade diese Übereinstimmung
-über zwei sehr verschiedene Uhren und Treiberpuffer hinweg das Interessante am Ergebnis.
+**Beide Plattformen sind verifiziert**, nicht nur gebaut: 60 von 60 auf `pico_test` (~24s) und
+dieselben 60 auf `esp32_test` (~28s). Da die Fälle echte Fristen ausmessen, ist gerade diese
+Übereinstimmung über zwei sehr verschiedene Uhren und Treiberpuffer hinweg das Interessante am
+Ergebnis.
+
+**Die Testvorrichtung muss billig zustellen, sonst verfälscht sie Zeitmessungen.** Mit
+`setTickInterval(0)` laufen Tick und Loop serialisiert: was der Telegramm-Callback kostet, liegt
+zwischen dem Tick, der das letzte Byte einer Sequenz verbraucht, und dem nächsten, der die Leere
+bemerkt und `_emptySince` setzt - die Zustellkosten verschieben also die Pausenerkennung nach hinten.
+`_frames` wuchs während eines Falls um und kopierte dabei jeden Eintrag samt Datenvektor neu;
+`test_confirmation_after_broken_echo_arrives_after_pause` fiel dadurch auf dem RP2040 in etwa der
+Hälfte der Läufe durch - die Pause wurde erst erkannt, nachdem das `L_Data.con` bereits eingetroffen
+und im `Resync` verworfen war. Behoben mit `reserve()` und `push_back(std::move(...))`; auf dem ESP32
+war die Reserve zufällig groß genug, dort fiel es nie auf.
+
+**Die neun Busmonitor-Fälle sind gegen Mutation geprüft**, und das war nötig: `abort()`
+auszukommentieren ließ zunächst nur *einen* der beiden dafür gedachten Fälle scheitern.
+`test_monitor_aborts_running_transmission` bestand weiter, weil schon der Wächter in
+`Transmitter::process()` verhindert, dass noch Bytes hinausgehen - der Fall prüfte also den Wächter
+und nicht den Abbruch. Erst die zusätzliche Zusicherung auf `TxState::Idle` bindet ihn an
+`abort()`. Wer hier einen Fall ergänzt: prüfe, ob er ohne die zugehörige Änderung wirklich scheitert.
 
 `monitor_speed = 115200` steht in `[env]` und muss zum `Serial.begin(115200)` in `test_main.cpp`
 passen; PlatformIOs Vorgabe wäre 9600. Das fiel nur auf dem ESP32 je ins Gewicht, wo `Serial` ein
@@ -1261,7 +1539,8 @@ Zierde, weshalb die fehlende Zeile bis zur ersten ESP32-Monitorsitzung unbemerkt
 Buchstabensalat zeigte. Der Testläufer selbst war nie betroffen: er benutzt `test_speed`, dessen
 Vorgabe bereits 115200 ist.
 
-**Alles läuft in Echtzeit - es gibt keine stellbare Uhr.** Ein Fall kostet, was die Sache kostet:
+**Auf der Hardware läuft alles in Echtzeit - dort gibt es keine stellbare Uhr** (die hat nur
+`native_test`, siehe oben). Ein Fall kostet, was die Sache kostet:
 2,6ms für die Pausenerkennung, 5s für einen Verbindungsverlust. Das ist der Preis dafür, die echten
 Fristen zu prüfen statt heruntergedrehter, und der ganze Lauf bleibt trotzdem im Sekundenbereich.
 Wird das je untragbar, ist der Hebel eine Indirektion `TPUart::nowMs()`/`nowUs()` - 14 direkte
@@ -1314,10 +1593,16 @@ Oberfläche fest. Drei Gruppen, und nur die erste ist schuldenfrei:
    `tick()` + `loop()`, `end()`, `pushTransmitQueue(Frame*)`, das bei Erfolg den Besitz übernimmt und
    die Länge um eins kürzt, weil die Library die Prüfsumme selbst rechnet) und `Frame(const char*,
    size_t)`.
-3. **Platzhalter, die 0 liefern**, mit `DUMMY` markiert: `Receiver::getSearchBufferPosition()`,
-   `getAwaitBytes()`, `Statistics::getRxSearchBufferOverflow()`. Einen SearchBuffer gibt es nicht,
-   es ist also nichts zu melden - `OGM-Common`s `bcu`-Befehl druckt sie trotzdem. Die Parameter
-   `irq`/`dma` des `RP2040`-Konstruktors werden aus demselben Grund ignoriert: es gibt nur den
+3. **Platzhalter aus der Zeit des SearchBuffers**, den es hier nicht mehr gibt. `OGM-Common`s
+   `bcu`-Befehl druckt sie trotzdem, sie müssen also aufrufbar bleiben - liefern aber nicht mehr
+   konstant 0, sondern die nächstliegende Aussage über den heutigen Empfangspfad:
+   `Receiver::getSearchBufferPosition()` den Füllstand des Empfangspuffers und
+   `Receiver::getAwaitBytes()` die noch ausstehenden Bytes des laufenden Telegramms (0, solange die
+   Größe noch nicht feststeht). Zwei tote Spalten sagen nichts; diese beiden zusammen zeigen, wo im
+   Telegramm die Verarbeitung gerade steht.
+   Bei **0** bleibt allein `Statistics::getRxSearchBufferOverflow()` - dafür gibt es in dieser
+   Library nichts Vergleichbares, jeder Ersatzwert wäre eine Falschaussage. Die Parameter `irq`/`dma`
+   des `RP2040`-Konstruktors werden aus demselben Grund ignoriert wie früher: es gibt nur den
    DMA-Pfad.
 
 **Nichts in diesem Repository fasst diese Oberfläche an**, kein Test und kein Beispiel - die Gruppen
@@ -1384,6 +1669,10 @@ und erst am laufenden Bus auffiel - wer an denselben Stellen arbeitet, läuft in
   500µs-Intervalls.
 - Die Testsammlung läuft auf beiden Plattformen auf echter Hardware, prüft dort aber gegen den `Dummy`:
   verifiziert sind damit Protokoll und Zeitverhalten der Library, nicht die Interface-Klassen.
+- **Der Busmonitor ist nie an einem echten Chip gelaufen.** Die neun Testfälle laufen gegen den `Dummy`,
+  und die Wächter selbst sind aus Tabelle 11 des NCN5130-Datenblatts (S. 32) abgeleitet - gelesen, nicht
+  gemessen. Offen ist damit vor allem, ob der Chip die dort als `I` geführten Dienste tatsächlich
+  folgenlos verwirft, und ob `stopMode()`/`powerControl()` im Modus wirklich durchgreifen.
 - Poll-Slave-Betrieb (`U_PollingState.req`, beim NCN zusätzlich Auto-Polling über `U_Configure.req`)
   bewusst nicht umgesetzt - nur damit könnte das Gerät an einem Poll überhaupt teilnehmen.
   Empfangsseitig ist der Fall abgedeckt, und kein Verbraucher der Library kennt Polldaten.

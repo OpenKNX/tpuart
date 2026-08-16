@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 
-// Die Zähler stehen im Byte-Pfad von tick() und sind damit der am häufigsten durchlaufene Code der Library.
+// Die Zähler stehen im Byte-Pfad des Ticks und sind damit der am häufigsten durchlaufene Code der Library.
 // Sie sind trotzdem hier und nicht als inline-Rümpfe im Header: ein Inkrement ist ein Speicherzugriff plus
 // Funktionsaufruf, gegen die 500µs zwischen zwei Ticks ist das nicht messbar. Ein Tick kostet gemessen
 // 2-3µs, davon geht das hier im Rauschen unter.
@@ -11,22 +11,41 @@ namespace TPUart
 
 void Statistics::reset()
 {
-    _rxReceivedBytes = 0;
+    _rxBytes = 0;
     _rxFrames = 0;
     _rxInvalidFrames = 0;
     _rxFrameBytes = 0;
     _rxControlBytes = 0;
     _rxDroppedBytes = 0;
-    _rxRepetitions = 0;
+    _rxRepeatedFrames = 0;
     _txControlBytes = 0;
     _txFrames = 0;
     _txBytes = 0;
-    _acknowledgesSent = 0;
-    _acknowledgesSuppressed = 0;
-    _interfaceOverflows = 0;
+    _txAcknowledges = 0;
+    _txAcknowledgesSuppressed = 0;
+    _txConfirmTimeouts = 0;
+    _rxInterfaceOverflows = 0;
     _rxQueueOverflows = 0;
-    _ctrlQueueOverflows = 0;
+    _txControlQueueOverflows = 0;
     _txQueueOverflows = 0;
+    _connectionLosses = 0;
+    _rxResyncs = 0;
+    _chipSlaveCollisions = 0;
+    _chipReceiveErrors = 0;
+    _chipTransmitErrors = 0;
+    _chipProtocolErrors = 0;
+    _chipTemperatureWarnings = 0;
+    _ticks = 0;
+    _tickGapMaxUs = 0;
+    _tickSlowGaps = 0;
+    _tickDurationMaxUs = 0;
+    _checkAcknowledgeMaxUs = 0;
+    _ticksStartedAt = 0;
+    _rxInterfacePeakBytes = 0;
+    _rxQueuePeakBytes = 0;
+    _txControlQueuePeakBytes = 0;
+    _txQueuePeakFrames = 0;
+
     for (uint8_t i = 0; i < BUS_LOAD_WINDOW; i++)
         _busLoadSamples[i] = {};
 
@@ -34,9 +53,11 @@ void Statistics::reset()
     _busLoadCount = 0;
 }
 
-void Statistics::incrementRxReceivedBytes(uint32_t increment)
+// --- Empfang -------------------------------------------------------------------------------------------
+
+void Statistics::incrementRxBytes(uint32_t increment)
 {
-    _rxReceivedBytes += increment;
+    _rxBytes += increment;
 }
 
 void Statistics::incrementRxFrames(uint32_t increment)
@@ -64,54 +85,14 @@ void Statistics::incrementRxDroppedBytes(uint32_t increment)
     _rxDroppedBytes += increment;
 }
 
-void Statistics::incrementRxRepetitions(uint32_t increment)
+void Statistics::incrementRxRepeatedFrames(uint32_t increment)
 {
-    _rxRepetitions += increment;
+    _rxRepeatedFrames += increment;
 }
 
-void Statistics::incrementTxControlBytes(uint32_t increment)
+uint32_t Statistics::getRxBytes() const
 {
-    _txControlBytes += increment;
-}
-
-void Statistics::incrementTxFrames(uint32_t increment)
-{
-    _txFrames += increment;
-}
-
-void Statistics::incrementAcknowledgesSent(uint32_t increment)
-{
-    _acknowledgesSent += increment;
-}
-
-void Statistics::incrementAcknowledgesSuppressed(uint32_t increment)
-{
-    _acknowledgesSuppressed += increment;
-}
-
-void Statistics::incrementInterfaceOverflows(uint32_t increment)
-{
-    _interfaceOverflows += increment;
-}
-
-void Statistics::incrementRxQueueOverflows(uint32_t increment)
-{
-    _rxQueueOverflows += increment;
-}
-
-void Statistics::incrementCtrlQueueOverflows(uint32_t increment)
-{
-    _ctrlQueueOverflows += increment;
-}
-
-void Statistics::incrementTxQueueOverflows(uint32_t increment)
-{
-    _txQueueOverflows += increment;
-}
-
-uint32_t Statistics::getRxReceivedBytes() const
-{
-    return _rxReceivedBytes;
+    return _rxBytes;
 }
 
 uint32_t Statistics::getRxFrames() const
@@ -139,14 +120,41 @@ uint32_t Statistics::getRxDroppedBytes() const
     return _rxDroppedBytes;
 }
 
-uint32_t Statistics::getRxRepetitions() const
+uint32_t Statistics::getRxRepeatedFrames() const
 {
-    return _rxRepetitions;
+    return _rxRepeatedFrames;
 }
+
+// --- Versand -------------------------------------------------------------------------------------------
 
 void Statistics::incrementTxBytes(uint32_t increment)
 {
     _txBytes += increment;
+}
+
+void Statistics::incrementTxControlBytes(uint32_t increment)
+{
+    _txControlBytes += increment;
+}
+
+void Statistics::incrementTxFrames(uint32_t increment)
+{
+    _txFrames += increment;
+}
+
+void Statistics::incrementTxAcknowledges(uint32_t increment)
+{
+    _txAcknowledges += increment;
+}
+
+void Statistics::incrementTxAcknowledgesSuppressed(uint32_t increment)
+{
+    _txAcknowledgesSuppressed += increment;
+}
+
+void Statistics::incrementTxConfirmTimeouts(uint32_t increment)
+{
+    _txConfirmTimeouts += increment;
 }
 
 uint32_t Statistics::getTxBytes() const
@@ -164,19 +172,51 @@ uint32_t Statistics::getTxFrames() const
     return _txFrames;
 }
 
-uint32_t Statistics::getAcknowledgesSent() const
+uint32_t Statistics::getTxAcknowledges() const
 {
-    return _acknowledgesSent;
+    return _txAcknowledges;
 }
 
-uint32_t Statistics::getAcknowledgesSuppressed() const
+uint32_t Statistics::getTxAcknowledgesSuppressed() const
 {
-    return _acknowledgesSuppressed;
+    return _txAcknowledgesSuppressed;
 }
 
-uint32_t Statistics::getInterfaceOverflows() const
+uint32_t Statistics::getTxConfirmTimeouts() const
 {
-    return _interfaceOverflows;
+    return _txConfirmTimeouts;
+}
+
+// --- Verluste und Verbindung ---------------------------------------------------------------------------
+
+void Statistics::incrementRxInterfaceOverflows(uint32_t increment)
+{
+    _rxInterfaceOverflows += increment;
+}
+
+void Statistics::incrementRxQueueOverflows(uint32_t increment)
+{
+    _rxQueueOverflows += increment;
+}
+
+void Statistics::incrementTxControlQueueOverflows(uint32_t increment)
+{
+    _txControlQueueOverflows += increment;
+}
+
+void Statistics::incrementTxQueueOverflows(uint32_t increment)
+{
+    _txQueueOverflows += increment;
+}
+
+void Statistics::incrementConnectionLosses(uint32_t increment)
+{
+    _connectionLosses += increment;
+}
+
+uint32_t Statistics::getRxInterfaceOverflows() const
+{
+    return _rxInterfaceOverflows;
 }
 
 uint32_t Statistics::getRxQueueOverflows() const
@@ -184,9 +224,9 @@ uint32_t Statistics::getRxQueueOverflows() const
     return _rxQueueOverflows;
 }
 
-uint32_t Statistics::getCtrlQueueOverflows() const
+uint32_t Statistics::getTxControlQueueOverflows() const
 {
-    return _ctrlQueueOverflows;
+    return _txControlQueueOverflows;
 }
 
 uint32_t Statistics::getTxQueueOverflows() const
@@ -194,38 +234,176 @@ uint32_t Statistics::getTxQueueOverflows() const
     return _txQueueOverflows;
 }
 
-// --- KOMPAT, siehe Header -----------------------------------------------------------------------------
-
-uint32_t Statistics::getRxDiscardedBytes() const
+uint32_t Statistics::getConnectionLosses() const
 {
-    return getRxDroppedBytes();
+    return _connectionLosses;
 }
 
-uint32_t Statistics::getRxUartOverflow() const
+void Statistics::incrementRxResyncs(uint32_t increment)
 {
-    return getInterfaceOverflows();
+    _rxResyncs += increment;
 }
 
-uint32_t Statistics::getRxFrameBufferOverflow() const
+void Statistics::incrementChipSlaveCollisions(uint32_t increment)
 {
-    return getRxQueueOverflows();
+    _chipSlaveCollisions += increment;
 }
 
-uint32_t Statistics::getTxOverflowFrameBuffer() const
+void Statistics::incrementChipReceiveErrors(uint32_t increment)
 {
-    return getTxQueueOverflows();
+    _chipReceiveErrors += increment;
 }
 
-// DUMMY: den SearchBuffer gibt es in dieser Library nicht mehr - hier kann nichts überlaufen.
-uint32_t Statistics::getRxSearchBufferOverflow() const
+void Statistics::incrementChipTransmitErrors(uint32_t increment)
 {
-    return 0;
+    _chipTransmitErrors += increment;
 }
 
-uint32_t Statistics::getRxBusBytes() const
+void Statistics::incrementChipProtocolErrors(uint32_t increment)
 {
-    return _rxFrameBytes;
+    _chipProtocolErrors += increment;
 }
+
+void Statistics::incrementChipTemperatureWarnings(uint32_t increment)
+{
+    _chipTemperatureWarnings += increment;
+}
+
+// --- Takt ----------------------------------------------------------------------------------------------
+
+void Statistics::recordTick(uint32_t gapUs)
+{
+    // Der erste Tick legt den Bezugspunkt der mittleren Rate fest - siehe _ticksStartedAt.
+    if (_ticks == 0) _ticksStartedAt = millis();
+
+    // Nicht _ticks++, sondern die Form der übrigen Zähler: ++ auf einem volatile ist seit C++20 als
+    // deprecated markiert und der ESP32-Build übersetzt mit dieser Norm (-Wvolatile).
+    _ticks += 1;
+    if (gapUs > _tickGapMaxUs) _tickGapMaxUs = gapUs;
+}
+
+void Statistics::incrementTickSlowGaps(uint32_t increment)
+{
+    _tickSlowGaps += increment;
+}
+
+uint32_t Statistics::getTickSlowGaps() const
+{
+    return _tickSlowGaps;
+}
+
+void Statistics::updateTickDurationMaxUs(uint32_t durationUs)
+{
+    if (durationUs > _tickDurationMaxUs) _tickDurationMaxUs = durationUs;
+}
+
+uint32_t Statistics::getTickDurationMaxUs() const
+{
+    return _tickDurationMaxUs;
+}
+
+void Statistics::updateCheckAcknowledgeMaxUs(uint32_t durationUs)
+{
+    if (durationUs > _checkAcknowledgeMaxUs) _checkAcknowledgeMaxUs = durationUs;
+}
+
+uint32_t Statistics::getCheckAcknowledgeMaxUs() const
+{
+    return _checkAcknowledgeMaxUs;
+}
+
+uint32_t Statistics::getTickAverageUs() const
+{
+    uint32_t ticks = _ticks;
+    if (ticks == 0) return 0;
+
+    // In 64 Bit gerechnet: elapsed mal 1000 läuft in 32 Bit schon nach 71 Minuten Laufzeit über, und
+    // genau dann wäre der Wert am interessantesten.
+    uint32_t elapsed = millis() - _ticksStartedAt;
+    return (uint32_t)(((uint64_t)elapsed * 1000) / ticks);
+}
+
+void Statistics::updateRxInterfacePeakBytes(uint32_t pending)
+{
+    if (pending > _rxInterfacePeakBytes) _rxInterfacePeakBytes = pending;
+}
+
+uint32_t Statistics::getTicks() const
+{
+    return _ticks;
+}
+
+uint32_t Statistics::getTickGapMaxUs() const
+{
+    return _tickGapMaxUs;
+}
+
+uint32_t Statistics::getRxInterfacePeakBytes() const
+{
+    return _rxInterfacePeakBytes;
+}
+
+void Statistics::updateRxQueuePeakBytes(uint32_t used)
+{
+    if (used > _rxQueuePeakBytes) _rxQueuePeakBytes = used;
+}
+
+void Statistics::updateTxControlQueuePeakBytes(uint32_t used)
+{
+    if (used > _txControlQueuePeakBytes) _txControlQueuePeakBytes = used;
+}
+
+void Statistics::updateTxQueuePeakFrames(uint32_t used)
+{
+    if (used > _txQueuePeakFrames) _txQueuePeakFrames = used;
+}
+
+uint32_t Statistics::getRxResyncs() const
+{
+    return _rxResyncs;
+}
+
+uint32_t Statistics::getChipSlaveCollisions() const
+{
+    return _chipSlaveCollisions;
+}
+
+uint32_t Statistics::getChipReceiveErrors() const
+{
+    return _chipReceiveErrors;
+}
+
+uint32_t Statistics::getChipTransmitErrors() const
+{
+    return _chipTransmitErrors;
+}
+
+uint32_t Statistics::getChipProtocolErrors() const
+{
+    return _chipProtocolErrors;
+}
+
+uint32_t Statistics::getChipTemperatureWarnings() const
+{
+    return _chipTemperatureWarnings;
+}
+
+uint32_t Statistics::getRxQueuePeakBytes() const
+{
+    return _rxQueuePeakBytes;
+}
+
+uint32_t Statistics::getTxControlQueuePeakBytes() const
+{
+    return _txControlQueuePeakBytes;
+}
+
+uint32_t Statistics::getTxQueuePeakFrames() const
+{
+    return _txQueuePeakFrames;
+}
+
+// --- Buslast -------------------------------------------------------------------------------------------
 
 void Statistics::sampleBusLoad()
 {
@@ -240,7 +418,7 @@ void Statistics::sampleBusLoad()
     }
 
     // Der älteste Eintrag fällt hier heraus - das Fenster wandert um eine Scheibe weiter.
-    _busLoadSamples[_busLoadIndex] = {getRxBusBytes(), now};
+    _busLoadSamples[_busLoadIndex] = {getRxFrameBytes(), now};
 
     _busLoadIndex = (uint8_t)((_busLoadIndex + 1) % BUS_LOAD_WINDOW);
     if (_busLoadCount < BUS_LOAD_WINDOW) _busLoadCount++;
@@ -263,8 +441,50 @@ uint32_t Statistics::getBusLoad() const
     // Geteilt wird durch die GEMESSENE Spanne, die Breite muss also nicht exakt stimmen. Der
     // Zwischenwert bleibt in 32 Bit, solange die Differenz unter 4,29 Mio Bytes liegt - bei 738 Byte/s
     // Buslast wären das über anderthalb Stunden innerhalb EINES Fensters von drei Sekunden.
-    uint32_t delta = getRxBusBytes() - _busLoadSamples[oldest]._bytes;
+    uint32_t delta = getRxFrameBytes() - _busLoadSamples[oldest]._bytes;
     return (delta * 1000 + elapsed / 2) / elapsed;
+}
+
+// --- KOMPAT, siehe Header --------------------------------------------------------------------------------
+
+uint32_t Statistics::getRxReceivedBytes() const
+{
+    return getRxBytes();
+}
+
+uint32_t Statistics::getRxRepetitions() const
+{
+    return getRxRepeatedFrames();
+}
+
+uint32_t Statistics::getRxDiscardedBytes() const
+{
+    return getRxDroppedBytes();
+}
+
+uint32_t Statistics::getRxBusBytes() const
+{
+    return getRxFrameBytes();
+}
+
+uint32_t Statistics::getRxUartOverflow() const
+{
+    return getRxInterfaceOverflows();
+}
+
+uint32_t Statistics::getRxFrameBufferOverflow() const
+{
+    return getRxQueueOverflows();
+}
+
+uint32_t Statistics::getTxOverflowFrameBuffer() const
+{
+    return getTxQueueOverflows();
+}
+
+uint32_t Statistics::getRxSearchBufferOverflow() const
+{
+    return 0;
 }
 
 } // namespace TPUart

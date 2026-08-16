@@ -17,6 +17,10 @@
 // Beide Plattformen bringen ihren eigenen Zweig mit, ausgewählt über ARDUINO_ARCH_*, nicht über ein
 // TPUART_INTERFACE_*-Flag: die alten Envs prüften je Lauf genau ein Interface, hier laufen alle
 // Interfaces der jeweiligen Plattform in einem Bau mit.
+// NUR AUF DER HARDWARE. Nativ gibt es kein Serial1, und die Interfaces sind ohnehin plattformgebunden -
+// zu prüfen wäre dort nichts. Der native Lauf deckt die Protokolllogik ab, nicht die Anbindung.
+#ifdef ARDUINO
+
 #include <Arduino.h>
 
 #include "TPUart/DataLinkLayer.h"
@@ -66,3 +70,5 @@ void tpuartInterfaceLinkCheck()
     espDatalink.end();
 #endif
 }
+
+#endif // ARDUINO

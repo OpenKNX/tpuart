@@ -29,11 +29,17 @@ Receiver::Receiver(DataLinkLayer &dll) : _dll(dll) {}
 
 void Receiver::process()
 {
-    if (!_dll._interface->available())
+    size_t pending = _dll._interface->available();
+    if (!pending)
     {
         checkPause();
         return;
     }
+
+    // Der Rückstand in Bytes - gratis, weil available() ohnehin gefragt wurde. Gesund sind 0-1: der Bus
+    // liefert höchstens alle 1,354ms ein Byte, der Tick holt alle 500µs eines ab. Alles darüber ist ein
+    // Aussetzer des Antriebs, und ab 2 wird bei Byte 6 die Quittung unterdrückt.
+    _dll._statistics.updateRxInterfacePeakBytes((uint32_t)pending);
 
     int value = _dll._interface->read();
     if (value < 0)
@@ -49,7 +55,7 @@ void Receiver::process()
     // Hardware-Flag.
     if (_dll._interface->overflow()) _dll.reportInterfaceOverflow();
 
-    _dll._statistics.incrementRxReceivedBytes();
+    _dll._statistics.incrementRxBytes();
 
     // Lebenszeichen der BCU. Jedes Byte zählt, nicht nur die Antwort auf eine Statusabfrage: reicht sie
     // Bus-Verkehr durch, lebt sie offensichtlich.
@@ -450,7 +456,7 @@ void Receiver::sendAcknowledge()
     // während mindestens 2 ausstehen.
     if (_dll._interface->available() >= (_frameSize - _bufferPos))
     {
-        _dll._statistics.incrementAcknowledgesSuppressed();
+        _dll._statistics.incrementTxAcknowledgesSuppressed();
         return;
     }
 
@@ -520,6 +526,12 @@ void Receiver::processControlByte(uint8_t value)
 // nachwirkender Zustand im nächsten Telegramm auf.
 void Receiver::resetSequence(RxState nextState)
 {
+    // Die eine Stelle, an der ein Resync beginnt - alle Wege dorthin laufen hier zusammen (CRC-Fehler,
+    // beschädigtes Längenoktett, unerwartetes Byte in FrameAck, Moduswechsel). Doppelt gezählt wird
+    // nichts: forceResync() kehrt bei bereits laufendem Resync früh um, und completeSequence() kommt aus
+    // Frame bzw. Poll, nie aus Resync selbst.
+    if (nextState == RxState::Resync) _dll._statistics.incrementRxResyncs();
+
     _bufferPos = 0;
     _frameSize = 0;
     _crc = 0;
@@ -578,7 +590,10 @@ void Receiver::completeSequence(uint8_t flags, RxState nextState)
         else
             _dll._statistics.incrementRxControlBytes((uint32_t)length);
 
-        pushEntry(_buffer, length, flags);
+        // Passt der Eintrag nicht mehr in den Ring, ist er weg - und diese Bytes hat dann WIRKLICH niemand
+        // gesehen, genau wie die im Resync verworfenen. Sie gehören deshalb in denselben Zähler.
+        if (!pushEntry(_buffer, length, flags))
+            _dll._statistics.incrementRxDroppedBytes((uint32_t)length);
     }
 
     resetSequence(nextState);
@@ -596,6 +611,10 @@ bool Receiver::pushEntry(const uint8_t *data, size_t length, uint8_t flags)
         _dll.reportRxQueueOverflow();
         return false;
     }
+
+    // Der Höchststand NACH dem Einstellen - das ist der Füllstand, der wirklich erreicht wurde. Der
+    // Vergleich hängt sich an ein bereits ausgerechnetes `used` an und kostet damit fast nichts.
+    _dll._statistics.updateRxQueuePeakBytes(used + needed);
 
     uint32_t head = _queueHead;
     _queue[head++ % TPUART_RX_QUEUE_SIZE] = (uint8_t)(length & 0xFF);
@@ -675,7 +694,7 @@ void Receiver::processQueue()
             if (seen && frame.isRepeated())
             {
                 frame.setFiltered();
-                _dll._statistics.incrementRxRepetitions();
+                _dll._statistics.incrementRxRepeatedFrames();
             }
         }
 
@@ -688,16 +707,28 @@ RxState Receiver::state() const
     return _state;
 }
 
-// --- KOMPAT, siehe Header: beides DUMMY -----------------------------------------------------------------
+// --- KOMPAT, siehe Header ------------------------------------------------------------------------------
+//
+// Beide Namen stammen aus der Suche im Puffer, die es hier nicht mehr gibt - sie liefern deshalb nicht
+// mehr das, wonach sie heißen, sondern die nächstliegende Aussage über den heutigen Empfangspfad. Das ist
+// besser als die konstante 0 von vorher: die Aufrufer drucken beide Werte nebeneinander, und zwei tote
+// Spalten sagen gar nichts, während diese beiden zusammen zeigen, wo im Telegramm die Verarbeitung
+// gerade steht.
 
+// Wie viele Bytes der laufenden Sequenz schon im Puffer liegen. Im Leerlauf 0.
 unsigned short Receiver::getSearchBufferPosition() const
 {
-    return 0;
+    return (unsigned short)_bufferPos;
 }
 
+// Wie viele Bytes des laufenden Telegramms noch ausstehen. 0, solange die Größe noch nicht feststeht -
+// sie ergibt sich erst aus dem Längenoktett, und vorher ist die Restlänge schlicht unbekannt. Der
+// Vergleich fängt zusätzlich den Fall ab, dass _bufferPos über die Grenze hinausgelaufen ist.
 unsigned short Receiver::getAwaitBytes() const
 {
-    return 0;
+    if (_frameSize == 0 || _bufferPos >= _frameSize) return 0;
+
+    return (unsigned short)(_frameSize - _bufferPos);
 }
 
 } // namespace TPUart

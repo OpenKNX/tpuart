@@ -58,6 +58,27 @@ void DataLinkLayer::tick()
     if (_interface == nullptr) return; // ohne Interface gibt es nichts zu tun (siehe KOMPAT-Konstruktor)
     if (!_initialized) return;         // begin() wurde noch nicht aufgerufen
 
+    // TAKTMESSUNG, und sie steht bewusst VOR allen weiteren Abbrüchen: gemessen werden soll der ANTRIEB,
+    // also wie oft wir gerufen werden - nicht, wie oft wir etwas zu tun hatten. Stünde sie weiter unten,
+    // wären ausgerechnet die Phasen unsichtbar, in denen der Tick nichts tut und trotzdem laufen muss.
+    //
+    // Die Kosten sind ein micros() im Leerlaufpfad, und das ist eine bewusste Abkehr von der Ansage, diesen
+    // Pfad auf möglichst wenige MMIO-Zugriffe zu halten: er hatte einen (den DMA-Zähler in available()) und
+    // hat jetzt zwei. Gerechnet auf den RP2040 sind das rund 0,1% CPU zusätzlich zu den ~0,5%, die der Tick
+    // ohnehin kostet. Dafür ist die häufigste Ursache von Problemen dieser Schicht überhaupt erst ablesbar,
+    // statt aus ihren Folgen erraten zu werden.
+    uint32_t tickNow = micros();
+    uint32_t tickGap = _tickLastUs == 0 ? 0 : tickNow - _tickLastUs;
+    _tickLastUs = tickNow;
+
+    _statistics.recordTick(tickGap);
+
+    // Die Einordnung passiert HIER und nicht in Statistics: TPUART_TICK_SLOW_US ist eine Protokollkonstante
+    // (die Zeichenzeit des Busses), und die Zählerklasse kennt keine - dieselbe Trennung wie bei den
+    // Fehlerbits des Chips. Der Zähler ist das, was den Höchstwert überhaupt erst deutbar macht: ohne ihn
+    // sehen ein einzelnes Ereignis und ein Dauerzustand identisch aus.
+    if (tickGap > TPUART_TICK_SLOW_US) _statistics.incrementTickSlowGaps();
+
     // Die Baudraten-SUCHE gehört dem Hauptkontext, weil sie das Interface neu konfiguriert - hier ist
     // deshalb Schluss, bis die Verbindung zum ersten Mal gestanden hat (siehe searchBaudRate).
     if (!_everConnected) return;
@@ -70,6 +91,13 @@ void DataLinkLayer::tick()
 
     _receiver.process();
     _transmitter.process();
+
+    // ERST HIER gemessen, nicht an den frühen Abbrüchen: die sind ein paar Vergleiche und würden den
+    // Höchstwert nur beschönigen. Was hier steht, ist der volle Durchlauf einschließlich des
+    // Quittungs-Callbacks des Aufrufers - und damit die Zahl, die eine hohe IRQ-Priorität rechtfertigt
+    // oder eben nicht. Zweites micros(), also nochmal ~0,1% CPU; für eine Zahl, ohne die jede
+    // Prioritätswahl geraten ist, ist das billig.
+    _statistics.updateTickDurationMaxUs(micros() - tickNow);
 }
 
 void DataLinkLayer::begin(BcuType bcuType)
@@ -80,6 +108,10 @@ void DataLinkLayer::begin(BcuType bcuType)
     _detectAwaitingResponse = false;
     _detectCandidateIndex = 0;
     _detectNextAttemptAt = millis(); // sofort beim nächsten loop() fällig
+
+    // Die Taktmessung fängt neu an: die Zeit zwischen end() und begin() ist keine Lücke im Antrieb, und
+    // ohne das Zurücksetzen stünde sie für immer als Höchstwert in getTickGapMaxUs().
+    _tickLastUs = 0;
 
     // Der Antrieb darf sofort loslaufen, obwohl noch keine Verbindung steht: bis _everConnected gesetzt
     // ist, kehrt tick() gleich wieder um und fasst das Interface nicht an - die Baudratensuche gehört dem
@@ -118,6 +150,11 @@ void DataLinkLayer::setExternalTick(bool enabled)
 bool DataLinkLayer::hasTickDriver() const
 {
     return _tickDriver.running();
+}
+
+uint32_t DataLinkLayer::tickInterval() const
+{
+    return _tickIntervalUs;
 }
 
 // KOMPAT: Gegenstück zu begin(). Das Interface wird geschlossen, aber NICHT freigegeben - es gehört dem
@@ -299,8 +336,49 @@ void DataLinkLayer::advanceDetectCandidate()
 // Library über den Chip führt.
 void DataLinkLayer::controlByteSent(uint8_t code)
 {
-    if (code == U_BUSMON_REQ) _busMonitor = true;
-    if (code == U_RESET_REQ) _busMonitor = false;
+    if (code == U_BUSMON_REQ)
+    {
+        _busMonitor = true;
+
+        // Mit dem Moduswechsel ist der ganze Sendeweg hinfällig: der Chip nimmt keine Telegrammdienste mehr
+        // an, und was er von einem laufenden Telegramm schon hat, ergibt als halbes Telegramm keinen Sinn -
+        // auf dem Bus hat nie jemand einen Anfang gesehen. Abgebrochen wird deshalb, NICHT wie beim Reset
+        // von vorn begonnen, und die Warteschlange gleich mit verworfen: was erst nach dem Verlassen des
+        // Modus hinausginge, wäre dann längst überholt. Den Heap gibt loop() frei, wie bei jedem anderen
+        // abgeholten Telegramm auch.
+        _transmitter.abort();
+
+        // BUSMON AN HEISST BUSY AUS. Der Chip nimmt im Busmonitor keine Telegramme mehr an und quittiert
+        // nichts - ein Busy-Modus, der das Quittieren nur ersetzt, kann es dort nicht geben, und heraus
+        // kommt man ohnehin nur per Reset. Der Zustand ist also nicht unbekannt, sondern bekannt weg.
+        //
+        // Gemeldet statt selbst gelöscht: _busyModeSince gehört dem Hauptkontext (busyMode(),
+        // checkBusyMode()), und ein zweiter Schreiber aus dem Tick wäre der teurere Fehler. Genau dafür
+        // gibt es diesen Weg schon - checkBusyMode() zieht beim nächsten loop() nach, ohne ein Byte zu
+        // senden. Ohne das liefe checkBusyMode() in eine Sackgasse: es riefe nach Ablauf der Frist
+        // busyMode(false), und das lehnt im Busmonitor jetzt ab, ließe _busyModeSince also stehen und
+        // versuchte es endlos erneut.
+        reportBusyModeCancelled();
+
+        // Dasselbe für die Auto-Quittung: im Busmonitor ist der Chip durchsichtig und quittiert nichts.
+        // Das Flag beschreibt den Chip, nicht unseren Wunsch - es steht hier also auf falsch, bis die
+        // Adresse nach dem Reset erneut abgesetzt wird (die Konfigurationsepoche holt das nach).
+        _autoAcknowledge = false;
+    }
+
+    if (code == U_RESET_REQ)
+    {
+        // Beim VERLASSEN des Busmonitors muss die Verbindungsüberwachung neu aufgezogen werden, sonst
+        // schlägt sie sofort zu. Während des Modus ruht sie (siehe processConnectionState), _lastReceivedAt
+        // ist auf einem ruhigen Bus also beliebig alt - und Busmonitor auf einem ruhigen Bus ist der
+        // Normalfall, man schaltet ihn ein, um zuzusehen. Zwischen diesem U_Reset.req und der U_Reset.ind,
+        // die ihn beantwortet, liegt zwar nur rund eine Millisekunde, aber der Hauptloop kann genau dort
+        // hineinlaufen und meldete dann einen Verbindungsabbruch, den es nie gab.
+        // Erlaubt ist das hier, weil auch der Empfangspfad im Tick schreibt - ein Schreiber, ein Kontext.
+        if (_busMonitor) _lastReceivedAt = millis();
+
+        _busMonitor = false;
+    }
 
     // Nur diese beiden Codes ändern die Bedeutung des Bytestroms (im Busmonitor kommen die Quittungen vom
     // Bus dazu, nach einem Reset fallen sie weg). Ab wann genau der Chip umschaltet, ist von hier aus nicht
@@ -343,7 +421,10 @@ void DataLinkLayer::loop()
 
     _receiver.processQueue();
 
-    // Der Tick darf keinen Heap anfassen, also wird hier aufgeräumt, was er abgeholt hat.
+    // Der Tick darf keinen Heap anfassen, also wird hier aufgeräumt, was er abgeholt hat. Das schließt die
+    // beim Wechsel in den Busmonitor verworfenen Telegramme ein: der Tick hat _queueTail dafür bis an
+    // _queueHead vorgezogen (Transmitter::abort()), hier fällt das nur noch als "abgeholt" an und wird
+    // freigegeben. Ein eigener Weg dafür wäre ein zweiter Schreiber auf _queueTail gewesen.
     _transmitter.releaseSentTelegrams();
 
     // Die Baudratensuche gehört hierher und nicht in den Tick: sie konfiguriert das Interface pro Kandidat
@@ -360,6 +441,7 @@ void DataLinkLayer::loop()
     _statistics.sampleBusLoad();
 
     checkBusyMode();
+    checkTickRate();
 
     // Der eine Reset, der einen Fehler anzeigt: der Wachhund des Transmitters hat zugeschlagen, weil zum
     // gesendeten Telegramm keine Bestätigung kam. Er kann nicht selbst melden - er läuft im Tick.
@@ -370,6 +452,64 @@ void DataLinkLayer::loop()
     // derselben Runde ausgegeben zu werden ist die Erwartung des Aufrufers.
     showSystemState();
     showStateErrors();
+}
+
+// DER ANTRIEB ÜBERWACHT SICH SELBST, und das ist die Lehre aus einem Fehler, der Stunden gekostet hat: die
+// Taktrate war zu niedrig, und das zeigte sich AUSSCHLIESSLICH als Folgeschaden - unterdrückte Quittungen,
+// Rückstand im Interface. Die Ursache stand nirgends, sie war nur auf ausdrückliche Nachfrage über
+// hasTickDriver() zu erfahren, und danach fragt im Betrieb niemand.
+//
+// GEMESSEN WIRD DIE ERREICHTE RATE, nicht die eingestellte. Damit gilt der Wächter für JEDEN Antrieb - den
+// eigenen Timer, einen externen Tick und den Hauptloop - und er misst das, was tatsächlich passiert, statt
+// das, was gemeint war. Ein Wächter auf hasTickDriver() hätte genau den Fall verfehlt, in dem jemand
+// absichtlich selbst tickt und dabei zu langsam ist.
+//
+// DIE SCHWELLE KOMMT AUS DEM BUS, nicht aus der Konfiguration, und deshalb ist sie keine Geschmacksfrage:
+// ein Tick bewegt ein Byte je Richtung, ein TP1-Zeichen dauert 1,354ms. Liegt der mittlere Tickabstand
+// darüber, holt die Schicht weniger Bytes ab, als der Bus im Vollausbau liefert - dann füllen sich die
+// Puffer, bis etwas überläuft, und keine Puffergröße hilft dagegen. Unterhalb der Schwelle ist alles gut,
+// oberhalb ist es grundsätzlich kaputt.
+//
+// Gemeldet wird EINMAL je Störung, nicht je Sekunde: die Meldung ist eine Diagnose, keine Dauerbeobachtung.
+// Erholt sich die Rate, wird der Melder wieder scharf, ein wiederkehrendes Problem bleibt also sichtbar.
+void DataLinkLayer::checkTickRate()
+{
+    uint32_t now = millis();
+
+    // Der erste Durchlauf legt nur den Bezugspunkt fest - ohne Vorgänger gibt es keine Rate.
+    if (_tickRateCheckedAt == 0)
+    {
+        _tickRateCheckedAt = now;
+        _tickRateLastTicks = _statistics.getTicks();
+        return;
+    }
+
+    uint32_t elapsed = now - _tickRateCheckedAt;
+    if (elapsed < TPUART_TICK_RATE_WINDOW_MS) return;
+
+    uint32_t ticks = _statistics.getTicks();
+    uint32_t delta = ticks - _tickRateLastTicks;
+
+    _tickRateCheckedAt = now;
+    _tickRateLastTicks = ticks;
+
+    // Gar kein Tick im ganzen Fenster ist der schlimmste Fall und zugleich der, der eine Division durch
+    // null wäre - er wird deshalb ausdrücklich behandelt und nicht in die Rechnung gelassen.
+    uint32_t averageUs = delta == 0 ? 0xFFFFFFFF : (elapsed * 1000) / delta;
+
+    if (averageUs <= TPUART_TICK_SLOW_US)
+    {
+        _tickRateReported = false; // erholt - der Melder wird wieder scharf
+        return;
+    }
+
+    if (_tickRateReported) return;
+    _tickRateReported = true;
+
+    if (delta == 0)
+        printError("Tick stopped - no tick in %u ms, bus needs one below %u us", (unsigned)elapsed, (unsigned)TPUART_TICK_SLOW_US);
+    else
+        printError("Tick too slow - %u us average (%u/s), bus needs below %u us", (unsigned)averageUs, (unsigned)(delta * 1000 / elapsed), (unsigned)TPUART_TICK_SLOW_US);
 }
 
 // Aus loop(), also aus dem Hauptkontext - hier darf queueControl() benutzt und gemeldet werden.
@@ -405,6 +545,19 @@ void DataLinkLayer::processConnectionState()
     //   1. ZUERST den Zeitstempel greifen, DANACH die Uhr lesen. Dann liegt now nie vor last.
     //   2. Trotzdem VORZEICHENBEHAFTET vergleichen: der Tick kann auch nach Schritt 1 noch schreiben, und
     //      ein minimal vorauseilender Zeitstempel bedeutet "gerade eben empfangen", nicht "ewig her".
+    // IM BUSMONITOR RUHT DIE ÜBERWACHUNG, und das ist keine Bequemlichkeit, sondern Notwendigkeit. Sie
+    // ruht auf zwei Beinen, und im Busmonitor bricht das zweite weg: Bus-Verkehr zählt als Lebenszeichen,
+    // und auf einem ruhigen Bus hält die sekündliche Statusabfrage die Frist offen. Genau die ist hier aber
+    // wirkungslos - Tabelle 11 (S. 32) führt U_State.req im Busmonitor als "I", also ignoriert und OHNE
+    // Antwort. Auf einem ruhigen Bus liefe die 5s-Frist deshalb zwangsläufig ab, connectionLost() setzte
+    // den Reconnect in Gang, und dessen U_Reset.req BEENDET DEN BUSMONITOR. Er hielte also nie länger als
+    // fünf Sekunden.
+    //
+    // Der Preis ist bekannt und hinnehmbar: eine BCU, die im Busmonitor ausfällt, merken wir nicht - bis
+    // der Modus per reset() verlassen wird und die Überwachung wieder anläuft. Passiv ist der Modus
+    // ohnehin, es hängt nichts daran.
+    if (_busMonitor) return;
+
     uint32_t last = _lastReceivedAt;
     uint32_t now = millis();
 
@@ -445,6 +598,8 @@ void DataLinkLayer::connectionLost()
 {
     printError("BCU disconnected - no byte received for %u ms", (unsigned)TPUART_CONNECTION_TIMEOUT_MS);
 
+    _statistics.incrementConnectionLosses();
+
     _connectReported = false;
     _detectAwaitingResponse = false;
     _detectNextAttemptAt = millis();
@@ -473,7 +628,22 @@ void DataLinkLayer::handleControlEntry(const uint8_t *data, size_t length)
     // die Fehlerbits. Verodert, weil der Chip jedes Ereignis nur einmal meldet (siehe _stateErrors).
     if ((value & U_STATE_MASK) == U_STATE_IND)
     {
-        _stateErrors |= (uint8_t)(value ^ U_STATE_MASK);
+        uint8_t errors = (uint8_t)(value ^ U_STATE_MASK);
+
+        // EINZELN GEZÄHLT, und zwar hier und nicht in Statistics: die Zuordnung Bit -> Zähler braucht die
+        // Protokollkonstanten, und die kennt nur diese Schicht. Statistics bleibt ein reiner Zählerspeicher.
+        //
+        // Nötig ist das, weil _stateErrors die Bits nur verodert und beim Ausgeben löscht - der Chip meldet
+        // jedes Ereignis genau einmal, "einmal vor Stunden" und "dauernd" sähen dort also gleich aus. Und
+        // einzeln statt als Summe, weil es fünf verschiedene Diagnosen sind: eine stehende
+        // Übertemperaturwarnung ist etwas anderes als gelegentliche Kollisionen auf dem Bus.
+        if (errors & U_STATE_SLAVE_COLLISION) _statistics.incrementChipSlaveCollisions();
+        if (errors & U_STATE_RECEIVE_ERROR) _statistics.incrementChipReceiveErrors();
+        if (errors & U_STATE_TRANSMIT_ERROR) _statistics.incrementChipTransmitErrors();
+        if (errors & U_STATE_PROTOCOL_ERROR) _statistics.incrementChipProtocolErrors();
+        if (errors & U_STATE_TEMPERATURE_WARNING) _statistics.incrementChipTemperatureWarnings();
+
+        _stateErrors |= errors;
         return;
     }
 
@@ -640,6 +810,13 @@ bool DataLinkLayer::applyConfiguration()
 {
     if (!_connected) return false;
 
+    // Im Busmonitor ignoriert der Chip U_SetAddress.req, U_SetRepetition.req und U_Configure.req (Tabelle 11,
+    // S. 32 - "I", ohne Rückmeldung). Hier wird deshalb NICHTS abgesetzt und false geliefert: die
+    // Konfigurationsepoche bleibt damit offen und der erste loop() nach dem Verlassen des Busmonitors holt
+    // sie nach. Das trifft sich mit dem Ausgang selbst - verlassen wird der Modus nur per Reset, und der
+    // löscht die Konfiguration im Chip ohnehin.
+    if (_busMonitor) return false;
+
     bool complete = true;
 
     if (_ownAddress != 0)
@@ -733,8 +910,14 @@ bool DataLinkLayer::reset()
 
 // Der System-Status ist NCN-spezifisch. Und er ist die Vorbedingung dafür, dass überhaupt ein
 // U_SystemStat.ind eintreffen kann - der einzige mehrbytige Steuerdienst, den der Receiver kennt.
+// Im Busmonitor ist der Dienst wirkungslos: Tabelle 11 (S. 32) führt U_State.req und U_SystemStat.req dort
+// als "I" - ignoriert, OHNE Rückmeldung an den Host. Es käme also keine U_State.ind zurück, und die beiden
+// Bytes stünden nur in einer Spur, die passiv sein soll. Deshalb hier abgefangen und nicht erst an jeder
+// Aufrufstelle: requestState() wird auch aus stopMode() und powerControl() gerufen.
 bool DataLinkLayer::requestState()
 {
+    if (_busMonitor) return false;
+
     if (!_transmitter.queueControl(U_STATE_REQ)) return false;
 
     if (_bcuType == BcuType::Ncn5120) _transmitter.queueControl(U_SYSTEM_STATE_REQ);
@@ -751,8 +934,13 @@ bool DataLinkLayer::stopMode(bool state)
     return true;
 }
 
+// Im Busmonitor wirkungslos: U_SetBusy.req und U_QuitBusy.req stehen in Tabelle 11 (S. 32) dort als "I".
+// Das Byte abzusetzen hieße, eine passive Spur zu verunreinigen für einen Modus, den der Chip gar nicht
+// annimmt - und _busyModeSince behauptete danach einen Zustand, den es nicht gibt.
 bool DataLinkLayer::busyMode(bool state)
 {
+    if (_busMonitor) return false;
+
     bool queued = _bcuType == BcuType::Ncn5120
                       ? _transmitter.queueControl(state ? U_NCN5120_SET_BUSY_REQ : U_NCN5120_QUIT_BUSY_REQ)
                       : _transmitter.queueControl(state ? U_TPUART2_SET_BUSY_REQ : U_TPUART2_QUIT_BUSY_REQ);
@@ -984,7 +1172,18 @@ AckType DataLinkLayer::checkAcknowledge(uint16_t destination, bool isGroupAddres
 {
     if (!_acknowledgeCallback) return AckType::None;
 
-    return _acknowledgeCallback(destination, isGroupAddress);
+    // GEMESSEN, WEIL ES DER EINZIGE UNBEGRENZTE ANTEIL DES TICKS IST. Alles andere hier ist ein Byte je
+    // Richtung und nach oben beschränkt; was dieser Callback kostet, bestimmt der Aufrufer, und er läuft
+    // je nach Plattform in einem Interrupt. Ohne die Messung ist getTickDurationMaxUs() nicht zuzuordnen -
+    // man sieht, dass ein Tick lange lief, aber nicht, ob die Library oder der Aufrufer schuld war.
+    //
+    // Die zwei micros() kosten hier nichts: dieser Zweig läuft genau EINMAL je empfangenem Telegramm
+    // (bei Byte 6, wenn die Größe bekannt wird), nicht bei jedem Tick.
+    uint32_t startedAt = micros();
+    AckType result = _acknowledgeCallback(destination, isGroupAddress);
+    _statistics.updateCheckAcknowledgeMaxUs(micros() - startedAt);
+
+    return result;
 }
 
 // Aus dem Tick. Beides zusammen, weil beides dasselbe Ereignis beschreibt: der Merker beantwortet "ist
@@ -992,7 +1191,7 @@ AckType DataLinkLayer::checkAcknowledge(uint16_t destination, bool isGroupAddres
 void DataLinkLayer::reportInterfaceOverflow()
 {
     _interfaceOverflow = true;
-    _statistics.incrementInterfaceOverflows();
+    _statistics.incrementRxInterfaceOverflows();
 }
 
 void DataLinkLayer::reportRxQueueOverflow()
@@ -1004,7 +1203,7 @@ void DataLinkLayer::reportRxQueueOverflow()
 void DataLinkLayer::reportControlOverflow()
 {
     _ctrlQueueOverflow = true;
-    _statistics.incrementCtrlQueueOverflows();
+    _statistics.incrementTxControlQueueOverflows();
 }
 
 bool DataLinkLayer::queueOverflow()
