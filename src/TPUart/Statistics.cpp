@@ -36,15 +36,14 @@ void Statistics::reset()
     _chipProtocolErrors = 0;
     _chipTemperatureWarnings = 0;
     _ticks = 0;
-    _tickGapMaxUs = 0;
-    _tickSlowGaps = 0;
+    _tickDeferrals = 0;
+    _tickLastDeferredUs = 0;
     _tickDurationMaxUs = 0;
     _checkAcknowledgeMaxUs = 0;
-    _ticksStartedAt = 0;
     _rxInterfacePeakBytes = 0;
     _rxQueuePeakBytes = 0;
     _txControlQueuePeakBytes = 0;
-    _txQueuePeakFrames = 0;
+    _txQueuePeakBytes = 0;
 
     for (uint8_t i = 0; i < BUS_LOAD_WINDOW; i++)
         _busLoadSamples[i] = {};
@@ -271,25 +270,27 @@ void Statistics::incrementChipTemperatureWarnings(uint32_t increment)
 
 // --- Takt ----------------------------------------------------------------------------------------------
 
-void Statistics::recordTick(uint32_t gapUs)
+void Statistics::recordTick()
 {
-    // Der erste Tick legt den Bezugspunkt der mittleren Rate fest - siehe _ticksStartedAt.
-    if (_ticks == 0) _ticksStartedAt = millis();
-
     // Nicht _ticks++, sondern die Form der übrigen Zähler: ++ auf einem volatile ist seit C++20 als
     // deprecated markiert und der ESP32-Build übersetzt mit dieser Norm (-Wvolatile).
     _ticks += 1;
-    if (gapUs > _tickGapMaxUs) _tickGapMaxUs = gapUs;
 }
 
-void Statistics::incrementTickSlowGaps(uint32_t increment)
+void Statistics::recordTickDeferred(uint32_t deferredUs)
 {
-    _tickSlowGaps += increment;
+    _tickDeferrals += 1;
+    _tickLastDeferredUs = deferredUs;
 }
 
-uint32_t Statistics::getTickSlowGaps() const
+uint32_t Statistics::getTickDeferrals() const
 {
-    return _tickSlowGaps;
+    return _tickDeferrals;
+}
+
+uint32_t Statistics::getTickLastDeferredUs() const
+{
+    return _tickLastDeferredUs;
 }
 
 void Statistics::updateTickDurationMaxUs(uint32_t durationUs)
@@ -312,17 +313,6 @@ uint32_t Statistics::getCheckAcknowledgeMaxUs() const
     return _checkAcknowledgeMaxUs;
 }
 
-uint32_t Statistics::getTickAverageUs() const
-{
-    uint32_t ticks = _ticks;
-    if (ticks == 0) return 0;
-
-    // In 64 Bit gerechnet: elapsed mal 1000 läuft in 32 Bit schon nach 71 Minuten Laufzeit über, und
-    // genau dann wäre der Wert am interessantesten.
-    uint32_t elapsed = millis() - _ticksStartedAt;
-    return (uint32_t)(((uint64_t)elapsed * 1000) / ticks);
-}
-
 void Statistics::updateRxInterfacePeakBytes(uint32_t pending)
 {
     if (pending > _rxInterfacePeakBytes) _rxInterfacePeakBytes = pending;
@@ -331,11 +321,6 @@ void Statistics::updateRxInterfacePeakBytes(uint32_t pending)
 uint32_t Statistics::getTicks() const
 {
     return _ticks;
-}
-
-uint32_t Statistics::getTickGapMaxUs() const
-{
-    return _tickGapMaxUs;
 }
 
 uint32_t Statistics::getRxInterfacePeakBytes() const
@@ -353,9 +338,9 @@ void Statistics::updateTxControlQueuePeakBytes(uint32_t used)
     if (used > _txControlQueuePeakBytes) _txControlQueuePeakBytes = used;
 }
 
-void Statistics::updateTxQueuePeakFrames(uint32_t used)
+void Statistics::updateTxQueuePeakBytes(uint32_t used)
 {
-    if (used > _txQueuePeakFrames) _txQueuePeakFrames = used;
+    if (used > _txQueuePeakBytes) _txQueuePeakBytes = used;
 }
 
 uint32_t Statistics::getRxResyncs() const
@@ -398,9 +383,9 @@ uint32_t Statistics::getTxControlQueuePeakBytes() const
     return _txControlQueuePeakBytes;
 }
 
-uint32_t Statistics::getTxQueuePeakFrames() const
+uint32_t Statistics::getTxQueuePeakBytes() const
 {
-    return _txQueuePeakFrames;
+    return _txQueuePeakBytes;
 }
 
 // --- Buslast -------------------------------------------------------------------------------------------

@@ -269,14 +269,14 @@ void Receiver::processFrameByte(uint8_t value)
 
     if (_frameSize == 0)
     {
-        bool extended = (_buffer[0] & L_DATA_MASK) == L_DATA_EXTENDED_IND;
-        size_t headerBytesNeeded = extended ? 7 : 6;
+        // Die Ableitung gehört zu Frame - dort steht sie einmal und wird von hier, von Frame::size() und
+        // von der Sendewarteschlange benutzt. Statisch, damit im Tick kein 263-Byte-Objekt entsteht.
+        // 0 heißt hier "der Kopf ist noch nicht vollständig", nicht "Fehler".
+        size_t size = Frame::sizeOf(_buffer, _bufferPos);
 
-        if (_bufferPos >= headerBytesNeeded)
+        if (size > 0)
         {
-            size_t metadataSize = extended ? 9 : 8;
-            uint8_t apduSize = extended ? _buffer[6] : (_buffer[5] & 0x0F);
-            _frameSize = metadataSize + apduSize;
+            _frameSize = size;
 
             // Passt nur dann nicht in den Puffer, wenn das Längenbyte den reservierten Wert 255 trägt -
             // die Länge ist damit korrupt und das Frame-Ende unbekannt. Weiterzusammeln wäre Raten, also

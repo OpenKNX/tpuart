@@ -35,6 +35,8 @@ void Dummy::clearData()
     _queue.clear();
     _pos = 0;
     _nextAvailableAt = micros(); // Fahrplan neu aufsetzen, sonst wirkt der alte auf die neuen Bytes nach
+    _availableCount = 0;
+    _scanArrivesAt = _nextAvailableAt;
 }
 
 const std::vector<uint8_t> &Dummy::writtenBytes() const
@@ -72,6 +74,8 @@ void Dummy::begin(uint32_t baud)
     _byteTimeUs = baud > 0 ? (uint32_t)(11000000UL / baud) : 0;
 
     _nextAvailableAt = micros();
+    _scanArrivesAt = _nextAvailableAt;
+    _availableCount = 0;
     _lastDrainAt = _nextAvailableAt;
     _writeUsed = 0; // ein Neustart verwirft den Sendepuffer, wie end()/begin() bei der Hardware
     _running = true;
@@ -85,6 +89,8 @@ void Dummy::end()
 void Dummy::flush()
 {
     _pos = _queue.size();
+    _availableCount = 0;
+    _scanArrivesAt = _nextAvailableAt; // wie bisher: neu angehängte Bytes starten am stehenden Fahrplan
 }
 
 size_t Dummy::available()
@@ -92,17 +98,17 @@ size_t Dummy::available()
     if (!_running) return 0;
 
     uint32_t now = micros();
-    uint32_t arrivesAt = _nextAvailableAt;
-    size_t count = 0;
+    size_t pending = _queue.size() - _pos;
 
-    for (size_t i = _pos; i < _queue.size(); i++)
+    // Nur das FORTSETZEN, was noch nicht erkannt ist - siehe die Begründung an _availableCount.
+    while (_availableCount < pending)
     {
-        if ((int32_t)(now - arrivesAt) < 0) break;
-        count++;
-        arrivesAt += _queue[i]._pauseUs;
+        if ((int32_t)(now - _scanArrivesAt) < 0) break;
+        _scanArrivesAt += _queue[_pos + _availableCount]._pauseUs;
+        _availableCount++;
     }
 
-    return count;
+    return _availableCount;
 }
 
 size_t Dummy::availableForWrite()
@@ -120,6 +126,7 @@ int Dummy::read()
     // Rückstand mit dem ersten gelesenen Byte auflösen und wäre nicht mehr nachstellbar.
     const QueuedByte &entry = _queue[_pos++];
     _nextAvailableAt += entry._pauseUs;
+    _availableCount--; // available() hat eben noch mindestens dieses eine gemeldet
     return (unsigned char)entry._data;
 }
 

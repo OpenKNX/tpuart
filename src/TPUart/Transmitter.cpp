@@ -12,19 +12,16 @@
 namespace TPUart
 {
 
-static_assert(TPUART_TX_QUEUE_COUNT >= 1, "TPUART_TX_QUEUE_COUNT muss mindestens einen Platz haben");
-
+// Mindestens ein maximales Telegramm plus die Reserve muss hineinpassen - sonst könnte der Puffer nie ein
+// vollständiges Telegramm aufnehmen und jeder Versand scheiterte stumm an der Kapazität.
+static_assert(TPUART_TX_BUFFER_SIZE >= TPUART_BUFFER_SIZE + TPUART_TX_PRIORITY_RESERVE,
+              "TPUART_TX_BUFFER_SIZE muss ein maximales Telegramm zusätzlich zur Reserve fassen");
 
 Transmitter::Transmitter(DataLinkLayer &dll) : _dll(dll) {}
 
-// Gibt her, was noch in der Warteschlange liegt. Im Regelfall läuft das nie - der DataLinkLayer ist
-// üblicherweise ein globales Objekt - aber ein Heap-Halter ohne Destruktor ist eine Falle für jeden, der ihn
-// doch einmal lokal anlegt.
-Transmitter::~Transmitter()
-{
-    for (uint32_t i = _queueFree; i != _queueHead; i++)
-        free(_queue[i % TPUART_TX_QUEUE_COUNT]._data);
-}
+// Es gibt nichts mehr freizugeben: die Warteschlange ist ein statischer Bytepuffer. Der Destruktor stand
+// hier, solange jedes wartende Telegramm ein eigener malloc-Block war.
+Transmitter::~Transmitter() {}
 
 // ---------------------------------------------------------------------------------------------------
 // Zeitkritische Seite - läuft später aus einem Timer-Interrupt
@@ -140,33 +137,41 @@ void Transmitter::process()
     _state = TxState::Await;
 }
 
-// Aus dem Tick. Kopiert das nächste Telegramm in den Sendepuffer. Der Heap-Block wird hier NICHT
-// freigegeben - free() gehört nicht in einen Interrupt; das erledigt releaseSentTelegrams() aus loop().
+// Aus dem Tick. Kopiert das vorgelegte Telegramm in den Sendepuffer. Der Platz in der Warteschlange wird
+// hier NICHT freigegeben - das erledigt stageNextTelegram() aus loop(), der die Queue allein gehört.
 bool Transmitter::startNextTransmission()
 {
-    // Im Busmonitor ist der Chip transparent und sendet nichts - dort darf nichts angefangen werden.
-    // sendFrame() lehnt in diesem Modus schon ab, aber ein Telegramm, das VOR dem Umschalten eingereiht
-    // wurde, läge sonst hier und ginge trotzdem raus. Es bleibt in der Warteschlange und wartet, bis der
-    // Busmonitor per Reset verlassen wird.
-    if (_dll.isBusMonitor()) return false;
-
-    if (_queueTail == _queueHead) return false;
-
-    const Entry &entry = _queue[_queueTail % TPUART_TX_QUEUE_COUNT];
-
-    // Kann im geordneten Betrieb nicht vorkommen (sendFrame() prüft beim Einstellen). Bleibt stehen, weil
-    // ein Nullzeiger oder eine überlange Länge hier sonst über den Sendepuffer hinausschreiben würde.
-    if (entry._data == nullptr || entry._length == 0 || entry._length > TPUART_BUFFER_SIZE)
+    // Was noch vorliegt, ist im Busmonitor überholt - der Chip sendet dort nicht, und heraus kommt man nur
+    // per Reset. Verworfen wird es hier, damit der Hauptkontext den Platz freigeben und räumen kann.
+    if (_dll.isBusMonitor())
     {
-        _queueTail = _queueTail + 1;
+        if (_stagedSeq != _takenSeq) _takenSeq = _takenSeq + 1;
         return false;
     }
 
-    _frameSize = entry._length;
-    for (size_t i = 0; i < _frameSize; i++)
-        _buffer[i] = entry._data[i];
+    // Nichts vorgelegt - der Hauptkontext legt beim nächsten loop() nach. Er hat dafür die gesamte Dauer
+    // der laufenden Übertragung Zeit (20ms und mehr), die Vorlage ist also praktisch immer da.
+    if (_stagedSeq == _takenSeq) return false;
 
-    _queueTail = _queueTail + 1; // ab hier darf der Hauptkontext den Block freigeben
+    // Kann im geordneten Betrieb nicht vorkommen (die Aufnahmeprüfung lässt nur intakte Telegramme
+    // herein). Bleibt stehen, weil eine überlange Länge hier sonst über den Sendepuffer hinausschriebe.
+    if (_stagedBuffer == nullptr || _stagedFrameSize == 0 || _stagedFrameSize > TPUART_BUFFER_SIZE)
+    {
+        _takenSeq = _takenSeq + 1;
+        return false;
+    }
+
+    // memcpy und keine Byteschleife: das hier läuft im Tick, auf dem RP2040 also im Interrupt, und kopiert
+    // bis zu 263 Bytes. Die Quelle liegt an einem beliebigen Byte-Offset im Warteschlangenpuffer, es wird
+    // also nicht durchweg wortweise gehen - schneller als Byte für Byte ist es trotzdem, und die Laufzeit
+    // eines Ticks ist genau die Zahl, an der die IRQ-Priorität dieser Schicht hängt.
+    _frameSize = _stagedFrameSize;
+    memcpy(_buffer, _stagedBuffer, _frameSize);
+
+    // ZULETZT: ab hier darf der Hauptkontext den Platz freigeben und neu vorlegen. Der Tick sendet aus
+    // seinem eigenen _buffer, die Bytes der Warteschlange werden also nicht mehr gebraucht - auch nicht
+    // für restart() nach einem Reset.
+    _takenSeq = _takenSeq + 1;
 
     beginTransmission();
     return true;
@@ -295,7 +300,9 @@ void Transmitter::restart()
 // passiert hat.
 void Transmitter::abort()
 {
-    _queueTail = _queueHead;
+    // Nur die Vorlage verwerfen - die Warteschlange gehört dem Hauptkontext, der räumt sie beim nächsten
+    // stageNextTelegram(). Genau diese Trennung löst den Wettlauf auf, der hier früher stand.
+    if (_stagedSeq != _takenSeq) _takenSeq = _takenSeq + 1;
 
     if (_state == TxState::Idle) return;
 
@@ -327,8 +334,10 @@ bool Transmitter::isEcho(const uint8_t *data, size_t length) const
 
 // Ein Produzent, ein Konsument (tick()), Kopf zuletzt sichtbar gemacht - dieselbe Regel wie bei den anderen
 // beiden Ringen, damit der Tick nie einen halben Eintrag sieht.
-bool Transmitter::sendFrame(const uint8_t *data, size_t length)
+bool Transmitter::pushTransmitQueue(const Frame &frame)
 {
+    size_t length = frame.length();
+
     // Jede Ablehnung nennt ihren Grund selbst. Der Aufrufer bekommt nur ein bool und kann ihn deshalb
     // nicht kennen - eine geratene Begründung in der Anwendung ist schlimmer als gar keine.
     if (!_dll.isConnected())
@@ -343,11 +352,10 @@ bool Transmitter::sendFrame(const uint8_t *data, size_t length)
         return false;
     }
 
-    // Ein Telegramm hat mindestens 7 Nutzoktette (Standard: Control, Quelle, Ziel, Länge, TPCI), und mit
-    // der angehängten Prüfsumme muss es in den Puffer passen.
-    if (length < 7 || length + 1 > TPUART_BUFFER_SIZE)
+    // Ein vollständiges Standard-Telegramm hat mindestens 8 Oktetts einschließlich Prüfsumme.
+    if (length < 8 || length > TPUART_BUFFER_SIZE)
     {
-        _dll.printError("Send rejected: length %u out of range (7..%u)", (unsigned)length, (unsigned)(TPUART_BUFFER_SIZE - 1));
+        _dll.printError("Send rejected: length %u out of range (8..%u)", (unsigned)length, (unsigned)TPUART_BUFFER_SIZE);
         return false;
     }
 
@@ -356,69 +364,80 @@ bool Transmitter::sendFrame(const uint8_t *data, size_t length)
     // Index 62, und U_L_DataEnd bis 0x7F, also Länge 63. Damit sind die Datenoktette 0...62 (das sind 63)
     // und die Prüfsumme auf Index 63 - zusammen 64 Oktette. Beim NCN512x verschiebt U_L_DataOffset.req
     // dieses Fenster, dort sind es bis zu 263.
-    if (_dll.bcuType() == BcuType::Tpuart2 && length + 1 > 64)
+    if (_dll.bcuType() == BcuType::Tpuart2 && length > 64)
     {
         _dll.printError("Send rejected: TPUART2 takes at most 63 byte plus checksum");
         return false;
     }
 
-    // Abgeholte, aber noch nicht freigegebene Plätze zuerst einsammeln - sonst gälte die Warteschlange als
-    // voll, obwohl der Tick längst weitergekommen ist.
-    releaseSentTelegrams();
-
-    if (_queueHead - _queueFree >= TPUART_TX_QUEUE_COUNT)
+    // DIE PRÜFUNG LÄUFT VOR JEDER VERÄNDERUNG AM PUFFER, und das ist keine Stilfrage: die Warteschlange
+    // führt kein Längenpräfix, sie leitet die Grenze zwischen zwei Einträgen aus dem Telegramm selbst ab.
+    // Käme etwas hinein, dessen Kopf nicht zur Länge passt, begänne der nächste Eintrag an der falschen
+    // Stelle und alles dahinter wäre Unsinn. Weil hier abgelehnt wird, BEVOR reserviert wird, hat ein
+    // zurückgewiesenes Telegramm den Puffer nie angefasst - das braucht kein Rückabwickeln.
+    //
+    // Geprüft werden Steuerbyte, Länge und Prüfsumme (siehe Frame::isValid). Die Prüfsumme wird NICHT mehr
+    // selbst gerechnet und angehängt: sie gehört zum Telegramm, und sie stillschweigend zu überschreiben
+    // verdeckte einen Fehler im Aufrufer - das Telegramm ginge dann mit korrekter CRC über falschem Inhalt
+    // hinaus.
+    if (!frame.isValid())
     {
-        _dll._statistics.incrementTxQueueOverflows();
-        _dll.printError("Send rejected: queue full (%u telegrams)", (unsigned)TPUART_TX_QUEUE_COUNT);
+        _dll.printError("Send rejected: not a well-formed telegram");
         return false;
     }
 
-    // malloc statt new: kein Exception-Handling nötig, der Fehlerfall ist ein sauberes nullptr. Das ist die
-    // einzige Heap-Nutzung der Library, und sie liegt bewusst hier - Telegramme sind unterschiedlich groß,
-    // eine Anzahl-Grenze wie in der alten Library wäre statisch nur mit vielfachem Speicher zu haben.
-    uint8_t *buffer = (uint8_t *)malloc(length + 1);
-    if (buffer == nullptr)
+    if (!_queue.push(frame))
     {
         _dll._statistics.incrementTxQueueOverflows();
-        _dll.printError("Send rejected: out of memory (%u byte)", (unsigned)(length + 1));
+        _dll.printError("Send rejected: queue full (%u byte)", (unsigned)TPUART_TX_BUFFER_SIZE);
         return false;
     }
 
-    uint8_t crc = 0;
-    for (size_t i = 0; i < length; i++)
-    {
-        buffer[i] = data[i];
-        crc ^= data[i];
-    }
+    _dll._statistics.updateTxQueuePeakBytes(_queue.used());
 
-    buffer[length] = (uint8_t)~crc; // dieselbe CRC-8/GSM-A wie beim Empfang
-
-    Entry &entry = _queue[_queueHead % TPUART_TX_QUEUE_COUNT];
-    entry._data = buffer;
-    entry._length = (uint16_t)(length + 1);
-
-    _queueHead = _queueHead + 1; // erst jetzt ist der Eintrag für den Tick sichtbar
-
-    // Gemessen gegen _queueFree und nicht gegen _queueTail: belegt ist ein Platz, bis der Hauptkontext ihn
-    // freigegeben hat, und genau daran wird oben auch die Vollprüfung gemacht.
-    _dll._statistics.updateTxQueuePeakFrames(_queueHead - _queueFree);
+    // Liegt nichts vor, kann das hier gleich geschehen - sonst wartete das erste Telegramm eine ganze
+    // Loop-Periode, obwohl der Sendeweg frei ist.
+    stageNextTelegram();
     return true;
 }
 
-// Aus dem Hauptkontext. Gibt frei, was der Tick inzwischen abgeholt hat. Erst damit werden die Plätze
-// wieder verfügbar - deshalb rechnet die Belegungsprüfung in sendFrame() gegen _queueFree.
-void Transmitter::releaseSentTelegrams()
+// AUS DEM HAUPTKONTEXT, und hier läuft alles zusammen, was die Warteschlange betrifft: freigeben, was der
+// Tick abgeholt hat, gegebenenfalls räumen, und das nächste Telegramm vorlegen.
+//
+// Die Reihenfolge ist nicht beliebig. Geräumt wird VOR dem Vorlegen - sonst legte man im Busmonitor gerade
+// das vor, was man eben verwerfen wollte. Und der gepinnte Eintrag fällt erst, wenn _takenSeq nachgezogen
+// hat; bis dahin liest der Tick womöglich noch daraus.
+void Transmitter::stageNextTelegram()
 {
-    while (_queueFree != _queueTail)
-    {
-        Entry &entry = _queue[_queueFree % TPUART_TX_QUEUE_COUNT];
+    if (_stagedSeq != _takenSeq) return; // die Vorlage liegt noch, der Tick hat sie nicht abgeholt
 
-        free(entry._data);
-        entry._data = nullptr;
-        entry._length = 0;
+    // Der Tick hat übernommen (oder verworfen) - jetzt darf der Platz weg. pop() kompaktiert dabei, es
+    // bleibt also kein totes Gebiet am linken Rand zurück.
+    if (_queue.pinned()) _queue.pop();
 
-        _queueFree++;
-    }
+    _stagedBuffer = nullptr;
+    _stagedFrameSize = 0;
+
+    // Im Busmonitor ist alles Wartende überholt: heraus kommt man nur per Reset, und was danach hinausginge,
+    // wäre längst veraltet. Räumen darf hier nur der Hauptkontext - dass ihm die Warteschlange allein
+    // gehört, ist genau das, was den früheren Wettlauf an dieser Stelle auflöst.
+    if (_dll.isBusMonitor()) _queue.clear();
+
+    size_t length = 0;
+    const uint8_t *data = _queue.front(length);
+
+    // ERST NACH front(), denn dort wird das Flag gesetzt. Davor abgefragt käme die Meldung einen
+    // loop()-Durchlauf zu spät - und im ungünstigen Fall nie, wenn das Gerät genau dann stehenbleibt.
+    if (_queue.corrupted())
+        _dll.printError("Transmit queue corrupt - dropped");
+
+    if (data == nullptr) return;
+
+    _stagedBuffer = data;
+    _stagedFrameSize = length;
+    _queue.pin(); // ab jetzt bewegt den Eintrag nichts mehr, auch keine Aufnahme
+
+    _stagedSeq = _stagedSeq + 1; // ZULETZT - erst damit wird die Vorlage für den Tick sichtbar
 }
 
 bool Transmitter::queueControl(uint8_t code)
@@ -467,14 +486,16 @@ bool Transmitter::isTransmitting() const
     return _state != TxState::Idle;
 }
 
+// BYTES, nicht Telegramme - die Warteschlange misst sich seit dem Umbau in Bytes, weil ein gewöhnliches
+// Telegramm nur rund 5% eines maximalen ausmacht und feste Plätze den Rest verschenkt hätten.
 uint32_t Transmitter::queueUsed() const
 {
-    return _queueHead - _queueFree;
+    return (uint32_t)_queue.used();
 }
 
 uint32_t Transmitter::queueSize() const
 {
-    return TPUART_TX_QUEUE_COUNT;
+    return (uint32_t)TPUART_TX_BUFFER_SIZE;
 }
 
 bool Transmitter::confirmTimeout()

@@ -74,12 +74,12 @@ class DataLinkLayer;
 // DataLinkLayer::checkTickRate() misst dagegen die ERREICHTE Rate und meldet, wenn sie darüber liegt. Der
 // Wert ist bewusst nicht der eingestellte Takt: dass jemand 500µs wollte und 2200µs bekommt, ist die eine
 // Frage - ob das Ergebnis überhaupt für den Bus reicht, die andere und wichtigere.
-#ifndef TPUART_TICK_SLOW_US
-    #define TPUART_TICK_SLOW_US 1354
+#ifndef TPUART_TICK_DEFERRED_US
+    #define TPUART_TICK_DEFERRED_US 1354
 #endif
 
 // Fenster, über das gemittelt wird. Lang genug, dass eine einzelne lange Runde im Hauptloop nichts
-// auslöst - der Ausreißer steht in getTickGapMaxUs(), hier geht es um den Dauerzustand.
+// auslöst - einzelne Verzögerungen zählt getTickDeferrals(), hier geht es um den Dauerzustand.
 #ifndef TPUART_TICK_RATE_WINDOW_MS
     #define TPUART_TICK_RATE_WINDOW_MS 2000
 #endif

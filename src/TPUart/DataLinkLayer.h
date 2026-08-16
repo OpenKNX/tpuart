@@ -579,22 +579,26 @@ class DataLinkLayer
 
     // --- Telegrammversand ---------------------------------------------------------------------------
     //
-    // Stellt ein Telegramm in die Sendewarteschlange. Ein laufender Versand ist KEIN Ablehnungsgrund - wie
-    // in der alten Library wird eingereiht und der Reihe nach abgearbeitet. Übergeben wird das Telegramm
-    // OHNE Prüfsumme - die berechnet der Layer und hängt sie an, damit sie gar nicht erst falsch sein kann.
-    // `length` ist also um eins kleiner als das, was der Empfang später meldet.
+    // STELLT EIN TELEGRAMM IN DIE SENDEWARTESCHLANGE. Ein laufender Versand ist KEIN Ablehnungsgrund -
+    // eingereiht wird immer, abgearbeitet nach Priorität (System > Urgent > Normal > Low, innerhalb einer
+    // Klasse in Eingangsreihenfolge).
+    //
+    // ÜBERGEBEN WIRD EIN VOLLSTÄNDIGES TELEGRAMM EINSCHLIESSLICH PRÜFSUMME - für alle drei Überladungen
+    // dasselbe, es gibt hier keine zwei Konventionen mehr. Die Prüfsumme wird GEPRÜFT, nicht neu gerechnet:
+    // sie gehört zum Telegramm, und sie stillschweigend zu überschreiben verdeckte einen Fehler im
+    // Aufrufer - das Telegramm ginge dann mit korrekter CRC über falschem Inhalt hinaus.
     //
     // false bedeutet: keine Verbindung, Busmonitor aktiv (dort ist der Chip transparent und sendet nicht),
-    // unpassende Länge, oder die Warteschlange ist voll. Die Daten werden kopiert, der Aufrufer darf seinen
-    // Puffer sofort wieder verwenden.
-    // Wie voll die Warteschlange ist und ob gerade gesendet wird, sagt getTransmitter() - für Aufrufer, die
-    // den Nachschub dosieren wollen, statt sich auf ein false zu verlassen.
-    bool sendFrame(const uint8_t *data, size_t length);
+    // unpassende Länge, kein intaktes Telegramm (Steuerbyte, Länge oder Prüfsumme), oder die Warteschlange
+    // ist voll. Jede Ablehnung nennt ihren Grund über den Message-Callback - aus einem bool ist er nicht
+    // zu erschließen.
+    //
+    // Die Daten werden kopiert, der Aufrufer darf seinen Puffer sofort wieder verwenden.
+    bool pushTransmitQueue(const Frame &frame);
+    bool pushTransmitQueue(const uint8_t *data, size_t length);
 
-    // KOMPAT: Sendeweg der alten Library. Dort wurde ein mit new angelegtes Frame übergeben, das die
-    // Warteschlange übernahm - inklusive bereits berechneter Prüfsumme im letzten Byte. Hier wird der
-    // Inhalt kopiert (sendFrame rechnet die Prüfsumme selbst, dasselbe Ergebnis) und das Frame bei ERFOLG
-    // gelöscht. Bei false bleibt es beim Aufrufer, genau wie früher.
+    // KOMPAT: Sendeweg der alten Library, und die EINZIGE Überladung, die den Besitz übernimmt - bei Erfolg
+    // wird das Frame gelöscht, bei false bleibt es beim Aufrufer. Der knx-Stack verlässt sich darauf.
     bool pushTransmitQueue(Frame *frame);
 };
 

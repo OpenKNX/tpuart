@@ -113,16 +113,13 @@ class Statistics
     // gekostet, deshalb steht die Messung jetzt hier.
     //
     // _ticks gegen die Laufzeit gerechnet ergibt die MITTLERE Taktrate - der belastbare Wert, denn ein
-    // einzelner Ausreißer verzerrt ihn nicht. _tickGapMaxUs ist der schlechteste je gemessene Abstand
-    // zwischen zwei Aufrufen; er ist absichtlich der reine Höchststand und wird nie gemittelt, weil ein
-    // einziger zu langer Aussetzer genau der Fall ist, der ein Acknowledge-Fenster zerstört. Die beiden
-    // zusammen unterscheiden die zwei Krankheitsbilder: ein durchgehend zu langsamer Antrieb (Mittelwert
-    // schlecht) gegen einen, der gelegentlich blockiert wird (Mittelwert gut, Maximum schlecht).
+    // einzelner Ausreißer verzerrt ihn nicht. Die Verzögerungen daneben beantworten die andere Hälfte:
+    // ein durchgehend zu langsamer Antrieb (Mittelwert schlecht) gegen einen, der gelegentlich aufgehalten
+    // wird (Mittelwert gut, Verzögerungen vorhanden).
     //
     // Bezahlt wird das mit EINEM micros() je Tick. Das verdoppelt den Leerlaufpfad ungefähr - siehe den
     // Kommentar an DataLinkLayer::tick(), wo die Rechnung steht.
     volatile uint32_t _ticks = 0;
-    volatile uint32_t _tickGapMaxUs = 0;
 
     // WIE OFT die Grenze gerissen wurde, nicht nur wie schlimm es einmal war. Ohne diesen Zähler ist der
     // Höchstwert unfalsifizierbar: ein einzelner Ausreißer und ein Dauerzustand sehen identisch aus, und
@@ -131,7 +128,13 @@ class Statistics
     //
     // Klassifiziert wird im DataLinkLayer, nicht hier: die Schwelle ist eine Protokollkonstante, und diese
     // Klasse kennt keine (dieselbe Trennung wie bei den Fehlerbits des Chips).
-    volatile uint32_t _tickSlowGaps = 0;
+    volatile uint32_t _tickDeferrals = 0;
+
+    // DIE ZULETZT GEMESSENE VERZÖGERUNG, nicht die schlimmste je gemessene. Der Höchstwert SÄTTIGT: nach
+    // einem einzigen Flash-Schreibvorgang steht dort für immer eine fünfstellige Zahl, und er sagt danach
+    // nichts mehr über den aktuellen Zustand. Der letzte Wert wandert mit - wer nach einer verdächtigen
+    // Aktion nachsieht, bekommt deren Größenordnung und nicht die Vorgeschichte.
+    volatile uint32_t _tickLastDeferredUs = 0;
 
     // WIE LANGE EIN TICK LÄUFT, im schlechtesten je gemessenen Fall. Das ist die Zahl, die darüber
     // entscheidet, welche IRQ-Priorität dieser Schicht zusteht: wer andere Interrupts verdrängen will,
@@ -149,12 +152,6 @@ class Statistics
     // langer Tick nicht zuordnen - man weiss, DASS er lang war, aber nicht, wer ihn lang gemacht hat.
     volatile uint32_t _checkAcknowledgeMaxUs = 0;
 
-    // Zeitpunkt des ERSTEN Ticks nach begin() bzw. reset() - der Bezugspunkt für die mittlere Rate. Gegen
-    // die Uptime zu rechnen war falsch und hat hier schon in die Irre geführt: der Zähler beginnt erst bei
-    // begin(), die angezeigte Rate lag deshalb dauerhaft zu niedrig und stieg mit wachsender Laufzeit an,
-    // als würde sich das Gerät erholen.
-    volatile uint32_t _ticksStartedAt = 0;
-
     // Wie viele Bytes das Interface im Höchstfall bereithielt, als der Tick es abfragte. Das ist der
     // RÜCKSTAND in seiner ursprünglichen Einheit: 0-1 ist gesund (der Bus liefert höchstens alle 1,354ms
     // ein Byte, der Tick holt alle 500µs eines ab), alles darüber heißt, dass der Tick zwischenzeitlich
@@ -167,7 +164,7 @@ class Statistics
     // Sendequeue zählt Telegramme.
     volatile uint32_t _rxQueuePeakBytes = 0;
     volatile uint32_t _txControlQueuePeakBytes = 0;
-    volatile uint32_t _txQueuePeakFrames = 0;
+    volatile uint32_t _txQueuePeakBytes = 0;
 
     // BUSLAST: gemessen wird im Takt, nicht beim Ablesen. Vorher rechnete getBusLoad() über die Zeit seit
     // dem letzten AUFRUF - und die ist unbegrenzt, weil der von der Konsole kommt. Beim ersten Abruf nach
@@ -296,33 +293,32 @@ class Statistics
 
     // --- Takt ------------------------------------------------------------------------------------------
 
-    // EIN Aufruf für beide Werte, entgegen dem sonstigen Zuschnitt einer Methode je Zähler: das hier läuft
-    // bei JEDEM Tick, und der Leerlaufpfad ist der mit Abstand häufigste Code dieser Library. Beim ersten
-    // Tick nach begin() gibt es keinen Vorgänger - dann wird 0 übergeben und nur gezählt.
-    void recordTick(uint32_t gapUs);
+    // Zählt einen Tick und stempelt beim ersten den Bezugspunkt der mittleren Rate.
+    void recordTick();
 
     // Ein Tickabstand hat die Busgrenze gerissen. Getrennt von recordTick(), weil die Schwelle eine
-    // Protokollkonstante ist - siehe _tickSlowGaps.
-    void incrementTickSlowGaps(uint32_t increment = 1);
+    // Protokollkonstante ist und diese Klasse keine kennt - siehe _tickDeferrals.
+    void recordTickDeferred(uint32_t deferredUs);
 
     // Höchststand wie die Warteschlangen-Peaks, siehe _rxInterfacePeakBytes.
     void updateRxInterfacePeakBytes(uint32_t pending);
 
-    // Wie oft tick() gelaufen ist, seit begin() (bzw. seit reset()). Gegen die Laufzeit gerechnet ist das
-    // die mittlere Taktrate: bei der Vorgabe von 500µs sind 2000/s zu erwarten. Deutlich weniger heißt,
-    // dass der eigene Antrieb NICHT läuft und der Hauptloop tickt - dann sagt hasTickDriver() das Gleiche.
+    // Wie oft tick() gelaufen ist. NUR ALS DIFFERENZ ZWEIER STÄNDE zu benutzen - der Zähler läuft bei
+    // 500µs nach rund 25 Tagen um, und eine Rechnung gegen die Gesamtlaufzeit bräche damit. Genau so
+    // benutzt ihn checkTickRate(), und dort stimmt die vorzeichenlose Differenz auch über den Umlauf.
     uint32_t getTicks() const;
 
-    // Der längste je gemessene Abstand zwischen zwei tick()-Aufrufen, in Mikrosekunden. Die harte Grenze
-    // ist die Acknowledge-Frist: ab etwa 2700µs ist ein Telegramm vollständig eingetroffen, bevor der Tick
-    // bei Byte 6 die Entscheidung trifft, und die Quittung wird unterdrückt.
-    uint32_t getTickGapMaxUs() const;
 
-    // Wie oft ein Tickabstand die Busgrenze gerissen hat - siehe _tickSlowGaps. Erst zusammen mit
-    // getTickGapMaxUs() ist das eine Aussage: einmal 12ms ist ein Ereignis, hundertmal 2ms ein Defekt.
-    // Die Differenz zwischen zwei Abfragen sagt zudem, WANN es passiert - dafür genügt es, den Wert vor
-    // und nach einer verdächtigen Aktion abzulesen.
-    uint32_t getTickSlowGaps() const;
+
+    // Wie oft der Tick aufgehalten wurde - siehe _tickDeferrals. Erst zusammen mit der Dauer ist das eine
+    // Aussage: einmal 12ms ist ein Ereignis, hundertmal 2ms ein Defekt. Die Differenz zwischen zwei
+    // Abfragen sagt zudem, WANN es passiert - dafür genügt es, den Wert vor und nach einer verdächtigen
+    // Aktion abzulesen.
+    uint32_t getTickDeferrals() const;
+
+    // Die Dauer der ZULETZT gemessenen Verzögerung - siehe _tickLastDeferredUs. 0, solange nie eine
+    // auftrat.
+    uint32_t getTickLastDeferredUs() const;
 
     // Höchststand wie die übrigen Peaks - siehe _tickDurationMaxUs.
     void updateTickDurationMaxUs(uint32_t durationUs);
@@ -337,10 +333,6 @@ class Statistics
     void updateCheckAcknowledgeMaxUs(uint32_t durationUs);
     uint32_t getCheckAcknowledgeMaxUs() const;
 
-    // Der mittlere Tickabstand in Mikrosekunden, gerechnet ab dem ERSTEN Tick - nicht ab dem Start des
-    // Geräts. Gegen die Uptime zu rechnen ergibt einen Wert, der dauerhaft zu gut aussieht und mit der
-    // Laufzeit scheinbar besser wird; siehe _ticksStartedAt.
-    uint32_t getTickAverageUs() const;
 
     // Der größte je beobachtete Rückstand im Interface, in Bytes - siehe _rxInterfacePeakBytes.
     uint32_t getRxInterfacePeakBytes() const;
@@ -349,7 +341,7 @@ class Statistics
     // Füllstand ohnehin schon ausgerechnet ist, es kommt also nur ein Vergleich dazu.
     void updateRxQueuePeakBytes(uint32_t used);
     void updateTxControlQueuePeakBytes(uint32_t used);
-    void updateTxQueuePeakFrames(uint32_t used);
+    void updateTxQueuePeakBytes(uint32_t used);
 
     uint32_t getRxInterfaceOverflows() const;
     uint32_t getRxQueueOverflows() const;
@@ -374,10 +366,10 @@ class Statistics
 
     // Höchststände, siehe die Felder. Gegen die Größen aus Types.h zu lesen: getRxQueuePeakBytes() gegen
     // TPUART_RX_QUEUE_SIZE, getTxControlQueuePeakBytes() gegen TPUART_CTRL_QUEUE_SIZE,
-    // getTxQueuePeakFrames() gegen TPUART_TX_QUEUE_COUNT.
+    // getTxQueuePeakBytes() gegen TPUART_TX_QUEUE_COUNT.
     uint32_t getRxQueuePeakBytes() const;
     uint32_t getTxControlQueuePeakBytes() const;
-    uint32_t getTxQueuePeakFrames() const;
+    uint32_t getTxQueuePeakBytes() const;
 
     // --- Buslast ---------------------------------------------------------------------------------------
 

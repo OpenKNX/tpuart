@@ -3,6 +3,15 @@
 namespace TPUart
 {
 
+// Siehe den Kommentar an der Deklaration - die Tabelle dreht die Rohwerte auf die Rangfolge, Normal und
+// Urgent tauschen dabei die Plätze.
+uint8_t telegramPriorityRank(uint8_t control)
+{
+    static const uint8_t rank[TP_PRIORITY_COUNT] = {0, 2, 1, 3};
+
+    return rank[(control >> 2) & 0x03];
+}
+
 uint8_t acknowledgeFlags(AckType acknowledge)
 {
     switch (acknowledge)

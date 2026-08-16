@@ -13,8 +13,7 @@ Frame::Frame(size_t length, uint8_t flags) : _length(length < TPUART_BUFFER_SIZE
 
 Frame::Frame(const uint8_t *data, size_t length, uint8_t flags) : Frame(length, flags)
 {
-    for (size_t i = 0; i < _length; i++)
-        _data[i] = data[i];
+    memcpy(_data, data, _length);
 }
 
 Frame::Frame(const char *data, size_t length) : Frame((const uint8_t *)data, length, 0) {}
@@ -69,24 +68,53 @@ bool Frame::isFrame() const
     return (at(0) & L_DATA_MASK) == L_DATA_STANDARD_IND || (at(0) & L_DATA_MASK) == L_DATA_EXTENDED_IND;
 }
 
+// Die 9 gegen 8 steht NUR HIER - sowohl sizeOf() als auch metadataSize() holen sie sich von hier, sonst
+// gäbe es die Fallunterscheidung wieder zweimal.
+static uint8_t metadataSizeOf(uint8_t control)
+{
+    return (control & L_DATA_MASK) == L_DATA_EXTENDED_IND ? 9 : 8;
+}
+
 uint8_t Frame::metadataSize() const
 {
-    return isExtended() ? 9 : 8;
+    return metadataSizeOf(at(0));
 }
 
+// Abgeleitet statt erneut aus dem Längenfeld gelesen: die Nutzlast ist genau das, was von der Gesamtlänge
+// nach dem Rahmen übrig bleibt. So gibt es auch für die Herkunft der Länge nur eine Stelle.
 uint8_t Frame::apduSize() const
 {
-    return isExtended() ? at(6) : (uint8_t)(at(5) & 0x0F);
+    return (uint8_t)(size() - metadataSize());
 }
 
+// Die Zahlen: ein Standard-Telegramm hat 8 Oktetts Rahmen (Steuerbyte, Quelle 2, Ziel 2,
+// Adresstyp/Hopcount/Länge, TPCI, Prüfsumme) plus die APDU aus dem unteren Nibble von Byte 5; ein Extended
+// hat 9 - es bringt ein eigenes Längen-Oktett mit - plus die APDU aus Byte 6.
+uint16_t Frame::sizeOf(const uint8_t *data, size_t available)
+{
+    if (available < 6) return 0; // ohne Byte 5 ist nicht einmal die Standard-Länge lesbar
+
+    uint8_t metadata = metadataSizeOf(data[0]);
+
+    if (metadata == 9)
+    {
+        if (available < 7) return 0; // das Längen-Oktett des Extended steht erst in Byte 6
+        return (uint16_t)(metadata + data[6]);
+    }
+
+    return (uint16_t)(metadata + (data[5] & 0x0F));
+}
+
+// DER UMWEG ÜBER DAS KOPF-ARRAY ist kein Zierrat, sondern der Unterschied zwischen zwei Verträgen: at()
+// liefert jenseits von length() eine 0, size() beantwortet damit "wie lang SOLLTE es sein" auch bei einem
+// Fragment. sizeOf() meldet dort stattdessen 0 ("noch nicht entscheidbar"), und das wäre hier gefährlich -
+// cemiSize() rechnet size() - 1, und mit einer 0 entstünde ein 1-Byte-malloc, in das cemiData() dann
+// hineinschriebe. Sieben Bytes auf dem Stack, und size() läuft nicht je empfangenem Byte.
 uint16_t Frame::size() const
 {
-    return (uint16_t)(metadataSize() + apduSize());
-}
+    uint8_t header[7] = {at(0), at(1), at(2), at(3), at(4), at(5), at(6)};
 
-bool Frame::isTruncated() const
-{
-    return _length < size();
+    return sizeOf(header, sizeof(header));
 }
 
 uint16_t Frame::source() const
@@ -123,12 +151,27 @@ uint8_t Frame::calcCRC8() const
 
 bool Frame::isValid() const
 {
-    return !(_flags & TP_FRAME_FLAG_INVALID);
+    // DAS URTEIL DES EMPFÄNGERS ZUERST. Er weiß beim Setzen des Flags Dinge, die den ausgelieferten Bytes
+    // nicht mehr anzusehen sind - etwa dass eine verifizierte Pause mitten in das Telegramm fiel. Es zu
+    // übergehen hieße, ein bekannt kaputtes Telegramm womöglich für gut zu erklären. Und es steht vorn,
+    // weil ein so markiertes Telegramm dann nicht einmal den Durchlauf kostet.
+    if (_flags & TP_FRAME_FLAG_INVALID) return false;
+
+    // Steuerbyte. Alles, was kein L_Data ist, hat auf dem Sendeweg nichts verloren - insbesondere kein
+    // Poll (0xF0), dessen Länge ganz anders zustande kommt.
+    if (!isFrame()) return false;
+
+    // Länge. size() leitet sie aus dem Kopf ab; stimmt sie nicht überein, ist das Telegramm abgeschnitten
+    // oder das Längenfeld verfälscht. Die Mindestlänge ist damit miterledigt: ein Fragment unter sechs
+    // Bytes kann die abgeleitete Größe gar nicht erreichen.
+    if (_length != size()) return false;
+
+    return calcCRC8() == _data[_length - 1];
 }
 
 bool Frame::isInvalid() const
 {
-    return (_flags & TP_FRAME_FLAG_INVALID) != 0;
+    return !isValid();
 }
 
 bool Frame::isFiltered() const
@@ -298,12 +341,10 @@ std::string Frame::printFrame() const
     }
 
     result.append(" ) [");
+    // Nur die tatsächlich empfangene Länge. Ein abgeschnittenes Telegramm hatte hier einmal zusätzlich die
+    // Soll-Länge stehen - die Unterscheidung "abgeschnitten" gegenüber "Prüfsumme falsch" ist aber keine,
+    // auf die jemand anders reagiert: kaputt ist kaputt, und beide tragen INVALID.
     result.append(std::to_string(_length));
-    if (isTruncated())
-    {
-        result.append("/");
-        result.append(std::to_string(size()));
-    }
     result.append("]");
 
     return result;

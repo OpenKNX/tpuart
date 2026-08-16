@@ -31,6 +31,21 @@ class Dummy : public Abstract
     std::vector<QueuedByte> _queue;
     size_t _pos = 0;
     uint32_t _nextAvailableAt = 0;
+
+    // DER FAHRPLAN WIRD FORTGESCHRIEBEN, NICHT JEDES MAL NEU DURCHGERECHNET - und das ist keine
+    // Mikrooptimierung, sondern die Bedingung dafür, dass die Vorrichtung Zeitmessungen nicht
+    // verfälscht. available() lief früher bei JEDEM Aufruf von _pos bis zum Ende der Warteschlange,
+    // und read() ruft es gleich noch einmal; bei ohne Pause eingespeisten Blöcken wird das
+    // quadratisch. 900 Bytes ergaben so rund 810.000 Schleifendurchläufe je Richtung - auf dem PC
+    // unsichtbar, auf dem RP2040 über 70ms, womit test_rx_queue_overflow_is_counted sein
+    // 80ms-Budget an die Vorrichtung verlor statt an die Library (nativ grün, auf Hardware rot).
+    //
+    // Tragend ist, dass die ABSOLUTE Ankunftszeit eines Bytes feststeht: read() schiebt
+    // _nextAvailableAt um genau die Pause weiter, um die _pos vorrückt, die Ankunftszeiten der
+    // verbliebenen Bytes ändern sich dadurch also nicht. Ein einmal verfügbares Byte bleibt
+    // verfügbar, der Scan kann fortgesetzt statt wiederholt werden.
+    size_t _availableCount = 0;   // ab _pos bereits als angekommen erkannt
+    uint32_t _scanArrivesAt = 0;  // Ankunftszeit von _queue[_pos + _availableCount]
     bool _running = false;
     bool _forcedOverflow = false;
     // Standardmäßig genau die Tiefe, die ein Interface haben DARF (siehe TPUART_TX_INTERFACE_BUFFER) - so

@@ -90,10 +90,27 @@ class Frame
 
     // Gesamtlänge laut Kopf, inklusive Metadaten und APDU. Bei einem abgeschnittenen Frame größer als
     // length() - dann ist das hier die Soll-, nicht die Ist-Länge.
+    //
+    // WIRD NIE 0, auch nicht bei einem Fragment von zwei Bytes; siehe die Implementierung. Mehrere
+    // Aufrufstellen rechnen size() - 1.
     uint16_t size() const;
 
-    // Die Übertragung wurde vorzeitig beendet (verifizierte Pause mitten im Frame).
-    bool isTruncated() const;
+    // DIESELBE ABLEITUNG AUF ROHEN BYTES, ohne dass ein Frame entstehen muss. Sie ist hier statisch, weil
+    // zwei Stellen sie brauchen, an denen es (noch) kein Frame gibt: der Empfänger zerlegt in seinen
+    // eigenen Puffer und darf im Tick kein 263-Byte-Objekt auf den Stack legen, und die Sendewarteschlange
+    // trennt damit ihre Einträge - dort steht bewusst kein Längenpräfix, weil nur Geprüftes hineinkommt.
+    //
+    // DAS IST DIE EINZIGE STELLE MIT DIESER RECHNUNG. Sie stand einmal zusätzlich inline im Empfänger;
+    // zwei Kopien einer Regel laufen früher oder später auseinander.
+    //
+    // 0 heißt "noch nicht entscheidbar" - für ein Standard-Telegramm werden 6 Bytes gebraucht (das
+    // Längen-Nibble sitzt in Byte 5), für ein Extended 7. Der Wert kann TPUART_BUFFER_SIZE ÜBERSCHREITEN
+    // (ein Längenoktett von 255 ergibt 264); das ist ein korruptes Telegramm, und wie darauf zu reagieren
+    // ist, entscheidet der Aufrufer - der Empfänger meldet es als kaputt, der Sendeweg lehnt ab.
+    //
+    // NUR L_DATA. Ein Poll (L_POLL_DATA_IND) hat einen anderen Aufbau, seine Länge folgt aus dem
+    // Slot-Count; dafür ist Receiver::processPollByte() zuständig.
+    static uint16_t sizeOf(const uint8_t *data, size_t available);
 
     uint16_t source() const;
     uint16_t destination() const;
@@ -104,6 +121,22 @@ class Frame
     uint8_t calcCRC8() const;
 
     // Vom Receiver beim Einlesen entschieden, siehe Klassenkommentar.
+    // IST DAS EIN INTAKTES TELEGRAMM? Vier Bedingungen, und alle müssen stimmen:
+    //
+    //   - das INVALID-Flag ist nicht gesetzt, der Empfänger hat es also nicht als kaputt gemeldet
+    //   - das Steuerbyte benennt L_Data (standard oder extended)
+    //   - die Länge entspricht exakt der aus dem Kopf abgeleiteten - damit sind Mindestlänge und
+    //     Vollständigkeit in einem erledigt, ein abgeschnittenes Telegramm fällt durch
+    //   - die Prüfsumme stimmt
+    //
+    // BEIDES ZUSAMMEN, und keins davon reicht allein. Das Flag ist das Urteil des EMPFÄNGERS und stützt
+    // sich auf Wissen, das den Bytes nicht mehr anzusehen ist (eine Pause mitten im Telegramm etwa) - es
+    // zu übergehen hieße, ein bekannt kaputtes Telegramm für gut zu erklären. Umgekehrt ist es bei einem
+    // Telegramm, das ein Aufrufer selbst zum SENDEN baut, immer 0 und damit ohne Aussage; dort trägt
+    // allein die Rechnung. Deshalb prüft der Sendeweg hiermit, bevor er annimmt.
+    //
+    // Der Preis ist ein Durchlauf über das Telegramm - aber nur, wenn das Flag sauber ist. Gerufen wird
+    // das aus loop(), nicht aus dem Tick; dort führt der Receiver die Prüfsumme inkrementell mit.
     bool isValid() const;
     bool isInvalid() const;
 

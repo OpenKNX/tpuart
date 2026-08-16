@@ -68,16 +68,16 @@ void DataLinkLayer::tick()
     // ohnehin kostet. Dafür ist die häufigste Ursache von Problemen dieser Schicht überhaupt erst ablesbar,
     // statt aus ihren Folgen erraten zu werden.
     uint32_t tickNow = micros();
-    uint32_t tickGap = _tickLastUs == 0 ? 0 : tickNow - _tickLastUs;
+    uint32_t sinceLast = _tickLastUs == 0 ? 0 : tickNow - _tickLastUs;
     _tickLastUs = tickNow;
 
-    _statistics.recordTick(tickGap);
+    _statistics.recordTick();
 
-    // Die Einordnung passiert HIER und nicht in Statistics: TPUART_TICK_SLOW_US ist eine Protokollkonstante
+    // Die Einordnung passiert HIER und nicht in Statistics: TPUART_TICK_DEFERRED_US ist eine Protokollkonstante
     // (die Zeichenzeit des Busses), und die Zählerklasse kennt keine - dieselbe Trennung wie bei den
     // Fehlerbits des Chips. Der Zähler ist das, was den Höchstwert überhaupt erst deutbar macht: ohne ihn
     // sehen ein einzelnes Ereignis und ein Dauerzustand identisch aus.
-    if (tickGap > TPUART_TICK_SLOW_US) _statistics.incrementTickSlowGaps();
+    if (sinceLast > TPUART_TICK_DEFERRED_US) _statistics.recordTickDeferred(sinceLast);
 
     // Die Baudraten-SUCHE gehört dem Hauptkontext, weil sie das Interface neu konfiguriert - hier ist
     // deshalb Schluss, bis die Verbindung zum ersten Mal gestanden hat (siehe searchBaudRate).
@@ -110,7 +110,7 @@ void DataLinkLayer::begin(BcuType bcuType)
     _detectNextAttemptAt = millis(); // sofort beim nächsten loop() fällig
 
     // Die Taktmessung fängt neu an: die Zeit zwischen end() und begin() ist keine Lücke im Antrieb, und
-    // ohne das Zurücksetzen stünde sie für immer als Höchstwert in getTickGapMaxUs().
+    // ohne das Zurücksetzen zählte sie beim ersten Tick danach als Verzögerung.
     _tickLastUs = 0;
 
     // Der Antrieb darf sofort loslaufen, obwohl noch keine Verbindung steht: bis _everConnected gesetzt
@@ -421,11 +421,11 @@ void DataLinkLayer::loop()
 
     _receiver.processQueue();
 
-    // Der Tick darf keinen Heap anfassen, also wird hier aufgeräumt, was er abgeholt hat. Das schließt die
-    // beim Wechsel in den Busmonitor verworfenen Telegramme ein: der Tick hat _queueTail dafür bis an
-    // _queueHead vorgezogen (Transmitter::abort()), hier fällt das nur noch als "abgeholt" an und wird
-    // freigegeben. Ein eigener Weg dafür wäre ein zweiter Schreiber auf _queueTail gewesen.
-    _transmitter.releaseSentTelegrams();
+    // Der Tick fasst die Sendewarteschlange nicht an - er bekommt genau ein Telegramm vorgelegt. Hier
+    // läuft alles zusammen, was sie betrifft: den abgeholten Platz freigeben, im Busmonitor räumen, und
+    // das nächste vorlegen. Dass beides im selben Kontext liegt, ist der Grund, warum es beim Wechsel in
+    // den Busmonitor keinen Wettlauf mehr gibt.
+    _transmitter.stageNextTelegram();
 
     // Die Baudratensuche gehört hierher und nicht in den Tick: sie konfiguriert das Interface pro Kandidat
     // neu. Sie läuft genau einmal, bis die Verbindung zum ersten Mal steht - danach übernimmt der Tick
@@ -474,6 +474,10 @@ void DataLinkLayer::loop()
 // Erholt sich die Rate, wird der Melder wieder scharf, ein wiederkehrendes Problem bleibt also sichtbar.
 void DataLinkLayer::checkTickRate()
 {
+    // VOR begin() zählt nichts, weil tick() dort umkehrt, bevor recordTick() läuft. Ohne diese Sperre
+    // meldete der Wächter nach zwei Sekunden "Tick stopped", obwohl bloß noch niemand angefangen hat.
+    if (!_initialized) return;
+
     uint32_t now = millis();
 
     // Der erste Durchlauf legt nur den Bezugspunkt fest - ohne Vorgänger gibt es keine Rate.
@@ -495,9 +499,14 @@ void DataLinkLayer::checkTickRate()
 
     // Gar kein Tick im ganzen Fenster ist der schlimmste Fall und zugleich der, der eine Division durch
     // null wäre - er wird deshalb ausdrücklich behandelt und nicht in die Rechnung gelassen.
-    uint32_t averageUs = delta == 0 ? 0xFFFFFFFF : (elapsed * 1000) / delta;
+    //
+    // IN 64 BIT GERECHNET, und das ist kein Zierrat: elapsed steht in Millisekunden und ist nach oben durch
+    // nichts begrenzt - es ist der Abstand zwischen zwei loop()-Durchläufen, die weit genug auseinander
+    // lagen. Ab 71,6 Minuten liefe elapsed * 1000 in 32 Bit über, und das Ergebnis wäre nicht bloß
+    // unbrauchbar, sondern zu KLEIN: der Wächter schwiege ausgerechnet dann, wenn es am schlimmsten steht.
+    uint32_t averageUs = delta == 0 ? 0xFFFFFFFF : (uint32_t)(((uint64_t)elapsed * 1000) / delta);
 
-    if (averageUs <= TPUART_TICK_SLOW_US)
+    if (averageUs <= TPUART_TICK_DEFERRED_US)
     {
         _tickRateReported = false; // erholt - der Melder wird wieder scharf
         return;
@@ -507,9 +516,9 @@ void DataLinkLayer::checkTickRate()
     _tickRateReported = true;
 
     if (delta == 0)
-        printError("Tick stopped - no tick in %u ms, bus needs one below %u us", (unsigned)elapsed, (unsigned)TPUART_TICK_SLOW_US);
+        printError("Tick stopped - no tick in %u ms, bus needs one below %u us", (unsigned)elapsed, (unsigned)TPUART_TICK_DEFERRED_US);
     else
-        printError("Tick too slow - %u us average (%u/s), bus needs below %u us", (unsigned)averageUs, (unsigned)(delta * 1000 / elapsed), (unsigned)TPUART_TICK_SLOW_US);
+        printError("Tick too slow - %u us average (%u/s), bus needs below %u us", (unsigned)averageUs, (unsigned)(((uint64_t)delta * 1000) / elapsed), (unsigned)TPUART_TICK_DEFERRED_US);
 }
 
 // Aus loop(), also aus dem Hauptkontext - hier darf queueControl() benutzt und gemeldet werden.
@@ -1097,11 +1106,11 @@ const char *DataLinkLayer::bcuStateName() const
     switch (bcuState())
     {
         case BcuState::Connected:
-            return "connected";
+            return "Connected";
         case BcuState::Disconnected:
-            return "disconnected";
+            return "Disconnected";
         default:
-            return "uninitialized";
+            return "Uninitialized";
     }
 }
 
@@ -1255,21 +1264,35 @@ SystemState &DataLinkLayer::getSystemState()
     return _systemState;
 }
 
-bool DataLinkLayer::sendFrame(const uint8_t *data, size_t length)
+bool DataLinkLayer::pushTransmitQueue(const Frame &frame)
 {
-    return _transmitter.sendFrame(data, length);
+    return _transmitter.pushTransmitQueue(frame);
 }
 
-// KOMPAT, siehe Header. Die Länge geht um eins gekürzt weiter: das Frame bringt die Prüfsumme als letztes
-// Byte mit, sendFrame() rechnet sie selbst - dieselbe CRC-8 über dieselben Bytes, also derselbe Wert.
+// Wickelt die Bytes in ein Frame und delegiert. Die Kopie ist hinnehmbar: sie läuft im Hauptkontext, und
+// gespart würde sie nur durch eine nicht besitzende Sicht - dafür müsste Frame einen Zeiger statt seines
+// festen Arrays halten, und das ist ein Eingriff in eine Klasse, die überall benutzt wird.
+bool DataLinkLayer::pushTransmitQueue(const uint8_t *data, size_t length)
+{
+    if (data == nullptr) return false;
+    if (length == 0 || length > TPUART_BUFFER_SIZE) return false;
+
+    return pushTransmitQueue(Frame(data, length));
+}
+
+// KOMPAT: die Zeigerform übernimmt als einzige den BESITZ - so war es in der alten Library, und der
+// knx-Stack verlässt sich darauf (er gibt das Frame nur im Fehlerfall selbst frei).
+//
+// Gekürzt wird hier NICHTS mehr. Früher ging die Länge um eins reduziert weiter, weil die Schicht die
+// Prüfsumme selbst anhängte; jetzt gilt durchgehend "ein Frame ist ein vollständiges Telegramm
+// einschließlich Prüfsumme", und die wird geprüft statt neu gerechnet.
 bool DataLinkLayer::pushTransmitQueue(Frame *frame)
 {
     if (frame == nullptr) return false;
-    if (frame->length() < 2) return false;
 
-    if (!sendFrame(frame->buffer(), frame->length() - 1)) return false;
+    if (!pushTransmitQueue(*frame)) return false;
 
-    delete frame; // übernommen - wie in der alten Library, wo die Warteschlange den Besitz bekam
+    delete frame;
     return true;
 }
 

@@ -170,6 +170,25 @@ struct Fixture
 #endif
     }
 
+    // NUR TICKEN, NICHT LOOPEN - damit füllt sich der RX-Ring, ohne dass ihn jemand leert. Das ist genau
+    // das Bild eines steckengebliebenen Hauptloops, und anders ist ein Ringüberlauf nicht nachzustellen.
+    void tickOnly(uint32_t ms)
+    {
+#ifdef ARDUINO
+        uint32_t until = millis() + ms;
+        while ((int32_t)(millis() - until) < 0)
+            _dll.tick();
+#else
+        constexpr uint32_t STEP_US = 50;
+
+        for (uint32_t elapsed = 0; elapsed < ms * 1000; elapsed += STEP_US)
+        {
+            tpuartNativeClockUs() += STEP_US;
+            _dll.tick();
+        }
+#endif
+    }
+
     // Verbindungsaufnahme durchspielen. Die Baudratensuche liest das Interface DIREKT (nicht über den
     // Empfänger), es genügt also, die Antwort einzuspeisen, sobald der Request draußen ist.
     void connect(BcuType type = BcuType::Ncn5120)
@@ -1023,7 +1042,7 @@ static void test_monitor_rejects_send_frame()
     enterMonitor();
 
     std::vector<uint8_t> frame = standardFrame();
-    TEST_ASSERT_FALSE(fx->_dll.sendFrame(frame.data(), frame.size() - 1));
+    TEST_ASSERT_FALSE(fx->_dll.pushTransmitQueue(frame.data(), frame.size()));
 
     fx->pump(30);
     TEST_ASSERT_TRUE(fx->_interface.writtenBytes().empty());
@@ -1037,7 +1056,7 @@ static void test_monitor_drops_queued_telegram()
     fx->connect();
 
     std::vector<uint8_t> frame = standardFrame();
-    TEST_ASSERT_TRUE(fx->_dll.sendFrame(frame.data(), frame.size() - 1));
+    TEST_ASSERT_TRUE(fx->_dll.pushTransmitQueue(frame.data(), frame.size()));
 
     TEST_ASSERT_TRUE(fx->_dll.startMonitoring());
     fx->pump(40);
@@ -1063,7 +1082,7 @@ static void test_monitor_aborts_running_transmission()
     fx->connect();
 
     std::vector<uint8_t> frame = standardFrame(0x1101, 0x0801, 15); // 23 Oktette, dauert mehrere Ticks
-    TEST_ASSERT_TRUE(fx->_dll.sendFrame(frame.data(), frame.size() - 1));
+    TEST_ASSERT_TRUE(fx->_dll.pushTransmitQueue(frame.data(), frame.size()));
 
     fx->pump(4); // ein paar Oktette sind jetzt draußen, das Telegramm ist aber nicht fertig
     TEST_ASSERT_TRUE(fx->_interface.writtenBytes().size() > 0);
@@ -1208,33 +1227,32 @@ static void test_monitor_survives_silence_and_exits_cleanly()
 // Senden
 // ---------------------------------------------------------------------------------------------------
 
-// Der Aufrufer übergibt das Telegramm OHNE Prüfsumme - die hängt die Library an, damit sie nicht falsch
-// sein kann. Auf der Leitung steht danach U_L_DataStart, je ein U_L_DataCont und zum Schluss U_L_DataEnd.
+// Der Aufrufer übergibt ein VOLLSTÄNDIGES Telegramm einschließlich Prüfsumme - die Library prüft sie und
+// rechnet sie nicht mehr selbst. Auf der Leitung steht danach U_L_DataStart, je ein U_L_DataCont und zum
+// Schluss U_L_DataEnd.
 static void test_send_frame_produces_correct_sequence()
 {
     fx->connect();
 
     std::vector<uint8_t> frame = standardFrame();
-    frame.pop_back(); // ohne Prüfsumme übergeben
-
-    TEST_ASSERT_TRUE(fx->_dll.sendFrame(frame.data(), frame.size()));
+    TEST_ASSERT_TRUE(fx->_dll.pushTransmitQueue(frame.data(), frame.size()));
     fx->pump(40);
 
     const std::vector<uint8_t> &written = fx->_interface.writtenBytes();
 
-    // Je Oktett zwei Hostbytes (Dienst mit Index, dann das Datenbyte), plus die angehängte Prüfsumme -
-    // und davor EIN Offset-Byte: beginTransmission() setzt _chipOffsetValid zurück, das erste Oktett
-    // trägt seinen Offset also mit. Bei neun Oktetten bleibt es bei diesem einen, der nächste fiele erst
-    // bei Position 64 an.
-    TEST_ASSERT_EQUAL(1 + (frame.size() + 1) * 2, written.size());
+    // Je Oktett zwei Hostbytes (Dienst mit Index, dann das Datenbyte) - und davor EIN Offset-Byte:
+    // beginTransmission() setzt _chipOffsetValid zurück, das erste Oktett trägt seinen Offset also mit.
+    // Bei neun Oktetten bleibt es bei diesem einen, der nächste fiele erst bei Position 64 an.
+    TEST_ASSERT_EQUAL(1 + frame.size() * 2, written.size());
     TEST_ASSERT_EQUAL_HEX8(U_L_DATA_OFFSET_REQ | 0, written[0]);
     TEST_ASSERT_EQUAL_HEX8(U_L_DATA_START_REQ | 0, written[1]);
     TEST_ASSERT_EQUAL_HEX8(frame[0], written[2]);
 
     // Im U_L_DataEnd steht die Zahl der DATEN-Oktette; das Prüfsummen-Byte folgt dahinter und zählt nicht
     // als indiziertes Oktett mit.
-    TEST_ASSERT_EQUAL_HEX8(U_L_DATA_END_REQ | (uint8_t)frame.size(), written[written.size() - 2]);
-    TEST_ASSERT_EQUAL_HEX8(checksum(frame), written[written.size() - 1]);
+    TEST_ASSERT_EQUAL_HEX8(U_L_DATA_END_REQ | (uint8_t)(frame.size() - 1), written[written.size() - 2]);
+    // Genau das Prüfsummen-Byte, das der Aufrufer mitgegeben hat - es wird nicht mehr neu gerechnet.
+    TEST_ASSERT_EQUAL_HEX8(frame.back(), written[written.size() - 1]);
     TEST_ASSERT_EQUAL(1, fx->_dll.getStatistics().getTxFrames());
 }
 
@@ -1246,8 +1264,7 @@ static void expectSendSequence(const std::vector<uint8_t> &frame, size_t expecte
 {
     fx->connect();
 
-    std::vector<uint8_t> payload(frame.begin(), frame.end() - 1); // ohne Prüfsumme übergeben
-    TEST_ASSERT_TRUE(fx->_dll.sendFrame(payload.data(), payload.size()));
+        TEST_ASSERT_TRUE(fx->_dll.pushTransmitQueue(frame.data(), frame.size()));
 
     fx->pump((uint32_t)(frame.size() * 2 + 60));
 
@@ -1319,8 +1336,7 @@ static void test_send_extended_maximal_uses_offsets_sparingly()
 // Wiederholungen ab und der Wachhund würde mitten in eine laufende Übertragung greifen.
 static void sendWithEcho(const std::vector<uint8_t> &frame, uint8_t echoCount, int confirmByte)
 {
-    std::vector<uint8_t> payload(frame.begin(), frame.end() - 1);
-    TEST_ASSERT_TRUE(fx->_dll.sendFrame(payload.data(), payload.size()));
+        TEST_ASSERT_TRUE(fx->_dll.pushTransmitQueue(frame.data(), frame.size()));
 
     fx->pump((uint32_t)(frame.size() * 2 + 60));
     fx->_interface.clearWrittenBytes();
@@ -1430,9 +1446,8 @@ static void test_confirmation_without_echo_still_releases_path()
     fx->connect();
 
     std::vector<uint8_t> frame = standardFrame();
-    std::vector<uint8_t> payload(frame.begin(), frame.end() - 1);
-
-    TEST_ASSERT_TRUE(fx->_dll.sendFrame(payload.data(), payload.size()));
+    
+    TEST_ASSERT_TRUE(fx->_dll.pushTransmitQueue(frame.data(), frame.size()));
     fx->pump((uint32_t)(frame.size() * 2 + 60));
     fx->_interface.clearWrittenBytes();
 
@@ -1470,9 +1485,8 @@ static void test_confirmation_after_broken_echo_is_lost_without_pause()
     fx->connect();
 
     std::vector<uint8_t> frame = standardFrame();
-    std::vector<uint8_t> payload(frame.begin(), frame.end() - 1);
-
-    TEST_ASSERT_TRUE(fx->_dll.sendFrame(payload.data(), payload.size()));
+    
+    TEST_ASSERT_TRUE(fx->_dll.pushTransmitQueue(frame.data(), frame.size()));
     fx->pump((uint32_t)(frame.size() * 2 + 60));
 
     std::vector<uint8_t> broken = frame;
@@ -1500,9 +1514,8 @@ static void test_confirmation_after_broken_echo_arrives_after_pause()
     fx->connect();
 
     std::vector<uint8_t> frame = standardFrame();
-    std::vector<uint8_t> payload(frame.begin(), frame.end() - 1);
-
-    TEST_ASSERT_TRUE(fx->_dll.sendFrame(payload.data(), payload.size()));
+    
+    TEST_ASSERT_TRUE(fx->_dll.pushTransmitQueue(frame.data(), frame.size()));
     fx->pump((uint32_t)(frame.size() * 2 + 60));
 
     std::vector<uint8_t> broken = frame;
@@ -1564,12 +1577,82 @@ static void test_send_frame_rejects_oversized()
     std::vector<uint8_t> frame(300, 0x00);
     frame[0] = 0xBC;
 
-    TEST_ASSERT_FALSE(fx->_dll.sendFrame(frame.data(), frame.size()));
+    TEST_ASSERT_FALSE(fx->_dll.pushTransmitQueue(frame.data(), frame.size()));
 }
 
 // ---------------------------------------------------------------------------------------------------
 // Schnittstelle und Statistik
 // ---------------------------------------------------------------------------------------------------
+
+// DER SENDEPUFFER LÄUFT VOLL. Über uns puffert nichts - der knx-Stack verwirft ein abgelehntes Telegramm
+// und meldet ein negatives L_Data.con nach oben -, jede Ablehnung ist also unmittelbar ein verlorenes
+// Telegramm. Der Zähler ist damit kein Schönheitswert.
+//
+// Ohne pump() holt der Tick nichts ab, der Puffer füllt sich also bis zur Grenze. standardFrame() ist Low,
+// es greift damit die kleinere Grenze (siehe TPUART_TX_PRIORITY_RESERVE).
+static void test_tx_queue_overflow_is_counted()
+{
+    fx->connect();
+
+    std::vector<uint8_t> frame = standardFrame();
+
+    int accepted = 0;
+    while (fx->_dll.pushTransmitQueue(frame.data(), frame.size()))
+        accepted++;
+
+    TEST_ASSERT_GREATER_THAN(0, accepted);
+    TEST_ASSERT_EQUAL(1, fx->_dll.getStatistics().getTxQueueOverflows());
+
+    // Und oberhalb von Low ist trotzdem noch Platz - genau dafür gibt es die Reserve.
+    std::vector<uint8_t> urgent = standardFrame();
+    urgent.pop_back();                                // alte Prüfsumme runter
+    urgent[0] = (uint8_t)((urgent[0] & ~0x0C) | 0x08); // Urgent statt Low
+    urgent.push_back(checksum(urgent));                // und über den geänderten Inhalt neu
+
+    TEST_ASSERT_TRUE(fx->_dll.pushTransmitQueue(urgent.data(), urgent.size()));
+}
+
+// Die Steuercode-Warteschlange ist klein (TPUART_CTRL_QUEUE_SIZE), und ein Überlauf dort verwirft einen
+// Befehl an den Chip. Gemeldet wird er einmalig, gezählt bei jedem Vorkommen.
+static void test_control_queue_overflow_is_counted()
+{
+    fx->connect();
+
+    int accepted = 0;
+    while (fx->_dll.reset()) // U_Reset.req, ein Byte je Eintrag
+        accepted++;
+
+    TEST_ASSERT_GREATER_THAN(0, accepted);
+    TEST_ASSERT_EQUAL(1, fx->_dll.getStatistics().getTxControlQueueOverflows());
+}
+
+// DER RX-RING LÄUFT ÜBER, wenn der Hauptloop stehenbleibt, während der Bus weiterliefert. Die Politik ist
+// dabei ausdrücklich "den NEUEN Eintrag verwerfen, das bereits Angenommene behalten" - hier wird geprüft,
+// dass das überhaupt gemeldet wird.
+//
+// Nachgestellt mit tickOnly(): der Tick zerlegt und stellt ein, aber niemand holt ab. Ohne Zeitraster
+// eingespeist, damit die 100 Telegramme in wenigen Millisekunden durch sind statt in anderthalb Sekunden.
+static void test_rx_queue_overflow_is_counted()
+{
+    fx->connect();
+
+    std::vector<uint8_t> frame = standardFrame();
+    std::vector<uint8_t> stream;
+
+    // Ein Eintrag kostet 3 Byte Kopf plus das Telegramm; in TPUART_RX_QUEUE_SIZE passen damit gut 80.
+    for (int i = 0; i < 100; i++)
+        stream.insert(stream.end(), frame.begin(), frame.end());
+
+    fx->feed(stream, 0);
+    fx->tickOnly(80);
+
+    TEST_ASSERT_GREATER_THAN(0, fx->_dll.getStatistics().getRxQueueOverflows());
+
+    // Verworfen wird der NEUE Eintrag - was schon drinsteht, bleibt lesbar. Nach einem loop() müssen die
+    // frühen Telegramme also ankommen.
+    fx->pump(5);
+    TEST_ASSERT_GREATER_THAN(0, fx->_frames.size());
+}
 
 static void test_interface_overflow_is_counted()
 {
@@ -1596,12 +1679,12 @@ static void test_tick_rate_is_measured()
     // genau 100 mal), auf der Hardware so schnell wie der Prozessor durch die Schleife kommt - dort sind es
     // deutlich mehr. Beides muss durch dieselbe Zusicherung passen.
     TEST_ASSERT_GREATER_THAN(50, fx->_dll.getStatistics().getTicks());
-    TEST_ASSERT_GREATER_THAN(0, fx->_dll.getStatistics().getTickGapMaxUs());
+    TEST_ASSERT_GREATER_THAN(0, fx->_dll.getStatistics().getTicks());
 }
 
 // DIE PAUSE ZWISCHEN ZWEI BETRIEBSPHASEN IST KEIN AUSSETZER. Ohne das Zurücksetzen von _tickLastUs in
-// begin() stünde die Zeit zwischen end() und begin() für immer als Höchstwert in getTickGapMaxUs() - der
-// Wert wäre damit dauerhaft unbrauchbar, und zwar genau auf einem Gerät, das die BCU neu verbindet.
+// begin() zählte die Zeit zwischen end() und begin() beim ersten Tick danach als Verzögerung - und zwar
+// genau auf einem Gerät, das die BCU neu verbindet.
 static void test_tick_gap_survives_restart()
 {
     fx->connect();
@@ -1614,8 +1697,8 @@ static void test_tick_gap_survives_restart()
     fx->_dll.begin(BcuType::Ncn5120);
     fx->pump(5);
 
-    // 20ms wären als Lücke unübersehbar; alles unter einer Millisekunde beweist, dass sie nicht drinsteckt.
-    TEST_ASSERT_LESS_THAN(1000, fx->_dll.getStatistics().getTickGapMaxUs());
+    // 20ms lägen weit über der Schwelle und wären als Verzögerung gezählt worden.
+    TEST_ASSERT_EQUAL(0, fx->_dll.getStatistics().getTickDeferrals());
 }
 
 // DER RÜCKSTAND IM INTERFACE, in seiner ursprünglichen Einheit. Kommen alle Bytes auf einmal (gapUs 0),
@@ -1638,7 +1721,7 @@ static void test_interface_backlog_is_measured()
 //
 // Der Wächter misst die ERREICHTE Rate, nicht die eingestellte, greift also bei jedem Antrieb. Gemeldet
 // wird einmal je Störung; erholt sich die Rate, wird der Melder wieder scharf.
-static void test_slow_tick_is_reported()
+static void test_deferred_tick_is_reported()
 {
     fx->connect();
     fx->pump(5); // setzt den Bezugspunkt des Wächters
@@ -1719,9 +1802,15 @@ static void test_bus_load_counts_only_frame_bytes()
 
 // DIE LISTE DER FÄLLE, für beide Einstiegspunkte dieselbe - auf der Hardware ruft setup() sie, nativ
 // main(). Das ist die einzige Stelle, die von einem Fall weiß.
+// Die Fälle der Sendewarteschlange liegen in einer eigenen Datei: sie brauchen weder Vorrichtung noch
+// Interface noch Zeit, und genau das ist der Grund, warum die Klasse herausgezogen wurde.
+void runTransmitQueueTests();
+
 static int runAllTests()
 {
     UNITY_BEGIN();
+
+    runTransmitQueueTests();
 
     RUN_TEST(test_connect_reports_connected);
     RUN_TEST(test_connect_without_answer_stays_disconnected);
@@ -1795,9 +1884,12 @@ static int runAllTests()
     RUN_TEST(test_tick_rate_is_measured);
     RUN_TEST(test_tick_gap_survives_restart);
     RUN_TEST(test_interface_backlog_is_measured);
-    RUN_TEST(test_slow_tick_is_reported);
+    RUN_TEST(test_deferred_tick_is_reported);
     RUN_TEST(test_healthy_tick_is_not_reported);
+    RUN_TEST(test_rx_queue_overflow_is_counted);
     RUN_TEST(test_interface_overflow_is_counted);
+    RUN_TEST(test_tx_queue_overflow_is_counted);
+    RUN_TEST(test_control_queue_overflow_is_counted);
     RUN_TEST(test_control_sequence_is_never_split);
     RUN_TEST(test_bus_load_counts_only_frame_bytes);
 

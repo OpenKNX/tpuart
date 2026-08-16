@@ -1,4 +1,6 @@
 #pragma once
+#include "TPUart/TransmitQueue.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -9,20 +11,12 @@ namespace TPUart
 
 class DataLinkLayer;
 
-// Sendewarteschlange wie in der alten Library: die Telegramme liegen auf dem HEAP, begrenzt wird über ihre
-// ANZAHL (dort std::queue<Frame*> mit MAX_QUEUE_SIZE = 50). Statisch ginge diese Grenze nicht sinnvoll -
-// 50 Plätze in voller Telegrammgröße wären über 13 KB, und ein Byte-Ring mit vernünftigen 1024 Byte fasst
-// eben keine 50 Telegramme, sondern nur so viele, wie ihre tatsächliche Größe zulässt. Auf dem Heap belegt
-// jedes Telegramm exakt seine Länge, und die Grenze ist eine Aussage, auf die sich der Aufrufer verlassen
-// kann.
+// Die Sendewarteschlange liegt in TransmitQueue - ein statischer Bytepuffer, dem Hauptkontext allein
+// gehörend, prioritätsgeordnet. Ihre Größe steht dort als TPUART_TX_BUFFER_SIZE.
 //
-// Statisch bleibt nur die Zeigertabelle (TPUART_TX_QUEUE_COUNT * 8 Byte). Alloziert und freigegeben wird
-// ausschließlich im HAUPTKONTEXT - malloc/free sind nicht interruptfest, und tick() läuft im Timer-Betrieb
-// im Interrupt. Der Tick kopiert nur heraus (siehe _buffer); freigegeben wird hinterher in loop(), dafür
-// gibt es den dritten Index _queueFree.
-#ifndef TPUART_TX_QUEUE_COUNT
-#define TPUART_TX_QUEUE_COUNT 50
-#endif
+// Hier stand einmal TPUART_TX_QUEUE_COUNT und eine Zeigertabelle auf Heap-Blöcke. Das war die einzige
+// fragmentierende Allokation der Library, im Bustakt über die Lebensdauer des Geräts - und eine Grenze in
+// TELEGRAMMEN, obwohl ein gewöhnliches nur rund 5% eines maximalen ausmacht.
 
 // Der SCHLIMMSTE Fall eines Telegrammbytes: Offset-Byte, Positionsbyte, Datenbyte. Die drei müssen
 // unmittelbar aufeinander folgen, sonst schöbe sich ein zwischendurch fälliges Acknowledge dazwischen.
@@ -131,24 +125,27 @@ class Transmitter
     // Interface, Statistik und die andere Hälfte werden über _dll gerufen, nicht als eigene Referenz
     // gehalten - siehe Receiver.h, dieselbe Begründung.
 
-    // Ein Platz der Sendewarteschlange: Zeiger auf das Telegramm im Heap, Länge inklusive Prüfsumme.
-    struct Entry
-    {
-        uint8_t *_data;
-        uint16_t _length;
-    };
+    // DIE SENDEWARTESCHLANGE GEHÖRT DEM HAUPTKONTEXT ALLEIN - siehe TransmitQueue.h. Der Tick fasst sie
+    // nicht an; er bekommt genau ein Telegramm vorgelegt. Nur unter dieser Bedingung darf darin überhaupt
+    // nach Priorität umsortiert werden.
+    //
+    // Vorher lagen hier drei Indizes und ein Feld aus Heap-Zeigern. Der dritte Index existierte allein
+    // deshalb, weil free() nicht in den Tick darf - jetzt gibt der Hauptkontext ohnehin selbst frei, und
+    // es gibt gar keinen Heap mehr.
+    TransmitQueue _queue;
 
-    // Drei Indizes statt der üblichen zwei, weil das Freigeben nicht dort passieren darf, wo der Eintrag
-    // verbraucht wird:
-    //   _queueHead - schreibt nur der Hauptkontext (sendFrame(), alloziert)
-    //   _queueTail - schreibt nur tick() (hat das Telegramm in den Sendepuffer kopiert)
-    //   _queueFree - schreibt nur der Hauptkontext (loop(), gibt bis _queueTail frei)
-    // Ein Platz gilt erst als wiederverwendbar, wenn er freigegeben ist - die Belegungsprüfung rechnet
-    // deshalb gegen _queueFree, nicht gegen _queueTail.
-    Entry _queue[TPUART_TX_QUEUE_COUNT] = {};
-    volatile uint32_t _queueHead = 0;
-    volatile uint32_t _queueTail = 0;
-    uint32_t _queueFree = 0;
+    // DIE VORLAGE: ein Telegramm, das für den Tick bereitliegt. Zeigt IN den Puffer der Warteschlange,
+    // es wird also nichts kopiert - kopiert wird erst der Tick in seinen eigenen _buffer.
+    //
+    // DREI REGELN, und sie tragen die ganze Nebenläufigkeit dieses Pfades:
+    //   1. Der Hauptkontext schreibt die Vorlage NUR, wenn _stagedSeq == _takenSeq.
+    //   2. Er gibt den Platz erst frei (pop), wenn _takenSeq nachgezogen hat.
+    //   3. Veröffentlicht wird in beide Richtungen ZULETZT - Nutzlast vor Zähler.
+    // Je ein Schreiber, gelesen wird über Kreuz. Ungleich heißt "es liegt etwas bereit".
+    const uint8_t *_stagedBuffer = nullptr;
+    size_t _stagedFrameSize = 0;
+    volatile uint32_t _stagedSeq = 0; // schreibt nur der Hauptkontext
+    volatile uint32_t _takenSeq = 0;  // schreibt nur tick()
 
     // Das Telegramm, das GERADE übertragen wird - bewusst getrennt von der Warteschlange, denn das sind
     // zwei verschiedene Vorgänge: die Warteschlange nimmt entgegen und reicht weiter, der Sendepuffer
@@ -217,9 +214,9 @@ class Transmitter
     // Aus tick(): setzt höchstens EINE Steuersequenz ODER ein Telegramm-Oktett ab.
     void process();
 
-    // Aus dem Hauptkontext: stellt ein Telegramm in die Sendewarteschlange, OHNE Prüfsumme - die wird hier
-    // berechnet und angehängt. Die Daten werden kopiert.
-    bool sendFrame(const uint8_t *data, size_t length);
+    // Aus dem Hauptkontext: stellt ein vollständiges Telegramm EINSCHLIESSLICH Prüfsumme in die
+    // Sendewarteschlange. Geprüft wird vor jeder Veränderung am Puffer, die Bytes werden kopiert.
+    bool pushTransmitQueue(const Frame &frame);
 
     // Interne Steuerbyte-Schnittstelle für den DataLinkLayer - nach außen gibt es dafür die semantischen
     // Methoden (reset(), startMonitoring(), powerControl(), ...). Die Gruppe wird garantiert ununterbrochen
@@ -253,8 +250,9 @@ class Transmitter
     // und ob auf die Bestätigung zu warten ist).
     bool isEcho(const uint8_t *data, size_t length) const;
 
-    // Gibt den Heap-Speicher bereits abgeholter Telegramme frei. Nur aus dem Hauptkontext.
-    void releaseSentTelegrams();
+    // Gibt den abgeholten Platz frei, räumt im Busmonitor und legt das nächste Telegramm für den Tick
+    // bereit. NUR AUS DEM HAUPTKONTEXT - die Warteschlange gehört ihm allein.
+    void stageNextTelegram();
 
     // Der Wachhund hat zugeschlagen: keine Bestätigung zum gesendeten Telegramm, die BCU wurde
     // zurückgesetzt. Gesetzt im Tick, gemeldet aus loop() - im Tick darf nichts nach außen dringen.

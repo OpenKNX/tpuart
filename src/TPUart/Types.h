@@ -55,6 +55,26 @@ constexpr uint8_t L_DATA_STANDARD_IND = 0x90;
 constexpr uint8_t L_DATA_EXTENDED_IND = 0x10;
 constexpr uint8_t L_DATA_MASK = 0xD3;
 
+// PRIORITÄT EINES TELEGRAMMS, aus den Bits 3-2 des Steuerbytes. Vier Stufen, und die Rangfolge ist NICHT
+// die Reihenfolge der Rohwerte - das ist die Falle an dieser Stelle:
+//
+//   roh 0 = System   -> Rang 0 (höchste)      ETS-Programmierung, Verbindungssteuerung
+//   roh 1 = Normal   -> Rang 2                Zentralfunktionen
+//   roh 2 = Urgent   -> Rang 1                Alarme
+//   roh 3 = Low      -> Rang 3 (niedrigste)   gewöhnliche Gruppenkommunikation
+//
+// Normal und Urgent sind also vertauscht. Verifiziert nicht gegen die Datenblätter - die beschreiben die
+// UART-Strecke, nicht die Rahmensemantik -, sondern gegen den Code, der die Bits tatsächlich schreibt:
+// knx/src/knx/knx_types.h (SystemPriority=0x0, NormalPriority=0x4, UrgentPriority=0x8, LowPriority=0xC)
+// und CemiFrame::priority(), das mit 0x0C maskiert. Wer die Rangfolge hier vertauscht, bekommt einen
+// Fehler, den kein Test findet und der am Bus nur unter Last auffällt.
+uint8_t telegramPriorityRank(uint8_t control);
+
+// Anzahl der Prioritätsklassen und der Rang der niedrigsten. Letzterer ist der einzige, der eine
+// Sonderbehandlung bekommt: nur für ihn gilt die Reserve im Sendepuffer.
+constexpr uint8_t TP_PRIORITY_COUNT = 4;
+constexpr uint8_t TP_PRIORITY_LOW = 3;
+
 // Poll-Telegramm: ein Master fragt mit EINEM Telegramm bis zu 15 Geräte ab, und jedes antwortet mit einem
 // einzelnen Byte in seinem Slot - ohne eigenen Rahmen und ohne Quittung. Auf dem Bus sieht das so aus
 // (NCN Figure 56, Siemens Fig. 23): Control, Source 2, Poll-Adresse 2, Slot Count, Prüfsumme, danach die

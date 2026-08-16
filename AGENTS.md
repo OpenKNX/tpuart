@@ -404,10 +404,11 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
     Sequenzen. `hasTickDriver()` meldet, ob der eigene Timer der Library am Ende läuft.
   - **Der Timer-Antrieb gibt eine Zusage, die zwei Kerne nicht geben.** Ein Interrupt läuft immer zu
     Ende und wird nie vom Hauptloop verdrängt, `tick()` und `loop()` konnten sich also nie
-    verschränken. Mit `tick()` auf Kern 1 ist das weg. Die SPSC-Warteschlangen überstehen es (das
-    Telegramm wird herauskopiert, *bevor* `_queueTail` weiterrückt, und `releaseSentTelegrams()`
-    gibt nur unterhalb davon frei), aber jedes ab hier neu hinzugefügte geteilte Feld muss gegen
-    echte Parallelität geprüft werden, nicht nur gegen Verdrängung.
+    verschränken. Mit `tick()` auf Kern 1 ist das weg. Die SPSC-Ringe überstehen es (der Kopf wird
+    erst veröffentlicht, wenn der Eintrag vollständig geschrieben ist), und die Sendewarteschlange
+    berührt es gar nicht mehr - sie gehört seit dem Umbau dem Hauptkontext allein, der Tick sieht nur
+    die Vorlage. Jedes ab hier neu hinzugefügte geteilte Feld muss trotzdem gegen echte Parallelität
+    geprüft werden, nicht nur gegen Verdrängung.
   - **Folge für Callbacks**: auf dem RP2040 läuft der Quittungs-Callback
     (`registerCheckAcknowledge`) jetzt im Interrupt-Kontext. Er musste ohnehin kurz und
     allokationsfrei sein; das ist nun keine Empfehlung mehr.
@@ -967,6 +968,31 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
 - **Ein Moduswechsel löst ebenfalls einen Resync aus** (siehe Busmonitor oben) - dieser verwirft die
   laufende Sequenz, ohne sie zu melden, da er Folge unseres eigenen Handelns ist und nicht eines
   Busproblems.
+- **`Frame` ist überall ein VOLLSTÄNDIGES Telegramm einschließlich Prüfsumme**, in beide Richtungen
+  und an jedem Einstiegspunkt. Daran hängt mehr, als es aussieht: solange `sendFrame()` es *ohne*
+  erwartete und `pushTransmitQueue()` *mit*, hatten dieselben Bytes zwei Bedeutungen, und die
+  KOMPAT-Form musste die Länge um eins kürzen. Es gibt kein `+1`/`-1` mehr.
+  **`isValid()` rechnet nach und liest zugleich das Flag** - vier Bedingungen: `INVALID` nicht
+  gesetzt, Steuerbyte ist L_Data, `length() == size()` (das erledigt Mindestlänge und Vollständigkeit
+  in einem), Prüfsumme stimmt. Beide Anteile tragen etwas Eigenes, keiner reicht allein: das Flag
+  stützt sich auf Wissen des Empfängers, das den Bytes nicht mehr anzusehen ist (eine Pause mitten im
+  Telegramm), und die Rechnung ist das Einzige, was bei einem selbst gebauten *Sende*telegramm etwas
+  aussagt, wo die Flags immer 0 sind. Das Flag steht vorn, ein bereits gemeldetes Telegramm kostet
+  also nicht einmal den Durchlauf. `isInvalid()` ist die Verneinung davon.
+  **Die Längenableitung gibt es genau einmal**: `Frame::sizeOf(data, available)`, statisch, benutzt
+  von `Frame::size()`, vom Empfänger (`processFrameByte()`) und von der Sendewarteschlange. Statisch,
+  weil `sizeof(Frame)` 263 Byte ist - im Tick je Telegramm und in jedem `front()` wäre ein Objekt der
+  falsche Preis. Sie stand einmal zusätzlich inline im Empfänger; zwei Kopien einer Regel laufen
+  früher oder später auseinander. Dasselbe gilt für die 9-gegen-8 (`metadataSizeOf()`) und für die
+  Prüfsumme (`calcCRC8()`).
+  **`Frame::size()` geht dabei über ein nullgefülltes Kopf-Array**, und das ist kein Zierrat: `at()`
+  liefert jenseits von `length()` eine 0, `size()` beantwortet damit "wie lang *sollte* es sein" auch
+  bei einem Fragment. `sizeOf()` meldet dort 0 ("noch nicht entscheidbar"), und das wäre hier
+  gefährlich - `cemiSize()` rechnet `size() - 1`, mit einer 0 entstünde ein 1-Byte-`malloc`, in das
+  `cemiData()` dann hineinschriebe.
+  `isTruncated()` gab es einmal; es hatte einen einzigen Nutzer (`printFrame()`) und unterschied
+  "abgeschnitten" von "Prüfsumme falsch". Beide tragen `INVALID`, und niemand reagiert verschieden
+  darauf - kaputt ist kaputt.
 - **`Statistics`** (`Statistics.{h,cpp}`, erreichbar über `getStatistics()`). Die Zähler werden aus
   `tick()` hochgezählt und aus dem Hauptkontext gelesen, daher
   `volatile` und einfache Inkremente - ein Schreiber je Zähler. `reset()` aus dem Hauptkontext kann
@@ -1007,12 +1033,12 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   das sind Zustände des Chips, keine Richtung von uns aus (TE und SC entstehen beim Senden auf dem Bus,
   RE beim Empfangen - ein gemeinsames Präfix wäre in jedem Fall falsch).
   **Höchststände statt nur Überläufe.** `getRxQueuePeakBytes()`, `getTxControlQueuePeakBytes()` und
-  `getTxQueuePeakFrames()` beantworten die Auslegungsfrage, *bevor* etwas überläuft - ein
+  `getTxQueuePeakBytes()` beantworten die Auslegungsfrage, *bevor* etwas überläuft - ein
   Überlaufzähler sagt nur, dass es zu spät war. Sie hängen sich an einen Füllstand an, der an der
-  jeweiligen Stelle ohnehin ausgerechnet wird, es kommt also nur ein Vergleich dazu. Die Einheit steht
-  im Namen, weil sie nicht dieselbe ist: RX- und Steuerring zählen Bytes, die Sendequeue Telegramme.
-  Zu lesen sind sie gegen `TPUART_RX_QUEUE_SIZE`, `TPUART_CTRL_QUEUE_SIZE` und
-  `TPUART_TX_QUEUE_COUNT`.
+  jeweiligen Stelle ohnehin ausgerechnet wird, es kommt also nur ein Vergleich dazu. Alle drei zählen
+  **Bytes**; die Sendequeue tat das früher in Telegrammen, seit sie ein Bytepuffer ist, misst sie sich
+  wie die beiden anderen. Zu lesen sind sie gegen `TPUART_RX_QUEUE_SIZE`, `TPUART_CTRL_QUEUE_SIZE` und
+  `TPUART_TX_BUFFER_SIZE`.
   **Gezählt werden Probleme, nicht Vorgänge.** Deshalb gibt es `getConnectionLosses()` und
   `getTxConfirmTimeouts()`, aber keinen Zähler für Resets und keinen für negative Bestätigungen: ein
   negatives `L_Data.con` sagt nur, dass auf dem Bus niemand quittiert hat - eine Aussage über den Bus,
@@ -1037,17 +1063,32 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   dorthin. Ohne diese Reihenfolge zeigte ein Gerät ohne eigene Adressen Rückstände in Höhe des gesamten
   Busverkehrs an, und ein echter Rückstand wäre darin nicht mehr zu finden - festgehalten in
   `test_unaddressed_frame_is_not_acknowledged`, das den Fall bewusst *mit* vollem Rückstand fährt.
-- **Der Takt misst sich selbst** (`getTicks()`, `getTickGapMaxUs()`, `getRxInterfacePeakBytes()`), und
+- **Der Takt misst sich selbst** (`getTicks()`, `getTickDeferrals()`, `getTickLastDeferredUs()`,
+  `getRxInterfacePeakBytes()`), und
   das ist die Antwort auf ein wiederkehrendes Problem: der Antrieb ist die Voraussetzung für alles in
   dieser Schicht, war aber der einzige Wert, den man **nicht ablesen konnte**. Sichtbar waren nur seine
   Folgen - unterdrückte Quittungen, Interface-Überläufe -, und die Ursache musste geraten werden.
-  Drei Werte, weil sie drei verschiedene Krankheitsbilder trennen, und erst zusammen ergeben sie eine
-  Diagnose:
+  Die Werte trennen verschiedene Krankheitsbilder, und erst zusammen ergeben sie eine Diagnose:
   - `getTicks()` gegen die Laufzeit ist die **mittlere** Rate. Deutlich unter dem eingestellten Soll
     heißt: der eigene Antrieb läuft gar nicht, der Hauptloop tickt - dasselbe sagt `hasTickDriver()`.
-  - `getTickGapMaxUs()` ist der **schlechteste** je gemessene Abstand, absichtlich nie gemittelt: ein
-    einziger zu langer Aussetzer ist genau der Fall, der ein Quittungsfenster zerstört. Ein guter
-    Mittelwert bei schlechtem Maximum heißt, der Antrieb stimmt, wird aber zwischendurch blockiert.
+  - `getTickDeferrals()` sagt, **wie oft** der Tick aufgehalten wurde (Schwelle
+    `TPUART_TICK_DEFERRED_US`, die Zeichenzeit des Busses), `getTickLastDeferredUs()`, **wie lang die
+    letzte** dauerte. Ein guter Mittelwert bei vorhandenen Verzögerungen heißt: der Antrieb stimmt, wird
+    aber zwischendurch blockiert.
+    **Bewusst die letzte und nicht die schlimmste.** Ein Höchstwert SÄTTIGT - nach einem einzigen
+    Flash-Schreibvorgang stünde dort für immer eine fünfstellige Zahl, und er sagte danach nichts mehr
+    über den aktuellen Zustand. Es gab dafür einmal `getTickGapMaxUs()`; der Wert ist aus genau diesem
+    Grund entfernt worden. Wer wissen will, wann es passiert, liest den Zähler vor und nach der
+    verdächtigen Aktion ab.
+  - `getTickDurationMaxUs()` und `getCheckAcknowledgeMaxUs()` beantworten die **umgekehrte** Frage: nicht,
+    wie oft der Tick aufgehalten wurde, sondern wie lange er selbst braucht. Daran hängt die
+    Prioritätswahl - wer andere Interrupts verdrängen will, muss belegen können, dass er sie nur kurz
+    aufhält. Gemessen wird nur der volle Durchlauf; die frühen Abbrüche sind ein paar Vergleiche und
+    würden das Bild beschönigen. Die zweite Zahl ist der Anteil des **Aufrufers**: der Quittungs-Callback
+    ist der einzige unbegrenzte Teil des Ticks (alles andere ist ein Byte je Richtung), und liegen beide
+    dicht beieinander, gehört die Laufzeit ihm und nicht dieser Schicht. Beides sind Höchstwerte und
+    sättigen deshalb - anders als bei `getTickLastDeferredUs()` ist das hier richtig, weil die Frage
+    "wie schlimm kann es werden" lautet und nicht "wie steht es gerade".
   - `getRxInterfacePeakBytes()` ist derselbe Befund in der Einheit, in der er entsteht: 0-1 ist gesund
     (der Bus liefert höchstens alle 1,354ms ein Byte, der Tick holt alle 500µs eines ab), ab 2 wird bei
     Byte 6 die Quittung unterdrückt. Kostenlos erhoben, weil `Receiver::process()` `available()` ohnehin
@@ -1071,7 +1112,7 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   - **Gemessen wird die ERREICHTE Rate, nicht die eingestellte.** Ein Wächter auf `hasTickDriver()` hätte
     genau den Fall verfehlt, in dem jemand absichtlich selbst tickt (`setExternalTick`) und dabei zu langsam
     ist - und das war hier fast der Fall.
-  - **Die Schwelle kommt aus dem Bus, nicht aus der Konfiguration**: `TPUART_TICK_SLOW_US` ist 1354, die
+  - **Die Schwelle kommt aus dem Bus, nicht aus der Konfiguration**: `TPUART_TICK_DEFERRED_US` ist 1354, die
     Zeichenzeit auf TP1. Ein Tick bewegt ein Byte je Richtung; liegt der mittlere Abstand darüber, holt die
     Schicht weniger Bytes ab, als der Bus im Vollausbau liefert (738 Byte/s), und **keine Puffergröße hilft
     dagegen**. Unterhalb ist alles gut, oberhalb ist es grundsätzlich kaputt - das ist keine Empfehlung,
@@ -1079,13 +1120,13 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   Gemeldet wird **einmal je Störung**, nicht je Fenster; erholt sich die Rate, wird der Melder wieder
   scharf. Der Fall "gar kein Tick im Fenster" ist ausdrücklich behandelt, er wäre sonst eine Division durch
   null. Zwei Testfälle hängen daran, und der zweite ist der wichtigere:
-  `test_slow_tick_is_reported` und `test_healthy_tick_is_not_reported` - ein Wächter, der grundsätzlich
+  `test_deferred_tick_is_reported` und `test_healthy_tick_is_not_reported` - ein Wächter, der grundsätzlich
   meldet, wäre ohne den zweiten genauso "grün" wie der richtige und im Betrieb reines Rauschen.
   **Ein guter Mittelwert schließt das Problem nicht aus**, und im Router steckten dahinter *zwei*
   verschiedene Ursachen, die sich im blossen Höchstwert nicht unterscheiden ließen - erst
-  `getTickSlowGaps()` hat sie getrennt:
+  `getTickDeferrals()` hat sie getrennt:
   - **Dauerhaft, 2-4 mal je Sekunde**: ein gleichrangiger Interrupt auf 0x80. Behoben durch den eigenen
-    Alarmpool mit angehobener Priorität (siehe `TickDriver`), Ergebnis 0 slow über 26000 Ticks bei einem
+    Alarmpool mit angehobener Priorität (siehe `TickDriver`), Ergebnis 0 Verzögerungen über 26000 Ticks bei einem
     Höchstwert von 520µs gegen 500µs Intervall.
   - **Einmalig und riesig**: ein Flash-Schreibvorgang. **Auf BEIDEN Plattformen gemessen** - RP2040
     53176µs, ESP32 40033µs -, es ist also keine Eigenheit des einen Ports. Der Mechanismus unterscheidet
@@ -1119,7 +1160,7 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   der ersten Beobachtung von Stille, ein 52ms-Stillstand des Ticks wird also nicht als Buspause
   missdeutet.
   Der Wächter schweigt zu beidem zu Recht, sobald der Mittelwert stimmt - dafür gibt es
-  `getTickGapMaxUs()` und `getTickSlowGaps()` daneben.
+  `getTickDeferrals()` und `getTickLastDeferredUs()` daneben.
   `getBusLoad()` hat die Einheit Byte je Sekunde und ist ein **gleitender Mittelwert** über
   `BUS_LOAD_WINDOW` (3) Sekunden, fortgeschaltet alle `BUS_LOAD_SLICE_MS` (1000). Beide sind feste
   `static constexpr`-Member, keine überschreibbaren Makros - sie beschreiben eine Anzeige, keine
@@ -1150,30 +1191,61 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   passen. Steht dort ein Wert mit gesetzten oberen Bits, kann `normalMode()` nie wahr werden -
   ein Fehler, der lange unbemerkt bleibt, weil `modeString()` direkt gegen `0x03` vergleicht und
   weiterhin das Richtige anzeigt.
-- **Ein Telegramm senden** (`sendFrame()`): der Aufrufer übergibt das Telegramm *ohne* Prüfsumme -
-  die Schicht rechnet sie aus und hängt sie an, sie kann also nicht falsch sein. Es geht in eine
-  **Sendequeue** (`_txQueue`), eine bereits laufende Übertragung ist damit kein Ablehnungsgrund -
-  ohne die Warteschlange müsste der Aufrufer warten, bis der Pfad frei wird.
-  **Warteschlange und Übertragung sind zwei getrennte Aufgaben und bleiben getrennt.** Die
-  Warteschlange nimmt Telegramme an und gibt sie weiter; `_txBuffer` gehört einer laufenden
-  Übertragung. `startNextTransmission()` kopiert das nächste Telegramm hinüber, die Warteschlange
-  füllt sich also weiter, während das aktuelle Telegramm noch auf der Leitung ist.
-  **Die Warteschlange ist der eine Heap-Nutzer der Library**, und die Grenze ist eine
-  **Telegrammanzahl** (`TPUART_TX_QUEUE_COUNT`, Vorgabe 50). Beide Alternativen wurden gebaut und aus
-  demselben Grund
-  verworfen - Telegramme sind unterschiedlich groß, eine statische Struktur muss also den schlimmsten
-  Fall bezahlen: feste Plätze in voller Telegrammgröße kosten je 263 Byte (13KB bei 50), und ein
-  1024-Byte-Ring fasst ~80 gewöhnliche Telegramme, aber nur *drei* maximal große, was nicht die
-  Zusage "50 Telegramme" ist, die der Aufrufer bekommt. Statischer Speicher ist deshalb nur die
-  Zeigertabelle.
-  **Allokiert und freigegeben wird ausschließlich im Hauptkontext**: `malloc()` in `sendFrame()`,
-  `free()` in `releaseSentTelegrams()` - `malloc`/`free` sind nicht interruptsicher, und `tick()`
-  läuft im Timer-Modus in einem Interrupt. Dafür gibt es den dritten Index: `_txQueueHead` (Haupt,
-  allokiert), `_txQueueTail` (Tick, hat herauskopiert), `_txQueueFree` (Haupt, gibt bis zum Ende
-  frei). Ein Platz zählt erst als wiederverwendbar, wenn er freigegeben ist, die Füllstandsprüfung
-  läuft deshalb gegen `_txQueueFree`.
-  `malloc` statt `new`: keine Ausnahmebehandlung nötig, der Fehlerfall ist ein sauberer `nullptr` und
-  wird gemeldet wie jede andere Ablehnung.
+- **Ein Telegramm senden** (`pushTransmitQueue()`, drei Überladungen): `const Frame &` ist die
+  Umsetzung, `(data, length)` wickelt ein, `Frame *` ist KOMPAT und die einzige, die den **Besitz**
+  übernimmt. Ein laufender Versand ist kein Ablehnungsgrund.
+  **Alle drei nehmen ein VOLLSTÄNDIGES Telegramm einschließlich Prüfsumme** - es gibt hier keine zwei
+  Konventionen mehr. Früher erwartete `sendFrame()` es *ohne* und die KOMPAT-Form kürzte deshalb die
+  Länge um eins; dieselben Bytes hatten zwei Bedeutungen. **Die Prüfsumme wird geprüft, nicht neu
+  gerechnet**: sie gehört zum Telegramm, und sie stillschweigend zu überschreiben verdeckte einen
+  Fehler im Aufrufer - das Telegramm ginge dann mit korrekter CRC über falschem Inhalt hinaus.
+  Geprüft wird über `Frame::isValid()`, und zwar **vor jeder Veränderung am Puffer**; ein abgelehntes
+  Telegramm hat ihn also nie angefasst, was jedes Rückabwickeln erübrigt.
+- **Die Warteschlange ist ein linearer Bytepuffer** (`TransmitQueue`, `TPUART_TX_BUFFER_SIZE`,
+  Vorgabe 2048) und **gehört dem Hauptkontext allein**. Das ist die Bedingung, unter der darin nach
+  Priorität umsortiert werden darf: der Tick fasst sie nicht an.
+  **Die Library hat damit keinen Heap mehr im Datenpfad.** Vorher lag jedes wartende Telegramm in
+  einem eigenen `malloc`-Block variabler Größe - die einzige fragmentierende Allokation, im Bustakt
+  über die Lebensdauer des Geräts.
+  **Bytes statt Telegrammzahl**, und das ist der Grund: ein gewöhnliches Gruppentelegramm ist 9-15
+  Oktetts, ein maximales 263. Feste Plätze verschenkten rund 95%; dieselben 2048 Byte fassen ~140
+  gewöhnliche Telegramme, als feste Plätze wären es 7.
+  **Wie viel man braucht, ergibt die Anwendung, nicht der Bus**: der knx-Stack sendet je `loop()`
+  genau *ein* Telegramm (`sendNextGroupTelegram()`), der Loop läuft aber um ein Vielfaches schneller,
+  als der Bus abfließt (~50 Telegramme/s). 100 gleichzeitig geänderte KOs sind nach ~200ms alle
+  eingereiht, während der Bus ~10 geschafft hat - es warten also ~90. Zusammengefasst wird bereits im
+  KO selbst (mehrfaches Schreiben vor dem Senden ergibt *ein* Telegramm mit dem letzten Wert), die
+  Obergrenze ist also die Zahl gleichzeitig sendebereiter KOs.
+  **Über uns puffert nichts**: lehnt die Queue ab, verwirft der knx-Stack das Telegramm und meldet ein
+  negatives `L_Data.con` nach oben. Jede Ablehnung ist unmittelbar ein verlorenes Telegramm.
+  **Kein Längenpräfix** - ein Telegramm beschreibt seine eigene Länge (`Frame::sizeOf()`), und hier
+  kommt nur Geprüftes hinein. **Der Empfangsring macht es anders und zu Recht**: der bewahrt auch
+  `INVALID`-Einträge auf, und bei genau denen ist die Selbstbeschreibung das, was man nicht glauben
+  darf.
+- **Prioritäten: System > Urgent > Normal > Low**, strikt, ohne Aging - genau wie der Bus selbst das
+  Medium vergibt. Innerhalb einer Klasse gilt Eingangsreihenfolge. Die Rohwerte des Steuerbytes
+  (Bits 3-2) sind dabei **nicht** sortiert: `0=System, 1=Normal, 2=Urgent, 3=Low`, Normal und Urgent
+  tauschen also die Plätze. Verifiziert gegen den Code, der die Bits schreibt (`knx_types.h`,
+  `CemiFrame::priority()` mit Maske `0x0C`) - die Datenblätter beschreiben die UART-Strecke, nicht die
+  Rahmensemantik.
+  **Die Reserve ist die tragende Hälfte, nicht die Kür.** Sortieren hilft nur Telegrammen, die es in
+  die Queue *geschafft* haben; ein Low-Ansturm füllt sie sonst, und das System-Telegramm der
+  ETS-Verbindung wird an der Tür abgewiesen. `TPUART_TX_PRIORITY_RESERVE` (= `TPUART_BUFFER_SIZE`,
+  263) ist deshalb abgeleitet, nicht geraten: ein maximales Telegramm oberhalb von Low passt immer.
+- **Der Tick bekommt eine Vorlage gereicht**, er holt sich nichts. `_stagedData`/`_stagedLength` plus
+  zwei monotone Zähler, je ein Schreiber: `_stagedSeq` (Hauptkontext), `_takenSeq` (Tick), Nutzlast
+  vor Zähler veröffentlicht. Drei Regeln tragen das: die Vorlage nur schreiben, wenn beide gleich
+  sind; den Platz erst freigeben, wenn `_takenSeq` nachgezogen hat; und der Tick kopiert in `_buffer`,
+  weshalb die Bytes danach weg dürfen - auch `restart()` nach einem Reset arbeitet aus `_buffer`.
+  **Der Sendestart hängt damit nicht am Hauptloop**: nach der Übernahme hat er die gesamte Dauer der
+  laufenden Übertragung Zeit nachzulegen (20ms und mehr), ein 53ms-Flash-Stillstand ist also gedeckt.
+  Der Preis ist eine **auf genau ein Telegramm begrenzte Inversion** - eine bereits vorgelegte
+  Sendung lässt sich nicht zurückholen. Schlimmster Fall: ein maximales in Übertragung plus ein
+  maximales vorgelegt, also ~712ms, gegen eine T_Ack-Frist von rund 3 Sekunden.
+  **Das löst zugleich zwei alte Wettläufe auf**: `abort()` verwirft nur noch die Vorlage, den Puffer
+  räumt der Hauptkontext in `stageNextTelegram()` - und weil Einstellen und Räumen nun im selben
+  Kontext liegen, schließt sich auch das Fenster, das hier als "ohne Sperre nicht zu schließen"
+  dokumentiert war.
   Jedes Oktett geht mit seinem eigenen Positionsbyte hinaus (`U_L_DataStart.req` /
   `U_L_DataCont.req`, beide `0x80 | position`, keine Fallunterscheidung nötig), das letzte - die
   Prüfsumme - mit `U_L_DataEnd.req`, was die Übertragung auf dem Bus überhaupt erst startet. Das
@@ -1510,10 +1582,14 @@ Sammlung auch unbeaufsichtigt läuft); ohne das fehlt der erste Fall regelmäßi
 Lauf hält `loop()` die Verbindung offen und nimmt zwei Tasten entgegen: `r` fährt die Sammlung erneut,
 `b` setzt den RP2040 in den Bootloader.
 
-**Beide Plattformen sind verifiziert**, nicht nur gebaut: 60 von 60 auf `pico_test` (~24s) und
-dieselben 60 auf `esp32_test` (~28s). Da die Fälle echte Fristen ausmessen, ist gerade diese
-Übereinstimmung über zwei sehr verschiedene Uhren und Treiberpuffer hinweg das Interessante am
-Ergebnis.
+**Alle drei Umgebungen sind verifiziert**, nicht nur gebaut: 83 von 83 auf `pico_test` (~24s) und
+dieselben 83 auf `esp32_test` (~34s), beide auf echter Hardware, dazu `native_test` (~1,5s). Da die
+Fälle echte Fristen ausmessen, ist gerade die Übereinstimmung über zwei sehr verschiedene Uhren und
+Treiberpuffer hinweg das Interessante am Ergebnis.
+**Der native Lauf ersetzt die beiden Hardwareläufe trotzdem nicht**, und dafür gibt es jetzt einen
+Beleg statt einer Vermutung: er war grün, als `pico_test` rot war, und konnte den Fehler prinzipiell
+nicht sehen - dort hängt die Uhr an den Schleifendurchläufen und nicht an der Wanduhr, eine teure
+Testvorrichtung kostet also nichts (siehe die Zustellkosten weiter unten).
 
 **Die Testvorrichtung muss billig zustellen, sonst verfälscht sie Zeitmessungen.** Mit
 `setTickInterval(0)` laufen Tick und Loop serialisiert: was der Telegramm-Callback kostet, liegt
@@ -1524,6 +1600,21 @@ bemerkt und `_emptySince` setzt - die Zustellkosten verschieben also die Pausene
 Hälfte der Läufe durch - die Pause wurde erst erkannt, nachdem das `L_Data.con` bereits eingetroffen
 und im `Resync` verworfen war. Behoben mit `reserve()` und `push_back(std::move(...))`; auf dem ESP32
 war die Reserve zufällig groß genug, dort fiel es nie auf.
+
+**Derselbe Fehler ein zweites Mal, an anderer Stelle: `Dummy::available()` war quadratisch.** Es lief
+bei jedem Aufruf von `_pos` bis zum Ende der Warteschlange, und `read()` ruft es gleich noch einmal -
+bei einem ohne Pause eingespeisten Block sind damit alle Bytes sofort verfügbar und jeder Aufruf zählt
+den ganzen Rest erneut ab. `test_rx_queue_overflow_is_counted` speist 900 Bytes ein, das sind rund
+810.000 Schleifendurchläufe je Richtung: auf dem PC unsichtbar, auf dem RP2040 über 70ms gegen ein
+80ms-Budget. Der Fall verlor seine Ticks also an die Vorrichtung und meldete 0 Ringüberläufe - **nativ
+grün, auf Hardware rot**. Behoben, indem der Fahrplan fortgeschrieben statt neu durchgerechnet wird
+(`_availableCount`/`_scanArrivesAt`); tragend ist dabei, dass `read()` `_nextAvailableAt` um genau die
+Pause weiterschiebt, um die `_pos` vorrückt - die absoluten Ankunftszeiten der verbliebenen Bytes
+ändern sich dadurch nicht, ein einmal verfügbares Byte bleibt also verfügbar.
+Die Lehre ist dieselbe wie beim `_frames`-Fall und inzwischen zweimal belegt: **Kosten in der
+Vorrichtung sind nicht neutral, sie gehen dem Prüfling vom Zeitbudget ab** - und der native Lauf kann
+das nicht zeigen, weil dort die Uhr an den Schleifendurchläufen hängt und nicht an der Wanduhr. Genau
+deshalb zählen vor einer Freigabe die Hardwareläufe.
 
 **Die neun Busmonitor-Fälle sind gegen Mutation geprüft**, und das war nötig: `abort()`
 auszukommentieren ließ zunächst nur *einen* der beiden dafür gedachten Fälle scheitern.
@@ -1593,13 +1684,13 @@ Oberfläche fest. Drei Gruppen, und nur die erste ist schuldenfrei:
    `tick()` + `loop()`, `end()`, `pushTransmitQueue(Frame*)`, das bei Erfolg den Besitz übernimmt und
    die Länge um eins kürzt, weil die Library die Prüfsumme selbst rechnet) und `Frame(const char*,
    size_t)`.
-3. **Platzhalter aus der Zeit des SearchBuffers**, den es hier nicht mehr gibt. `OGM-Common`s
-   `bcu`-Befehl druckt sie trotzdem, sie müssen also aufrufbar bleiben - liefern aber nicht mehr
-   konstant 0, sondern die nächstliegende Aussage über den heutigen Empfangspfad:
-   `Receiver::getSearchBufferPosition()` den Füllstand des Empfangspuffers und
+3. **Platzhalter aus der Zeit des SearchBuffers**, den es hier nicht mehr gibt.
+   `Receiver::getSearchBufferPosition()` liefert den Füllstand des Empfangspuffers und
    `Receiver::getAwaitBytes()` die noch ausstehenden Bytes des laufenden Telegramms (0, solange die
-   Größe noch nicht feststeht). Zwei tote Spalten sagen nichts; diese beiden zusammen zeigen, wo im
-   Telegramm die Verarbeitung gerade steht.
+   Größe noch nicht feststeht) - beide statt der früheren konstanten 0.
+   **`OGM-Common`s `bcu`-Befehl druckt sie inzwischen nicht mehr**; sie stehen damit ohne Aufrufer da
+   und bleiben nur auf ausdrückliche Entscheidung des Anwenders erhalten, nicht mehr aus einem
+   Kompatibilitätszwang. Wer hier aufräumt, kann sie streichen, sobald das bestätigt ist.
    Bei **0** bleibt allein `Statistics::getRxSearchBufferOverflow()` - dafür gibt es in dieser
    Library nichts Vergleichbares, jeder Ersatzwert wäre eine Falschaussage. Die Parameter `irq`/`dma`
    des `RP2040`-Konstruktors werden aus demselben Grund ignoriert wie früher: es gibt nur den
