@@ -172,41 +172,37 @@ class Statistics
     // Last, und zweitens lief die Zwischengröße (Bytes mal 1000) in 32 Bit über. Mit dem festen Fenster
     // sind beide Probleme weg.
     //
-    // Es ist ein GLEITENDER MITTELWERT über BUS_LOAD_WINDOW Sekunden: im Takt von BUS_LOAD_SLICE_MS
-    // wandert der Zählerstand mit seinem Zeitstempel in den Ring. Der Ring liefert damit den ANFANGSPUNKT
-    // der Messung; das ENDE ist der Zählerstand im Moment der Abfrage. Die Last ist die Differenz der
-    // beiden, geteilt durch die Zeit dazwischen.
+    // GEMESSEN WIRD JE SEKUNDE, und was dabei herauskommt, steht bis zur nächsten Messung fest. Es gibt
+    // hier bewusst KEINEN gleitenden Mittelwert mehr (Entscheidung des Anwenders): der Wert soll die
+    // letzte Sekunde beschreiben und nicht ein Mittel über mehrere.
     //
-    // Deshalb hat der Ring genau BUS_LOAD_WINDOW Plätze und nicht einen mehr: der jüngste Messpunkt muss
-    // nicht gespeichert werden, er entsteht beim Lesen. Das hält den Wert zugleich aktuell - er hinkt nicht
-    // bis zu einer Sekunde hinterher, wie es ein gespeicherter Endpunkt täte.
+    // Der Preis ist bekannt und hingenommen: ein einzelnes maximales Telegramm belegt den Bus 356ms, drei
+    // davon füllen eine Sekunde fast allein - die Anzeige springt dadurch stärker, als es die Änderung am
+    // Bus rechtfertigt. Wer das wieder glätten will, mittelt über mehrere dieser fertigen Werte, statt das
+    // Fenster erneut zu verbreitern.
     //
-    // Die Spanne ist damit nicht fix, sondern liegt zwischen BUS_LOAD_WINDOW - 1 und BUS_LOAD_WINDOW
-    // Sekunden - je nachdem, wie lange die letzte Momentaufnahme her ist. Das macht nichts: geteilt wird
-    // durch die GEMESSENE Zeit zwischen den beiden Punkten, nicht durch eine angenommene. Exakt 3000ms
-    // träfe man ohnehin nie.
+    // WICHTIG dabei: gerechnet wird beim MESSEN, nicht beim Ablesen, und der Bezugspunkt wandert nur im
+    // Sekundentakt. Ein Bezugspunkt, der bei jedem Lesen mitzöge, ergäbe Spannen von wenigen Millisekunden
+    // - ein einzelnes Telegramm darin sähe wie ein völlig überlasteter Bus aus.
     //
-    // Beide Zahlen sind fest und nicht überschreibbar - sie beschreiben eine Anzeige, keine Betriebsart.
-    // Der Takt bestimmt, wie fein das Fenster nachrückt; die Breite, wie ruhig der Wert ist. Eine
-    // einzelne Sekunde ist als Auskunft zu unruhig: ein maximales Telegramm belegt den Bus 356ms, drei
-    // davon füllen eine Sekunde fast allein aus - der Wert spränge zwischen Spitze und Leerlauf, ohne
-    // dass sich am Bus etwas geändert hätte.
-    static constexpr uint32_t BUS_LOAD_SLICE_MS = 1000;
-    static constexpr uint8_t BUS_LOAD_WINDOW = 3;
+    // Fest und nicht überschreibbar: das beschreibt eine Anzeige, keine Betriebsart.
+    static constexpr uint32_t BUS_LOAD_INTERVAL_MS = 1000;
 
-    // Eine Momentaufnahme des Telegramm-Byte-Zählers. Gespeichert wird der ZÄHLERSTAND, nicht die Differenz
-    // - damit ist die Last zwischen zwei beliebigen Punkten ausrechenbar, ohne dass beim Messen schon
-    // feststehen müsste, welche das sind. Und der Zeitstempel gehört zum Eintrag, nicht zum Takt: kommt der
-    // Hauptloop einmal später dran, steht darin die echte Zeit und die Rechnung stimmt trotzdem.
-    struct BusLoadSample
-    {
-        uint32_t _bytes;
-        uint32_t _at;
-    };
+    // Der Bezugspunkt der laufenden Messung: Zählerstände plus Zeitstempel. Gespeichert werden die
+    // ZÄHLERSTÄNDE, nicht Differenzen - die Differenz entsteht erst beim Abschluss der Sekunde.
+    // Die TELEGRAMMZAHL steht mit drin, weil die Belegung des Busses nicht allein an den Oktetts hängt:
+    // vor jedem Telegramm müssen 50 Bitzeiten frei sein (~5,2ms), und diese Pause gehört der Übertragung,
+    // nicht der Ruhe. Aus Bytes allein ist sie nicht ableitbar - 90 Oktetts sind ein maximales Telegramm
+    // oder zehn kleine, und das ist ein Unterschied von 79ms.
+    uint32_t _busLoadRefBytes = 0;
+    uint32_t _busLoadRefFrames = 0;
+    uint32_t _busLoadRefAt = 0;
+    bool _busLoadRefValid = false;
 
-    BusLoadSample _busLoadSamples[BUS_LOAD_WINDOW] = {};
-    uint8_t _busLoadIndex = 0; // nächster Schreibplatz - und zugleich der älteste Eintrag
-    uint8_t _busLoadCount = 0; // wie viele Plätze belegt sind, bis der Ring einmal voll gelaufen ist
+    // Das Ergebnis der zuletzt abgeschlossenen Sekunde. Bis die erste vorbei ist, bleibt beides 0 - das
+    // ist ehrlicher als ein aus einer Bruchteilsekunde hochgerechneter Wert.
+    uint32_t _busLoadBytesPerSecond = 0;
+    uint16_t _busLoadPercent = 0;
 
   public:
     void reset();
@@ -381,11 +377,66 @@ class Statistics
     void sampleBusLoad();
 
     // Bytes pro Sekunde über die letzten BUS_LOAD_WINDOW Sekunden, sekündlich nachgeführt.
-    // Das Ablesen verändert nichts - beliebig oft abrufbar, ohne das Ergebnis des nächsten Aufrufs zu
-    // verändern. Gelesen wird aus demselben Kontext, der auch misst (Hauptloop): ein Eintrag sind zwei
-    // Felder, und die werden nicht zusammen geschrieben. Solange der Ring erst einen Eintrag hat, gibt es
-    // noch keine Spanne - dann 0.
+    // Das Ablesen verändert nichts und rechnet auch nichts - es liefert das Ergebnis der zuletzt
+    // abgeschlossenen Sekunde, beliebig oft. Solange die erste noch läuft: 0.
     uint32_t getBusLoad() const;
+
+    // DIE PHYSIK DES BUSSES als Bezugsgröße der Prozentanzeige: KNX TP1 läuft immer mit 9600 Baud, und
+    // ein Zeichen belegt 13 Bitzeiten (Start, 8 Daten, Parität, Stop, dazu 2 Bit Abstand) - 1354µs je
+    // Oktett, also 738 Oktetts je Sekunde.
+    //
+    // Sie steht HIER und nicht in Types.h, weil sie eine Anzeige beschreibt und nicht das Protokoll -
+    // dieselbe Trennung, aus der schon die Zuordnung "Fehlerbit -> Zähler" im DataLinkLayer liegt und
+    // nicht in dieser Klasse: die Zählerklasse kennt keine Protokollkonstanten.
+    //
+    // TPUART_TICK_DEFERRED_US in TickDriver.h trägt dieselbe Zahl aus demselben Grund, bleibt aber ein
+    // eigenes, überschreibbares Makro: das ist eine Schwelle, die jemand verstellen können soll, und ein
+    // -D darauf darf nicht stillschweigend den Nenner dieser Anzeige mitverschieben.
+    static constexpr uint32_t BUS_OCTET_TIME_US = 1354;
+    static constexpr uint32_t BUS_MAX_BYTES_PER_SECOND = 1000000UL / BUS_OCTET_TIME_US;
+
+    // Die Pause VOR jedem Telegramm: 50 Bitzeiten bei 9600 Baud. Sie ist keine Ruhe, sondern Teil der
+    // Übertragung - in dieser Zeit kann niemand senden.
+    static constexpr uint32_t BUS_FRAME_GAP_US = 5208;
+
+    // DER QUITTUNGS-SLOT, und er zählt UNBEDINGT mit - das ist der Kern: er ist fest reserviert, nicht
+    // bedingt. Ob in dieser Zeit jemand quittiert oder nicht, ändert nichts daran, dass sie vergeht und
+    // niemand sonst senden kann. Deshalb braucht es hier auch keine Kenntnis darüber, welche Telegramme
+    // quittiert wurden - eine Kenntnis, die der Host außerhalb des Busmonitors gar nicht hat.
+    //
+    // 15 Bitzeiten Abstand plus das Quittungsoktett (11 Bit) = 26 Bitzeiten bei 9600 Baud. Bleibt die
+    // Quittung aus, wartet der Sender stattdessen die dokumentierten 30 Bitzeiten ab (NCN5130 S. 38) -
+    // 417µs mehr, was keine Fallunterscheidung wert ist.
+    static constexpr uint32_t BUS_ACK_SLOT_US = 2708;
+
+    // WIE VOLL DER BUS IST, als Anteil der Zeit, in der er belegt war. Anders als getBusLoad() ist das
+    // keine Bytezahl in anderer Einheit, sondern eine Zeitrechnung aus Oktetts UND Telegrammzahl:
+    //
+    //     belegt = Oktetts * BUS_OCTET_TIME_US
+    //            + Telegramme * (BUS_FRAME_GAP_US + BUS_ACK_SLOT_US)
+    //
+    // Erst dadurch heißt 100% wirklich "hier passt kein Telegramm mehr hinein" und ist auch erreichbar.
+    // Über die Oktetts allein ginge das nicht: 90 Oktetts sind ein maximales Telegramm oder zehn kleine,
+    // und die zehn belegen den Bus 79ms länger.
+    //
+    // BEIDE ZUSCHLÄGE SIND FESTE SLOTS, keine Schätzung - das ist der Grund, warum diese Rechnung ohne
+    // Kenntnis des Verkehrs auskommt. Weder muss bekannt sein, wer quittiert hat, noch ob überhaupt
+    // jemand quittiert hat: die Zeit ist so oder so reserviert.
+    //
+    // ÜBER 100 WIRD BEWUSST NICHT GEDECKELT (Entscheidung des Anwenders), und deshalb ist der Rückgabetyp
+    // 16 Bit: ein uint8_t liefe bei 256% still über und meldete 0. Physikalisch kann der Bus nicht voller
+    // als voll sein, ein Wert über 100 ist also ein BEFUND und soll sichtbar sein.
+    //
+    // Damit das trägt, werden die Bytes JE BYTE gezählt (siehe Receiver::processFrameByte()) und nicht am
+    // Sequenzende in einem Rutsch. Sonst trüge ein laufendes Telegramm 0 bei und brächte beim Abschluss
+    // seine ganze Busbelegung mit - bei einem maximalen Telegramm 356ms, die im falschen Fenster landen,
+    // also bis zu 12% bei 3s Fensterbreite. Genau dieser Fehler hätte ein "über 100" erzeugt, das nichts
+    // bedeutet, und damit die Aussage der Zahl zerstört.
+    //
+    // Was als Rest bleibt, ist der Zuschlag JE TELEGRAMM: der wird weiterhin erst beim Abschluss fällig,
+    // weil vorher nicht feststeht, ob das Telegramm heil ist. Das sind 7916µs für ein Telegramm an der
+    // Fenstergrenze, bei 3s also 0,26% - vernachlässigbar.
+    uint16_t getBusLoadPercent() const;
 
     // --- KOMPAT: Namen der alten Library ----------------------------------------------------------------
     //

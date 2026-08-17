@@ -162,6 +162,7 @@ void Receiver::processByte(uint8_t value)
         case RxState::Control:
             _buffer[1] = value;
             _bufferPos = 2;
+            _dll._statistics.incrementRxControlBytes(); // das zweite Byte eines U_SystemStat.ind
             completeSequence(0, RxState::Idle);
             return;
 
@@ -265,6 +266,12 @@ void Receiver::processFrameByte(uint8_t value)
     if (_bufferPos < TPUART_BUFFER_SIZE) _buffer[_bufferPos] = value;
     _bufferPos++;
 
+    // JE BYTE GEZÄHLT, nicht am Sequenzende in einem Rutsch - siehe Statistics::getBusLoadPercent().
+    // Sprunghaft zu zählen hieße, dass ein laufendes Telegramm 0 beiträgt und beim Abschluss auf einen
+    // Schlag seine ganze Busbelegung mitbringt, auch den Teil, der vor dem Messfenster lag. Bei einem
+    // maximalen Telegramm sind das 356ms, die im falschen Fenster landen.
+    _dll._statistics.incrementRxFrameBytes();
+
     if (!isChecksumByte) _crc ^= value;
 
     if (_frameSize == 0)
@@ -345,6 +352,9 @@ void Receiver::processPollByte(uint8_t value)
     // Wie im Frame-Pfad reine Absicherung: die Sequenz ist auf 7 + 15 Byte begrenzt, ein Poll passt immer.
     if (_bufferPos < TPUART_BUFFER_SIZE) _buffer[_bufferPos] = value;
     _bufferPos++;
+
+    // Poll zählt zu den Telegrammbytes, siehe processFrameByte() zur Begründung des Zählens je Byte.
+    _dll._statistics.incrementRxFrameBytes();
 
     if (!isChecksumByte) _crc ^= value;
 
@@ -489,6 +499,9 @@ void Receiver::processControlByte(uint8_t value)
         return;
     }
 
+    // ERST HIER, nach dem Poll-Zweig: der zählt sein Byte selbst, und zwar als Telegrammbyte.
+    _dll._statistics.incrementRxControlBytes();
+
     // Nur die NCN512x-Reihe kennt diesen Dienst, und sie schickt ihn ausschließlich als Antwort auf ein
     // U_SystemState.req - also nur auf requestState() hin. Beim TPUART2 wäre 0x4B etwas anderes -
     // ohne diese Abfrage würde dort das Folgebyte mitverschluckt. Die alte Library hat genauso geprüft.
@@ -581,14 +594,10 @@ void Receiver::completeSequence(uint8_t flags, RxState nextState)
                 _dll._statistics.incrementRxFrames();
         }
 
-        // POLL ZÄHLT ZU DEN FRAME-BYTES, bekommt aber keine eigene Kategorie: es sind Bytes vom Bus wie
-        // die eines Telegramms, und ein Zähler, den in der Praxis nie jemand ungleich null sieht, wäre nur
-        // eine Zeile mehr in jeder Statistikausgabe. Bei den Telegramm-ZÄHLERN steht es bewusst nicht
-        // dabei - ein Poll ist kein Telegramm, es geht auch nicht über deliverFrame() nach oben.
-        if (isFrame || _buffer[0] == L_POLL_DATA_IND)
-            _dll._statistics.incrementRxFrameBytes((uint32_t)length);
-        else
-            _dll._statistics.incrementRxControlBytes((uint32_t)length);
+        // DIE BYTES SIND HIER SCHON GEZÄHLT - je Byte beim Eintreffen, nicht hier am Stück (siehe
+        // processFrameByte()). Poll läuft dabei in die Telegrammbytes, weil es Bytes vom Bus sind wie die
+        // eines Telegramms; bei den Telegramm-ZÄHLERN steht es bewusst nicht dabei - ein Poll ist kein
+        // Telegramm und geht auch nicht über deliverFrame() nach oben.
 
         // Passt der Eintrag nicht mehr in den Ring, ist er weg - und diese Bytes hat dann WIRKLICH niemand
         // gesehen, genau wie die im Resync verworfenen. Sie gehören deshalb in denselben Zähler.

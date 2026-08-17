@@ -1798,6 +1798,76 @@ static void test_bus_load_counts_only_frame_bytes()
     TEST_ASSERT_EQUAL(before + 9, fx->_dll.getStatistics().getRxFrameBytes());
 }
 
+// DIE BUSLAST IN PROZENT IST EINE ZEITRECHNUNG, keine umgerechnete Bytezahl - und genau das nagelt dieser
+// Fall fest. Die Telegrammzahl geht mit ein, weil vor jedem Telegramm 50 Bitzeiten frei sein müssen; aus
+// den Oktetts allein wäre das nicht ableitbar, denn 270 Oktetts sind ein großes Telegramm oder dreißig
+// kleine, und dreißig belegen den Bus 156ms länger.
+//
+// Die Schranken sind so gelegt, dass JEDER weggelassene Anteil darunter fällt. 270 Oktetts über die
+// Messspanne von 1000ms (sie ist reproduzierbar, weil loop() im Test dicht läuft und die Sekunde damit auf
+// ein, zwei Millisekunden genau abgeschlossen wird):
+//
+//     nur Oktetts                   366ms -> 36%
+//     + Pause (30 x 5208µs)         522ms -> 52%
+//     + Quittungsslot (30 x 2708µs) 603ms -> 60%   <- das Sollverhalten
+//
+// Mit 56..65 fällt also sowohl der fehlende Pausen- als auch der fehlende Quittungsanteil durch. Wer hier
+// eine Konstante ändert, muss die Tabelle mitrechnen - sie ist der eigentliche Inhalt des Falls.
+static void test_bus_load_percent_counts_frame_gaps()
+{
+    fx->connect();
+
+    const Statistics &st = fx->_dll.getStatistics();
+
+    // Ohne Verkehr 0 - und das darf nicht mit "noch keine Messung" verwechselt werden.
+    TEST_ASSERT_EQUAL(0, st.getBusLoadPercent());
+
+    std::vector<uint8_t> frame = standardFrame();
+    std::vector<uint8_t> stream;
+    for (int i = 0; i < 30; i++)
+        stream.insert(stream.end(), frame.begin(), frame.end());
+
+    fx->feed(stream, 0);
+
+    // Die Momentaufnahme läuft aus loop(), es muss also über eine Fensterbreite hinweg gepumpt werden -
+    // vorher gibt es keine Spanne und der Wert ist 0.
+    fx->pump(1100);
+
+    TEST_ASSERT_EQUAL(30, st.getRxFrames());
+    TEST_ASSERT_EQUAL(270, st.getRxFrameBytes());
+
+    // Die Spanne ist die GEMESSENE Zeit, deshalb Schranken statt eines festen Werts - aber eng genug, dass
+    // die Tabelle oben sie trennt.
+    uint16_t percent = st.getBusLoadPercent();
+    TEST_ASSERT_GREATER_THAN(55, percent);
+    TEST_ASSERT_LESS_THAN(66, percent);
+}
+
+// ÜBER 100 WIRD BEWUSST NICHT GEDECKELT, und dieser Fall hält das fest - sonst "repariert" es später
+// jemand als offensichtlichen Fehler. Physikalisch kann der Bus nicht voller als voll sein, ein Wert über
+// 100 ist also ein Befund, und solange niemand die Last im Betrieb angesehen hat, soll er sichtbar sein.
+//
+// 100 Telegramme à 9 Oktetts belegen rechnerisch 900 × 1354µs + 100 × 7916µs = 2,01s; über die Messspanne
+// von 1000ms sind das rund 201%. Die Schranken lassen Luft, prüfen aber beides: dass gar nicht gedeckelt
+// wird (sonst käme 100) und dass der Wert nicht in einem 8-Bit-Typ überläuft (dann käme 201-256, also ein
+// kleiner Wert statt eines großen).
+static void test_bus_load_percent_is_not_capped()
+{
+    fx->connect();
+
+    std::vector<uint8_t> frame = standardFrame();
+    std::vector<uint8_t> stream;
+    for (int i = 0; i < 100; i++)
+        stream.insert(stream.end(), frame.begin(), frame.end());
+
+    fx->feed(stream, 0);
+    fx->pump(1100);
+
+    uint16_t percent = fx->_dll.getStatistics().getBusLoadPercent();
+    TEST_ASSERT_GREATER_THAN(150, percent);
+    TEST_ASSERT_LESS_THAN(220, percent);
+}
+
 // ---------------------------------------------------------------------------------------------------
 
 // DIE LISTE DER FÄLLE, für beide Einstiegspunkte dieselbe - auf der Hardware ruft setup() sie, nativ
@@ -1892,6 +1962,8 @@ static int runAllTests()
     RUN_TEST(test_control_queue_overflow_is_counted);
     RUN_TEST(test_control_sequence_is_never_split);
     RUN_TEST(test_bus_load_counts_only_frame_bytes);
+    RUN_TEST(test_bus_load_percent_counts_frame_gaps);
+    RUN_TEST(test_bus_load_percent_is_not_capped);
 
     return UNITY_END();
 }

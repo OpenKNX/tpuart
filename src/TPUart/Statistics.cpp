@@ -45,11 +45,14 @@ void Statistics::reset()
     _txControlQueuePeakBytes = 0;
     _txQueuePeakBytes = 0;
 
-    for (uint8_t i = 0; i < BUS_LOAD_WINDOW; i++)
-        _busLoadSamples[i] = {};
-
-    _busLoadIndex = 0;
-    _busLoadCount = 0;
+    // Der Bezugspunkt muss mit zurück: er hält Zählerstände, und die sind gerade auf 0 gegangen. Bliebe er
+    // stehen, ergäbe die nächste Differenz einen riesigen negativen Sprung als vorzeichenlosen Wert.
+    _busLoadRefBytes = 0;
+    _busLoadRefFrames = 0;
+    _busLoadRefAt = 0;
+    _busLoadRefValid = false;
+    _busLoadBytesPerSecond = 0;
+    _busLoadPercent = 0;
 }
 
 // --- Empfang -------------------------------------------------------------------------------------------
@@ -394,40 +397,53 @@ void Statistics::sampleBusLoad()
 {
     uint32_t now = millis();
 
-    // Der zuletzt abgelegte Eintrag gibt den Takt vor. Ist der Ring noch leer, wird sofort einer angelegt -
-    // er ist der Startpunkt, aus dem sich die erste Spanne ergibt.
-    if (_busLoadCount > 0)
+    // Kaputte Telegramme zählen mit: sie haben den Bus genauso belegt wie heile.
+    uint32_t bytes = getRxFrameBytes();
+    uint32_t frames = getRxFrames() + getRxInvalidFrames();
+
+    // Der allererste Aufruf legt nur den Bezugspunkt an - ohne Spanne gibt es nichts zu rechnen.
+    if (!_busLoadRefValid)
     {
-        uint8_t last = (uint8_t)((_busLoadIndex + BUS_LOAD_WINDOW - 1) % BUS_LOAD_WINDOW);
-        if ((uint32_t)(now - _busLoadSamples[last]._at) < BUS_LOAD_SLICE_MS) return;
+        _busLoadRefBytes = bytes;
+        _busLoadRefFrames = frames;
+        _busLoadRefAt = now;
+        _busLoadRefValid = true;
+        return;
     }
 
-    // Der älteste Eintrag fällt hier heraus - das Fenster wandert um eine Scheibe weiter.
-    _busLoadSamples[_busLoadIndex] = {getRxFrameBytes(), now};
+    uint32_t elapsed = now - _busLoadRefAt;
+    if (elapsed < BUS_LOAD_INTERVAL_MS) return;
 
-    _busLoadIndex = (uint8_t)((_busLoadIndex + 1) % BUS_LOAD_WINDOW);
-    if (_busLoadCount < BUS_LOAD_WINDOW) _busLoadCount++;
+    uint32_t octets = bytes - _busLoadRefBytes;
+    uint32_t frameCount = frames - _busLoadRefFrames;
+
+    // Geteilt wird durch die GEMESSENE Spanne, nicht durch die angenommenen 1000ms: kommt der Hauptloop
+    // einmal später dran, ist die Sekunde eben 1040ms lang, und die Rechnung stimmt trotzdem.
+    _busLoadBytesPerSecond = (octets * 1000 + elapsed / 2) / elapsed;
+
+    // Die belegte ZEIT, nicht die Byteanzahl - siehe die Herleitung im Header. Der Zwischenwert bleibt in
+    // 32 Bit: bei voller Buslast sind das über eine Sekunde rund 1 Mio µs.
+    uint32_t busyUs = octets * BUS_OCTET_TIME_US + frameCount * (BUS_FRAME_GAP_US + BUS_ACK_SLOT_US);
+
+    // Geteilt wird durch ein HUNDERTSTEL der Spanne, das spart die Multiplikation mit 100 und damit den
+    // einzigen Schritt, an dem hier etwas überlaufen könnte. NICHT bei 100 gedeckelt (siehe Header);
+    // begrenzt wird nur gegen den Typ, damit aus einem absurden Wert kein stiller Überlauf wird.
+    uint32_t percent = busyUs / (elapsed * 10);
+    _busLoadPercent = percent > UINT16_MAX ? UINT16_MAX : (uint16_t)percent;
+
+    _busLoadRefBytes = bytes;
+    _busLoadRefFrames = frames;
+    _busLoadRefAt = now;
 }
 
 uint32_t Statistics::getBusLoad() const
 {
-    // Noch keine Momentaufnahme, also auch kein Anfangspunkt.
-    if (_busLoadCount == 0) return 0;
+    return _busLoadBytesPerSecond;
+}
 
-    // Der ÄLTESTE Eintrag: bei vollem Ring der Platz, der als Nächstes überschrieben wird; solange er
-    // erst anläuft, der Platz 0. Das Ende der Messung ist kein Eintrag, sondern das JETZT.
-    uint8_t oldest = _busLoadCount == BUS_LOAD_WINDOW ? _busLoadIndex : 0;
-
-    uint32_t elapsed = millis() - _busLoadSamples[oldest]._at;
-    if (elapsed == 0) return 0;
-
-    // Eine Division über die volle Fensterbreite - derselbe gleitende Mittelwert, den die einzeln
-    // gemittelten Teilraten ergäben, nur ohne die Zwischenwerte und mit einer Rundung statt dreien.
-    // Geteilt wird durch die GEMESSENE Spanne, die Breite muss also nicht exakt stimmen. Der
-    // Zwischenwert bleibt in 32 Bit, solange die Differenz unter 4,29 Mio Bytes liegt - bei 738 Byte/s
-    // Buslast wären das über anderthalb Stunden innerhalb EINES Fensters von drei Sekunden.
-    uint32_t delta = getRxFrameBytes() - _busLoadSamples[oldest]._bytes;
-    return (delta * 1000 + elapsed / 2) / elapsed;
+uint16_t Statistics::getBusLoadPercent() const
+{
+    return _busLoadPercent;
 }
 
 // --- KOMPAT, siehe Header --------------------------------------------------------------------------------

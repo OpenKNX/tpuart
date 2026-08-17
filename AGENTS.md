@@ -1177,6 +1177,61 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   Was hineinfließt, ist bewusst eng gefasst: **nur Telegrammbytes, Polls eingeschlossen**. Steuerbytes
   kommen von der BCU, nicht vom Bus, und gehören zur Auslastung der Host-Leitung; im Resync verworfene
   Bytes lassen sich nichts zuordnen.
+  **`getBusLoadPercent()` ist NICHT dieselbe Zahl in anderer Einheit**, und der Unterschied ist der
+  eigentliche Punkt: es ist eine **Zeitrechnung**, nicht ein Verhältnis zur Bytekapazität.
+  ```
+  belegt = Oktetts × BUS_OCTET_TIME_US (1354)
+         + Telegramme × (BUS_FRAME_GAP_US (5208) + BUS_ACK_SLOT_US (2708))
+  ```
+  **Beide Zuschläge sind FESTE SLOTS**, und daran hängt, dass die Rechnung ohne Kenntnis des Verkehrs
+  auskommt. Beim Quittungsslot ist das der entscheidende Punkt: er ist reserviert, nicht bedingt - ob
+  jemand quittiert oder nicht, die Zeit vergeht und niemand sonst kann senden. Es muss deshalb *nicht*
+  bekannt sein, welche Telegramme quittiert wurden, was der Host außerhalb des Busmonitors auch gar
+  nicht wissen kann. 15 Bitzeiten Abstand plus das Quittungsoktett (11 Bit) sind 26 Bitzeiten = 2708µs;
+  bleibt die Quittung aus, wartet der Sender die dokumentierten 30 Bitzeiten ab (S. 38) - 417µs mehr,
+  was keine Fallunterscheidung wert ist.
+  Hier stand zwischenzeitlich, die Quittung sei "nicht zählbar" und der Wert unterschätze die Belegung
+  deshalb um rund 13%. Das war falsch, und der Fehler war die Frage: gefragt war nicht, *ob* quittiert
+  wurde, sondern nur, *wie lang der Slot ist*.
+  Deshalb steht in der Messprobe neben dem Byte- auch der **Telegrammzähler** (heile plus kaputte - der
+  Bus war in beiden Fällen belegt). Aus den Oktetts allein ginge es nicht: 270 Oktetts sind ein großes
+  Telegramm oder dreißig kleine, und die dreißig belegen den Bus 156ms länger, weil vor jedem Telegramm
+  50 Bitzeiten frei sein müssen.
+  Das ist auch der Grund, warum der Nenner **nicht** die rohe Kanalkapazität ist (738 Oktetts/s). Gegen
+  die gerechnet wäre 100% unerreichbar, und zwar unterschiedlich weit: ~61% bei 9-Oktett-Telegrammen,
+  ~98% bei maximalen - eine Zahl, deren Obergrenze vom Verkehr abhängt, taugt nicht als Füllstand. Über
+  die Zeit gerechnet heißt 100% dagegen wirklich "hier passt kein Telegramm mehr hinein".
+  **Abgeschnittene Telegramme gehen vollwertig ein**, und das ist kein Zufall: gezählt werden die Bytes,
+  die tatsächlich ankamen (`length` am Sequenzende, nicht die Sollgröße), und da ein Fragment als
+  `INVALID` gemeldet wird, zählt es auch bei den Telegrammen mit. Ein nach drei Oktetts abgebrochenes
+  Telegramm bekommt also 3 × 1354µs plus einmal die Pause - der Bus war für beides belegt.
+  **Bytes aus einem Resync fehlen dagegen**, sie laufen nach `incrementRxDroppedBytes()` und tauchen in
+  `getRxFrameBytes()` nie auf. Bewusst nicht nachgerüstet (Entscheidung des Anwenders): ein Resync ist so
+  selten, dass es die Zahl nicht bewegt, und wenn er häufig wird, zeigt `getRxResyncs()` das deutlicher
+  an. **Den Dropped-Zähler dafür einfach zu addieren wäre falsch** - er fasst drei Quellen zusammen, und
+  eine davon ist bereits gezählt: ein fertiges Telegramm ohne Platz im RX-Ring erhöht *beide* Zähler.
+  Wer den Resync-Anteil doch will, braucht dafür einen eigenen Zähler.
+  **Über 100 wird bewusst NICHT gedeckelt** (Entscheidung des Anwenders), und der Rückgabetyp ist deshalb
+  16 Bit - ein `uint8_t` liefe bei 256% still über und meldete 0. Der Bus kann nicht voller als voll sein,
+  ein Wert über 100 ist also ein Befund und soll sichtbar sein statt weggerundet.
+  `test_bus_load_percent_is_not_capped` hält das fest, damit es niemand als offensichtlichen Fehler
+  "repariert".
+  **Damit das trägt, werden die Telegrammbytes JE BYTE gezählt** (`processFrameByte()` /
+  `processPollByte()` / `processControlByte()`), nicht mehr am Sequenzende in einem Rutsch. Der alte Weg
+  hatte einen echten Zuordnungsfehler: ein laufendes Telegramm trug 0 bei und brachte beim Abschluss seine
+  gesamte Busbelegung mit, auch den Teil, der vor dem Fenster lag - bei einem maximalen Telegramm 356ms,
+  bei 3s Fensterbreite also bis zu 12%. Das hätte ein "über 100" erzeugt, das nichts bedeutet, und damit
+  genau die Aussage zerstört, für die der Deckel weggelassen wurde. Die Kategorie steht dabei in jedem Pfad
+  schon mit Byte 0 fest, und der Zähler hat weiterhin genau einen Schreiber (den Tick) - es braucht also
+  weder Klassifikation im Nachhinein noch Atomarität. Achte auf die Reihenfolge in
+  `processControlByte()`: der Zähler steht **hinter** dem Poll-Zweig, weil der sein Byte selbst als
+  Telegrammbyte zählt.
+  Als Rest bleibt der Zuschlag **je Telegramm**, der weiterhin erst beim Abschluss fällig wird - vorher
+  steht nicht fest, ob das Telegramm heil ist. Für ein Telegramm an der Fenstergrenze sind das 7916µs,
+  bei 3s also 0,26%.
+  Die Ringarithmetik ("ältester Eintrag plus Spanne bis jetzt") liegt für beide Auskünfte in
+  `oldestBusLoadSample()` - zwei Kopien davon liefen früher oder später auseinander, besonders die
+  Fallunterscheidung "Ring schon voll oder erst anlaufend".
   Früher legte der Leser selbst das Fenster fest: das Intervall war "Zeit seit dem letzten Aufruf", was
   von der Konsole kommt und damit unbegrenzt ist - die erste Anzeige nach Stunden Laufzeit mittelte
   über die gesamte Laufzeit, und der Zwischenwert (Bytes × 1000) lief über 32 Bit über. Eine Messung
