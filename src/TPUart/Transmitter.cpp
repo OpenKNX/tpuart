@@ -328,6 +328,25 @@ bool Transmitter::isEcho(const uint8_t *data, size_t length) const
     return memcmp(data + 1, _buffer + 1, length - 2) == 0;
 }
 
+// DASSELBE FÜR EIN NOCH LAUFENDES TELEGRAMM, gebraucht bei Byte 6 für die Quittungsentscheidung: dort ist
+// das Echo erst zur Hälfte da, isEcho() kann also nicht greifen (es verlangt die vollständige Länge und
+// vergleicht die Prüfsumme mit).
+//
+// Verglichen wird der ANFANG, und das genügt zur Unterscheidung: die ersten Oktetts tragen die Quelladresse,
+// und ein fremdes Telegramm mit UNSERER Quelladresse wäre eine doppelt vergebene physikalische Adresse -
+// ein Anlagenfehler, nicht ein Fall, gegen den diese Prüfung sich wappnen müsste.
+//
+// Das Wiederholungsbit bleibt ausgenommen (0x20): der Chip löscht es, wenn er das Telegramm wiederholt, und
+// jede Wiederholung wird genauso zurückgespiegelt wie der erste Versuch.
+bool Transmitter::isEchoPrefix(const uint8_t *data, size_t length) const
+{
+    if (_state == TxState::Idle) return false;
+    if (length == 0 || length > _frameSize) return false;
+    if (((data[0] ^ _buffer[0]) & (uint8_t)~0x20) != 0) return false;
+
+    return memcmp(data + 1, _buffer + 1, length - 1) == 0;
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Gemütliche Seite - läuft aus dem Hauptloop
 // ---------------------------------------------------------------------------------------------------

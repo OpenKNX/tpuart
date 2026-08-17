@@ -390,23 +390,28 @@ void Receiver::sendAcknowledge()
     // hätte dort nichts verloren und würde den passiven Mitschnitt verfälschen.
     if (_dll.isBusMonitor()) return;
 
-    // HIER STEHT BEWUSST KEINE ECHO-PRÜFUNG, obwohl während eines eigenen Versands jedes gesendete Oktett
-    // vom Chip zurückkommt (Datenblatt S. 42: "Each transmitted data octet ... will also be transmitted
-    // back to the host controller") und als ganz normales Frame einläuft. Sie wäre in beide Richtungen
-    // wirkungslos:
+    // DAS EIGENE ECHO WIRD NICHT QUITTIERT - man quittiert nicht sich selbst. Der Chip gibt jedes gesendete
+    // Oktett an den Host zurück (Datenblatt S. 42: "Each transmitted data octet ... will also be transmitted
+    // back to the host controller"), das eigene Telegramm läuft also wie ein fremdes ein und käme sonst hier
+    // durch.
     //
-    //   AN SICH SELBST SCHICKT MAN NICHTS. Das Ziel unseres eigenen Telegramms ist ein anderes Gerät oder
-    //   eine Gruppe, die wir senden - der Callback unten sagt dazu "nicht für mich", und damit endet die
-    //   Sache von selbst, ohne Quittung und ohne ADDRESSED.
+    // Hier stand einmal das Gegenteil, mit der Begründung "an sich selbst schickt man nichts, der Callback
+    // sagt also ohnehin 'nicht für mich'". AM ECHTEN GERÄT WIDERLEGT: ein IP-Router leitet auf
+    // Gruppenadressen weiter, die in seiner eigenen Filtertabelle stehen - sein Callback sagt für das eigene
+    // Echo "meins". Gemessen an einem Router über 15,7 Stunden: 25196 gesendete Quittungen, exakt 4 je
+    // eigenem Telegramm (Original plus die drei Wiederholungen des Chips), und keine einzige für ein fremdes
+    // Telegramm. Das ist nicht der exotische Sonderfall, für den es damals gehalten wurde, sondern der
+    // Normalfall des Hauptverbrauchers dieser Library.
     //
-    //   UND SELBST WENN er "für mich" sagte (ein Gerät darf eine Gruppenadresse hören, auf die es auch
-    //   sendet): schickt der Host ein U_Ackn.req, während der Chip gerade selbst sendet, ignoriert der
-    //   Chip es und setzt die Quittungs-Flags mit dem nächsten eintreffenden Frame ohnehin zurück. Auf
-    //   dem Bus passiert also nichts.
+    // Wirkung hatte das Byte auf dem Bus nie (der Chip verwirft ein U_Ackn.req, das während seines eigenen
+    // Sendens eintrifft) - es war aber auch nicht gratis: es belegt einen der vier Plätze in
+    // TPUART_TX_INTERFACE_BUFFER, und zwar genau in dem Moment, in dem der Sendepfad drei davon für das
+    // nächste Oktett braucht. Und es machte getTxAcknowledges() als Diagnose wertlos.
     //
-    // Eine Prüfung "ist der Sendeweg belegt" wäre übrigens auch aktiv schädlich gewesen: TxState::Await
-    // hält bis zur Bestätigung an, und in dieser Zeit wäre kein einziges FREMDES Telegramm mehr quittiert
-    // worden.
+    // Geprüft wird der ANFANG gegen das laufende Telegramm, NICHT "ist der Sendeweg belegt" - letzteres wäre
+    // aktiv schädlich: TxState::Await hält bis zur Bestätigung an, und in dieser ganzen Zeit würde kein
+    // einziges FREMDES Telegramm mehr quittiert.
+    if (_dll._transmitter.isEchoPrefix(_buffer, _bufferPos)) return;
 
     // Die Entscheidung wird IMMER eingeholt, auch wenn gleich klar wird, dass nicht mehr quittiert werden
     // kann: sie beantwortet zwei verschiedene Fragen. "Ist das Telegramm für uns" (-> ADDRESSED) gilt

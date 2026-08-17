@@ -1369,6 +1369,90 @@ static void sendWithEcho(const std::vector<uint8_t> &frame, uint8_t echoCount, i
     fx->pump(scriptMs + 60);
 }
 
+// MAN QUITTIERT NICHT SICH SELBST. Der Chip spiegelt jedes gesendete Oktett zurück, das eigene Telegramm
+// läuft also wie ein fremdes ein - und ein Aufrufer, der auf die eigene Zieladresse hört, würde beim
+// Quittungs-Callback "meins" antworten. Genau das ist an einem echten IP-Router gemessen worden: 4
+// Quittungen je eigenem Telegramm, keine einzige für ein fremdes.
+//
+// Der Callback antwortet hier deshalb bewusst bejahend - ohne das prüft der Fall gar nichts, denn mit
+// AckType::None (der Vorgabe der Vorrichtung) endet die Kette schon vor der Echo-Erkennung.
+static void test_own_echo_is_not_acknowledged()
+{
+    fx->connect();
+    fx->_ackAnswer = AckType::Addressed;
+
+    // sendWithEcho() löscht die geschriebenen Bytes, NACHDEM das Telegramm draußen ist - was danach noch
+    // dazukommt, kann nur die Quittung zum eintreffenden Echo sein.
+    sendWithEcho(standardFrame(), 1, 0x8B);
+
+    TEST_ASSERT_EQUAL(0, fx->_interface.writtenBytes().size());
+    TEST_ASSERT_EQUAL(0, fx->_dll.getStatistics().getTxAcknowledges());
+}
+
+// OHNE BESTÄTIGUNG TRÄGT DAS EIGENE TELEGRAMM KEINE QUITTUNGSFLAGS - weder ADDRESSED noch ACK. ADDRESSED
+// heißt "wir sind dafür zuständig", und für ein Telegramm, das wir selbst gesendet haben, sind wir der
+// Absender und nicht der zuständige Empfänger. ACK heißt "es wurde quittiert", und ohne L_Data.con weiß
+// niemand, ob das geschah.
+static void test_own_echo_without_confirmation_has_no_ack_flags()
+{
+    fx->connect();
+    fx->_ackAnswer = AckType::Addressed;
+
+    sendWithEcho(standardFrame(), 1, -1); // kein L_Data.con
+
+    TEST_ASSERT_EQUAL(1, fx->_frames.size());
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_TX) != 0);
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_ADDRESSED) == 0);
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_ACK) == 0);
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_DATA_CON) == 0);
+}
+
+// MIT BESTÄTIGUNG KOMMT ACK - aber weiterhin NICHT ADDRESSED. Das ist der Punkt, an dem die beiden Flags
+// auseinanderfallen: die Quittung ist da (jemand auf dem Bus hat quittiert, gemeldet über L_Data.con),
+// zuständig für den Empfang war trotzdem nicht dieses Gerät.
+static void test_own_echo_with_confirmation_is_acked_but_not_addressed()
+{
+    fx->connect();
+    fx->_ackAnswer = AckType::Addressed;
+
+    sendWithEcho(standardFrame(), 1, 0x8B);
+
+    TEST_ASSERT_EQUAL(1, fx->_frames.size());
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_ACK) != 0);
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_DATA_CON) != 0);
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_ADDRESSED) == 0);
+}
+
+// DER WÄCHTER GEGEN DIE NAHELIEGENDE FEHLIMPLEMENTIERUNG. Die Echo-Erkennung darf NICHT "läuft gerade eine
+// Übertragung" heißen: TxState::Await hält bis zur Bestätigung an, und in dieser ganzen Zeit würde kein
+// einziges FREMDES Telegramm mehr quittiert - auf einem belegten Bus sind das leicht hunderte Millisekunden.
+//
+// Hier wartet der Sendeweg also auf sein L_Data.con, und mitten hinein kommt ein fremdes Telegramm (andere
+// Quelladresse). Es muss ganz normal quittiert werden.
+static void test_foreign_frame_is_acknowledged_while_awaiting_confirmation()
+{
+    fx->connect();
+    fx->_ackAnswer = AckType::Addressed;
+
+    std::vector<uint8_t> own = standardFrame();
+    TEST_ASSERT_TRUE(fx->_dll.pushTransmitQueue(own.data(), own.size()));
+    fx->pump((uint32_t)(own.size() * 2 + 60));
+
+    // Der Sendeweg hängt jetzt in Await - genau der Zustand, den eine Zustandsprüfung fälschlich als
+    // "nicht quittieren" lesen würde.
+    TEST_ASSERT_EQUAL(TxState::Await, fx->_dll.getTransmitter().state());
+    fx->_interface.clearWrittenBytes();
+
+    // Andere Quelladresse, also kein Echo. Zieladresse ebenfalls anders, damit auch der Anfang abweicht.
+    std::vector<uint8_t> foreign = standardFrame(0x2202, 0x0901);
+    fx->feedAndSettle(foreign);
+
+    TEST_ASSERT_EQUAL(1, fx->_dll.getStatistics().getTxAcknowledges());
+    TEST_ASSERT_EQUAL(1, fx->_frames.size());
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_ADDRESSED) != 0);
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_TX) == 0);
+}
+
 // Der Normalfall: ein Echo, dann die positive Bestätigung. Das Telegramm wird als eigenes gemeldet (TX),
 // mit Bestätigung (DATA_CON) und positiv quittiert (ACK, ohne NACK). Danach ist der Sendeweg frei.
 static void test_echo_and_positive_confirmation()
@@ -1942,6 +2026,10 @@ static int runAllTests()
     RUN_TEST(test_send_extended_maximal_uses_offsets_sparingly);
     RUN_TEST(test_send_frame_rejects_oversized);
 
+    RUN_TEST(test_own_echo_is_not_acknowledged);
+    RUN_TEST(test_own_echo_without_confirmation_has_no_ack_flags);
+    RUN_TEST(test_own_echo_with_confirmation_is_acked_but_not_addressed);
+    RUN_TEST(test_foreign_frame_is_acknowledged_while_awaiting_confirmation);
     RUN_TEST(test_echo_and_positive_confirmation);
     RUN_TEST(test_echo_and_negative_confirmation_flags_nack);
     RUN_TEST(test_echo_repetitions_keep_watchdog_quiet);

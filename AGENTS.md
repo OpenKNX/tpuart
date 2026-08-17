@@ -512,14 +512,20 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   | 6 | `DATA_CON` | ja - eine Bestätigung für unser eigenes Telegramm kam an |
   | 5 | `FILTERED` | ja - der Wiederholungsfilter hat es als Dublette markiert |
   | 4 | `INVALID` | ja - CRC-Fehler, abgeschnitten, kaputte Länge |
-  | 3 | `ADDRESSED` | ja - der Quittungs-Callback sagte, dieses Telegramm ist unseres |
+  | 3 | `ADDRESSED` | ja - wir sind für dieses Telegramm zuständig (der Quittungs-Callback sagte ja) |
   | 2 | `ACK_BUSY` | ja - nur im Busmonitor |
   | 1 | `ACK_NACK` | ja - nur im Busmonitor |
   | 0 | `ACK` | ja - nur im Busmonitor |
 - **`ACK` heißt "dieses Telegramm wurde quittiert"** - von wem auch immer. Bekannt sein kann das in
   drei Lagen: wir haben selbst quittiert, wir haben die Quittung im Busmonitor auf dem Bus gesehen,
-  oder sie kam als Antwort auf ein Telegramm, das *wir* gesendet haben. `ADDRESSED` kommt nur im
-  ersten Fall dazu und ist das, was ihn von den anderen beiden trennt.
+  oder sie kam als Antwort auf ein Telegramm, das *wir* gesendet haben.
+  **`ADDRESSED` heißt "wir sind für dieses Telegramm zuständig"** - und das ist ausdrücklich NICHT
+  dasselbe wie "wir haben quittiert". Es wird gesetzt, sobald der Quittungs-Callback ja sagt, und
+  *bevor* die Rückstandsprüfung greift: ein Telegramm, dessen Quittung unterdrückt wurde, ist trotzdem
+  an uns gerichtet, und der Aufrufer soll es als solches erkennen. Umgekehrt trägt unser eigenes Echo
+  auch mit Bestätigung **kein** `ADDRESSED` - für ein Telegramm, das wir selbst gesendet haben, sind wir
+  der Absender und nicht der zuständige Empfänger. Genau daran fallen die beiden Flags auseinander, und
+  `test_own_echo_with_confirmation_is_acked_but_not_addressed` nagelt es fest.
   `setAcknowledge(AcknowledgeType)` setzt entsprechend `ADDRESSED | ACK`. **Verenge `ACK` nicht auf
   "bei uns ist eine Quittung angekommen"**. Diese Lesart wurde ausprobiert und zurückgenommen: sie
   wirkt einleuchtend,
@@ -1193,6 +1199,15 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   Hier stand zwischenzeitlich, die Quittung sei "nicht zählbar" und der Wert unterschätze die Belegung
   deshalb um rund 13%. Das war falsch, und der Fehler war die Frage: gefragt war nicht, *ob* quittiert
   wurde, sondern nur, *wie lang der Slot ist*.
+  **UNABHÄNGIG BESTÄTIGT durch die geläufige Kennzahl "der Bus schafft rund 50 Telegramme je Sekunde".**
+  Sie fällt aus dieser Rechnung genau heraus - und nur, wenn alle drei Anteile drinstehen:
+  ```
+  9 × 1354µs (Oktetts) + 5208µs (Pause) + 2708µs (Quittungsslot) = 20102µs  ->  49,7 Telegramme/s
+  ```
+  Ohne den Quittungsslot kämen 57,5/s heraus, ohne die Pause 67/s - beides passt nicht. Das ist der
+  einzige Prüfstein von außen, den diese Rechnung hat, und er trifft. Zugleich ist die Anzeige damit
+  kalibriert: 50 minimale Telegramme je Sekunde sind genau 100%, und bei kleinen Telegrammen liest sich
+  der Prozentwert direkt als "Telegramme je Sekunde geteilt durch 50".
   Deshalb steht in der Messprobe neben dem Byte- auch der **Telegrammzähler** (heile plus kaputte - der
   Bus war in beiden Fällen belegt). Aus den Oktetts allein ginge es nicht: 270 Oktetts sind ein großes
   Telegramm oder dreißig kleine, und die dreißig belegen den Bus 156ms länger, weil vor jedem Telegramm
@@ -1364,21 +1379,45 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   löscht) und der davon abhängigen Prüfsumme. Zwei Dinge hängen daran: `completeSequence()` markiert
   das Telegramm mit `TP_FRAME_FLAG_TX`, und der Wachhund des Transmitters wird neu scharf gemacht
   (siehe oben).
-  **`sendAcknowledge()` prüft bewusst NICHT auf das Echo.** Es gab dafür einmal ein `isEchoPrefix()`,
-  ausgewertet bei Byte 6, und es wurde als totes Gewicht entfernt: *ein Gerät sendet nicht an sich
-  selbst*, der Quittungs-Callback antwortet für unser eigenes Ziel also "nicht meins", und die Kette
-  endet von allein. Und in dem einen exotischen Fall, in dem sie es nicht täte (ein Gerät, das auf
-  eine Gruppenadresse hört, an die es auch sendet), ignoriert der Chip ein `U_Ackn.req`, das während
-  seines Sendens abgesetzt wird, und löscht die Quittungsflags mit dem nächsten eingehenden Telegramm
-  ohnehin. Beachte, dass die *naheliegende* Variante - "überspringen, solange eine Übertragung läuft" -
-  aktiv schädlich gewesen wäre: `TxState::Await` dauert bis zur Bestätigung, und in dieser ganzen Zeit
-  wäre kein **fremdes** Telegramm quittiert worden.
+  **`sendAcknowledge()` steigt beim eigenen Echo sofort aus** (`Transmitter::isEchoPrefix()`, bei
+  Byte 6) - **man quittiert nicht sich selbst.**
+  Hier stand einmal das Gegenteil, mit der Begründung, ein Gerät sende nicht an sich selbst, der
+  Quittungs-Callback antworte für das eigene Ziel also "nicht meins" und die Kette ende von allein; der
+  Fall, in dem er "meins" sagt, galt als exotisch. **Am echten Gerät widerlegt**: ein IP-Router leitet
+  auf Gruppenadressen weiter, die in seiner eigenen Filtertabelle stehen, und sagt für sein Echo
+  deshalb "meins". Gemessen über 15,7 Stunden: **25196 gesendete Quittungen, exakt 4 je eigenem
+  Telegramm** (Original plus die drei Wiederholungen des Chips) und keine einzige für ein fremdes
+  Telegramm. Das ist der Normalfall des Hauptverbrauchers dieser Library, nicht ein Sonderfall.
+  Auf dem Bus hatte das Byte nie Wirkung (der Chip verwirft ein `U_Ackn.req`, das während seines eigenen
+  Sendens eintrifft) - gratis war es trotzdem nicht: es belegt einen der vier Plätze in
+  `TPUART_TX_INTERFACE_BUFFER`, genau in dem Moment, in dem der Sendepfad drei davon für das nächste
+  Oktett braucht, und es machte `getTxAcknowledges()` als Diagnose wertlos.
+  Verloren geht dadurch nichts: das `ACK` am Echo kommt aus dem `L_Data.con` über `RxState::FrameAck`,
+  nicht aus unserer eigenen Quittung.
+  **Geprüft wird der ANFANG gegen das laufende Telegramm, nicht "läuft gerade eine Übertragung"** - die
+  naheliegende Variante wäre aktiv schädlich: `TxState::Await` dauert bis zur Bestätigung, und in dieser
+  ganzen Zeit würde kein **fremdes** Telegramm mehr quittiert. Dafür steht
+  `test_foreign_frame_is_acknowledged_while_awaiting_confirmation`, und er ist der einzige Fall, der
+  diese Verwechslung fängt (mutationsgeprüft). Dass ein 6-Byte-Anfang genügt, liegt an der Quelladresse
+  darin: ein fremdes Telegramm mit *unserer* Quelladresse wäre eine doppelt vergebene physikalische
+  Adresse, also ein Anlagenfehler.
 - **`RepetitionFilter`** (`RepetitionFilter.{h,cpp}`) markiert ein Telegramm, das der Sender ein
   zweites Mal auf den Bus gelegt hat, weil er keine Quittung sah. Der Verbraucher bekommt es weiterhin,
   mit `FILTERED` markiert, und kann die Verarbeitung überspringen, statt zweimal zu handeln. Geprüft
   und gemerkt wird für **jedes gültige Telegramm**, nicht nur für wiederholte - ohne den Wert des
   Originals wäre die Wiederholung nicht erkennbar; markiert wird nur, wenn zusätzlich `isRepeated()`
   gilt.
+  **Das eigene Echo läuft mit, und `getRxRepeatedFrames()` zählt es mit** - ausdrücklich so (Entscheidung
+  des Anwenders): das Echo kommt real über den Empfangspfad herein, das `Rx` im Namen ist also richtig und
+  gilt für beide Richtungen, weil das gesendete Telegramm zum empfangenen wird. Der Chip löscht bei einer
+  Wiederholung das Wiederholungsbit und spiegelt jede Wiederholung genauso zurück wie den ersten Versuch,
+  `isRepeated()` greift also.
+  **Bei der Deutung wissen**: quittiert auf der Linie niemand unsere Telegramme, wiederholt der Chip jedes
+  bis zu dreimal, und der Zähler füllt sich mit unserem eigenen Versand. An einem Router gemessen: 18897
+  von 30861 Telegrammen als wiederholt gemeldet, also 61% - und davon **alle** eigene Echos (exakt 3 je
+  eigenem Telegramm), fremde Wiederholungen 0. Das liest sich wie ein schwer gestörter Bus und ist keiner.
+  Getrennt zu zählen wurde erwogen und verworfen; wer es doch braucht, hat an der Zählstelle das Flag
+  `TP_FRAME_FLAG_TX` zur Hand.
   Gespeichert wird je Sender ein 16-Bit-Fingerabdruck (CRC-16/SPI-FUJITSU, mit erzwungen gesetztem
   Wiederholungsbit, damit Original und Wiederholung gleich hashen), nicht das
   Telegramm: 50 maximal große Telegramme wären 13KB, das hier sind 400 Byte. Der Preis ist eine

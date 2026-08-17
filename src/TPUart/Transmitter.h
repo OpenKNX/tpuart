@@ -250,6 +250,10 @@ class Transmitter
     // und ob auf die Bestätigung zu warten ist).
     bool isEcho(const uint8_t *data, size_t length) const;
 
+    // Dasselbe für ein Telegramm, das erst zum Teil eingelaufen ist - gebraucht bei Byte 6, wo über die
+    // Quittung entschieden wird. Begründung an der Definition.
+    bool isEchoPrefix(const uint8_t *data, size_t length) const;
+
     // Gibt den abgeholten Platz frei, räumt im Busmonitor und legt das nächste Telegramm für den Tick
     // bereit. NUR AUS DEM HAUPTKONTEXT - die Warteschlange gehört ihm allein.
     void stageNextTelegram();
