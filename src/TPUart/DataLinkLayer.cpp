@@ -163,6 +163,34 @@ namespace TPUart
     }
 #endif
 
+#ifdef TPUART_BCU_MARKER
+    /*
+     * @brief Switch the NCN frame-end MARKER feature on (bench measurement).
+     *
+     * With CRC-CCITT also active the trailing order becomes <checksum> 0xCB 0x13 CRC-hi CRC-lo (DS
+     * Fig. 55), so every frame fails its CRC check and the octets land in the discarded-byte dump --
+     * which is what this measures. Quiet bus, single telegrams; the dump is rate-limited and truncated.
+     */
+    bool DataLinkLayer::markerMode(bool state)
+    {
+        if (_bcuState == BCU_UNINITIALIZED) return false;
+        if (_bcuType != BCU_NCN5120) return false; // NCN family only, the TPUART2 has no MARKER feature
+
+        if (!state)
+        {
+            printMessage("MARKER off (via BCU reset -- the chip clears features only on reset)");
+            reset();
+            return true;
+        }
+
+        txLock(true);
+        _interface->write(U_NCN5120_CONFIGURE_REQ | U_NCN5120_CONFIGURE_MARKER_REQ);
+        txUnlock();
+        printMessage("MARKER on: expect CB 13 behind the checksum, then CRC high+low");
+        return true;
+    }
+#endif
+
     const char *DataLinkLayer::getBcuStateInfo()
     {
         switch (_bcuState)

@@ -154,6 +154,11 @@ namespace TPUart
 #ifdef TPUART_BCU_DEBUG
         void forceDisconnect(); // test hook (console "bcu dis"): force the terminal BCU_DISCONNECTED state
 #endif
+#ifdef TPUART_BCU_MARKER
+        // Bench hook (console "bcu marker on|off"): NCN frame-end MARKER, DS p.40. The parser does not
+        // know 0xCB/0x13, so the device stops delivering frames while on; "off" resets the BCU.
+        bool markerMode(bool state);
+#endif
         void process();
 
         void registerMessage(std::function<void(const char *, bool)> callback);
