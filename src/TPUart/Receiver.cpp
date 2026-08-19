@@ -241,19 +241,9 @@ namespace TPUart
 
         if (!sufficientlyBytes()) return;
 
-        // Honour a reset indication UNCONDITIONALLY, before the _invalid sweep below: otherwise a desynced
-        // NCN keeps _invalid latched and its U_RESET_IND (the only path back to BCU_CONNECTED) is discarded
-        // forever. U_RESET_IND is a single unambiguous control byte, so bypassing the invalid-gate is safe.
-        if (_searchBuffer.get(0) == U_RESET_IND)
-        {
-            _dll.receivedReset(); // sets _uReset + clears _invalid + BCU_CONNECTED
-            _invalid = false;
-            _searchBuffer.move(1);
-            _awaitBytes = 1;
-            _state = RX_IDLE;
-            processSearchBuffer(); // continue with any trailing bytes
-            return;
-        }
+        // No control byte is interpreted while _invalid is latched: any value can sit at position 0,
+        // and a CRC low byte of 0x03 was taken for U_RESET_IND -- which drops the whole transmit queue.
+        // In sync, processControlBytes() handles it; a stuck desync is bounded by the desync watchdog.
 
         processSearchBufferAcknowledge();
         if (_searchBuffer.empty()) return;

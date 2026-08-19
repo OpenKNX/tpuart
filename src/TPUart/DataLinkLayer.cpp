@@ -504,9 +504,50 @@ namespace TPUart
         processWatchdog();
     }
 
+    /*
+     * @brief Bounds how long a desynced receiver is tolerated.
+     *
+     * _invalid only clears on a completed frame, so a chip that silently reset or spews noise stays
+     * latched with TX blocked and the state poll suppressed. A guarded reset re-syncs and re-applies the
+     * configuration. Later than the transmitter's own lost-confirm backstop, with a long cooldown.
+     */
+#ifndef TPUART_DESYNC_RECOVER_MS
+#define TPUART_DESYNC_RECOVER_MS 20000 // _invalid latched this long without clearing => unrecoverable on its own
+#endif
+#ifndef TPUART_DESYNC_COOLDOWN_MS
+#define TPUART_DESYNC_COOLDOWN_MS 60000 // minimum spacing between two desync resets
+#endif
+
     void DataLinkLayer::processWatchdog()
     {
         if (_bcuState == BCU_UNINITIALIZED) return;
+
+        // CONNECTED only: in BUSMONITOR a reset is the only way out of the mode and would kill the
+        // running capture; in DISCONNECTED the reconnect poke already clears the receiver each attempt.
+        if (_bcuState != BCU_CONNECTED || !_receiver._invalid)
+        {
+            _invalidSince = 0;
+        }
+        else
+        {
+            const unsigned long now = millis();
+            if (_invalidSince == 0)
+            {
+                _invalidSince = now;
+            }
+            else if (now - _invalidSince >= TPUART_DESYNC_RECOVER_MS &&
+                     (_lastDesyncReset == 0 || now - _lastDesyncReset >= TPUART_DESYNC_COOLDOWN_MS) &&
+                     _receiver._invalid) // re-read: the RX path may have cleared it in the meantime
+            {
+                const unsigned long secs = (now - _invalidSince) / 1000;
+                _lastDesyncReset = now;
+                _invalidSince = 0;
+                _statistics.incrementBcuResets();
+                printError("Watchdog: receiver desynced for %lus, reset.", secs);
+                reset();
+                return;
+            }
+        }
 
         _transmitter.processWatchdog();
     }

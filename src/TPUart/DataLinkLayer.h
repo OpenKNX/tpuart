@@ -50,6 +50,8 @@ namespace TPUart
         unsigned long _lastValidRx = 0;          // BCU auto-reconnect: last valid-protocol RX (liveness)
         unsigned long _reconnectBackoff = 1000;  // BCU auto-reconnect: poke interval, 1s -> 30s while NCN absent
         unsigned long _lastDiscardedMessage = 0;
+        unsigned long _invalidSince = 0;    // desync watchdog: millis() of the rising edge of _receiver._invalid
+        unsigned long _lastDesyncReset = 0; // desync watchdog: cooldown anchor, keeps a broken chip from reset-looping
         unsigned long _lastDiscardedBytes = 0;
         volatile size_t _rxFrameBufferEntries = 0;
         volatile BcuType _bcuType;
