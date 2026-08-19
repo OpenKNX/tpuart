@@ -222,7 +222,7 @@ namespace TPUart
             const uint8_t bsLo = (uint8_t)_rxFrameBuffer.pop();
             const uint8_t bsHi = (uint8_t)_rxFrameBuffer.pop();
             const uint16_t bufferSize = (uint16_t)(bsLo | (bsHi << 8));
-            const uint16_t frameSize = bufferSize - 3;
+            const uint16_t frameSize = bufferSize - 4;
 
             // Bound what was a VLA (char frameData[frameSize]): the producer (pushRxFrameBuffer) never pushes
             // more than the rx search buffer holds, so a frameSize above it means the ring desynced or the
@@ -246,7 +246,9 @@ namespace TPUart
 
             Frame frame(frameData, frameSize);
 
-            frame.addFlags(_rxFrameBuffer.pop());
+            const uint8_t flLo = (uint8_t)_rxFrameBuffer.pop();
+            const uint8_t flHi = (uint8_t)_rxFrameBuffer.pop();
+            frame.addFlags((uint16_t)(flLo | (flHi << 8)));
             asm volatile("" ::: "memory");
             _rxFrameBufferEntries = _rxFrameBufferEntries - 1;
             rxUnlock();
@@ -256,7 +258,9 @@ namespace TPUart
             // Skip the repetition filter for busmon-only carriers (FCS-failed frames and 1-byte standalone
             // acknowledges): they must not pollute the per-source repetition map, are never delivered up,
             // and a 1-byte ack carrier has no valid size()/source() for the filter to read.
-            if (!frame.isErrored() && !frame.isAckOnly())
+            // Busmon-only carriers never reach the link layer: size()/source() would read past their
+            // buffer (an ack is 1 octet, a truncated frame is shorter than its length octet claims).
+            if (!frame.isErrored() && !frame.isAckOnly() && !frame.isTruncated())
             {
                 bool alreadFound;
                 alreadFound = _repetitionFilter.check(frame);
@@ -273,11 +277,11 @@ namespace TPUart
         }
     }
 
-    void DataLinkLayer::pushRxFrameBuffer(Frame &frame)
+    void DataLinkLayer::pushRxFrameBuffer(Frame &frame, unsigned short len /* = 0 */)
     {
         _lastValidRx = millis(); // a parsed frame -> bus/chip alive -> liveness for auto-reconnect
-        const unsigned short frameSize = frame.size();
-        const unsigned short bufferSize = frameSize + 3;
+        const unsigned short frameSize = len ? len : frame.size();
+        const unsigned short bufferSize = frameSize + 4; // 2 size + 2 flags
         if (_rxFrameBuffer.available() <= bufferSize)
         {
             _rxFrameBufferOverflow = true;
@@ -296,8 +300,10 @@ namespace TPUart
         for (size_t i = 0; i < frameSize; i++)
             _rxFrameBuffer.push(frame.data(i));
 
-        // Flags (1 byte)
-        _rxFrameBuffer.push(frame.flags());
+        // Flags (2 bytes, little endian -- the word is 16 bit since the low 8 bits were exhausted)
+        const uint16_t fl = frame.flags();
+        _rxFrameBuffer.push((char)(fl & 0xFF));
+        _rxFrameBuffer.push((char)(fl >> 8));
         asm volatile("" ::: "memory");
         _rxFrameBufferEntries = _rxFrameBufferEntries + 1;
     }
@@ -309,7 +315,7 @@ namespace TPUart
         // and is tagged ACK_ONLY so the consumer short-circuits it to the busmon without ever calling
         // size()/isFrame()/cemi conversion (which would read past this single byte). Kept separate from
         // pushRxFrameBuffer, whose frame.size() would itself read past a 1-byte buffer.
-        const unsigned short bufferSize = 1 + 3;
+        const unsigned short bufferSize = 1 + 4; // 2 size + 2 flags
         if (_rxFrameBuffer.available() <= bufferSize)
         {
             _rxFrameBufferOverflow = true;
@@ -319,7 +325,8 @@ namespace TPUart
         _rxFrameBuffer.push(bufferSize & 0xFF);
         _rxFrameBuffer.push(bufferSize >> 8);
         _rxFrameBuffer.push(value);
-        _rxFrameBuffer.push(TP_FRAME_FLAG_ACK_ONLY);
+        _rxFrameBuffer.push((char)(TP_FRAME_FLAG_ACK_ONLY & 0xFF));
+        _rxFrameBuffer.push((char)(TP_FRAME_FLAG_ACK_ONLY >> 8));
         asm volatile("" ::: "memory");
         _rxFrameBufferEntries = _rxFrameBufferEntries + 1;
     }

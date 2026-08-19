@@ -31,6 +31,7 @@ namespace TPUart
             bool write(char value) override;
             int read() override;
             bool overflow() override;
+            bool lastByteErrored() override;
             void flush() override;
             bool hasCallback() override;
             void registerCallback(std::function<bool()> callback) override;

@@ -42,6 +42,9 @@ namespace TPUart
 
       public:
         volatile bool _invalid = false;
+        // Set when any octet of the frame currently being assembled arrived flagged by the chip; applied
+        // to the frame when it is handed up, cleared with it.
+        volatile bool _byteErrorInFrame = false;
         bool test = false;
         Receiver(DataLinkLayer &dll);
 

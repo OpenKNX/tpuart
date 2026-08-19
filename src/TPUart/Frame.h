@@ -1,6 +1,7 @@
 #pragma once
 #include "TPUart/Types.h"
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 // #ifdef TPUART_PRINT
@@ -40,19 +41,32 @@
 // Means that the frame failed FCS validation; used only to forward it to the busmon tagged as errored
 #define TP_FRAME_FLAG_FCS_ERROR 0b00010000
 
+// Bits 8+ use the upper half of the 16-bit flags word; the lower 8 are full.
+// An octet of this frame was flagged by the chip (parity bit in 9-bit UART mode, DS p.27). Maps to the
+// cEMI busmon "Bit error" flag, not "Parity error" -- the latter means a real TP1 parity violation.
+#define TP_FRAME_FLAG_BIT_ERROR 0b0000000100000000
+
+// Raw bus carrier, not an LPDU (e.g. a poll telegram). Forward via rawLength(), never size().
+#define TP_FRAME_FLAG_RAW 0b0000010000000000
+
+// Cut short: the stream went quiet before the announced length. Never size it from the length octet.
+#define TP_FRAME_FLAG_TRUNCATED 0b0000001000000000
+
 namespace TPUart
 {
     class Frame
     {
       private:
         const char *_data;
-        char _flags = 0;
+        uint16_t _flags = 0;
+        uint16_t _len = 0; // octets actually present when the buffer was copied (0 = derive from size())
         bool _deleteData = false;
 
       public:
         Frame(const char *data) : _data(data) {}
         Frame(const char *data, unsigned short size)
         {
+            _len = size;
             _deleteData = true;
             _data = (const char *)malloc(size);
             memcpy((char *)_data, data, size);
@@ -70,7 +84,7 @@ namespace TPUart
         //     // memcpy((char *)newData, (const char  *)*other._data, other.size());
         // }
 
-        void addFlags(char flags)
+        void addFlags(uint16_t flags)
         {
             _flags |= flags;
         }
@@ -258,6 +272,35 @@ namespace TPUart
         bool isErrored()
         {
             return _flags & TP_FRAME_FLAG_FCS_ERROR;
+        }
+
+        /*
+         * Octets actually available in the buffer. Equals size() for a complete frame, but a truncated
+         * frame or a 1-octet acknowledge carrier holds fewer than size() would compute from the length
+         * octet -- reading size() there runs past the buffer. Always use this for raw forwarding.
+         */
+        unsigned short rawLength()
+        {
+            return _len ? _len : size();
+        }
+
+        // True when the chip flagged at least one octet of this frame as bit-errored (see the define).
+        bool isBitErrored()
+        {
+            return _flags & TP_FRAME_FLAG_BIT_ERROR;
+        }
+
+        // True for a raw bus carrier that must not be interpreted as an LPDU (see the define).
+        bool isRaw()
+        {
+            return _flags & TP_FRAME_FLAG_RAW;
+        }
+
+        // True when the frame was cut short. Its buffer holds fewer octets than size() announces --
+        // callers must use the length carried alongside it, never size().
+        bool isTruncated()
+        {
+            return _flags & TP_FRAME_FLAG_TRUNCATED;
         }
 
         // True for a 1-byte carrier holding a standalone L2 acknowledge octet (busmon-only, see Receiver).

@@ -111,7 +111,8 @@ namespace TPUart
         std::function<void(const char *, bool error)> _callbackMessage;
 
         void connected(bool connected);
-        void pushRxFrameBuffer(Frame &frame);
+        // len = 0 -> from frame.size(). A truncated frame must pass the octets actually received.
+        void pushRxFrameBuffer(Frame &frame, unsigned short len = 0);
         // Push a standalone L2 acknowledge octet as a 1-byte busmon-only carrier (monitor mode only).
         void pushRxAcknByte(char value);
         // void processIncompleteFrame();

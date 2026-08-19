@@ -15,6 +15,9 @@ namespace TPUart
         uart_port_t _uart;
         bool _dma = false;
         volatile bool _overflow = false;
+        // Coarse: the IDF reports the error as an event without naming the octet, so this latches until
+        // the next read() and may tag a neighbour. The busmon flag is per telegram, so that is enough.
+        volatile bool _byteErrored = false;
         QueueHandle_t _taskQueue = nullptr;
         TaskHandle_t _taskHandle = nullptr;
         std::function<void(void)> _callback;
@@ -32,6 +35,11 @@ namespace TPUart
                 {
                     switch (event.type)
                     {
+                        case UART_PARITY_ERR:
+                        case UART_FRAME_ERR:
+                            // NCN: bus-side bit error, encoded into the octet's parity bit (DS p.27).
+                            _byteErrored = true;
+                            // fall through: the octets around it must still be drained
                         case UART_FIFO_OVF:
                         case UART_BUFFER_FULL:
                             _interface->_overflow = true;
@@ -131,6 +139,13 @@ namespace TPUart
             if (!available()) return -1;
             uint8_t c;
             return uart_read_bytes(_uart, &c, 1, pdMS_TO_TICKS(1)) == 1 ? (int)c : -1;
+        }
+
+        bool ESP32::lastByteErrored()
+        {
+            if (!_byteErrored) return false;
+            _byteErrored = false;
+            return true;
         }
 
         bool ESP32::overflow()

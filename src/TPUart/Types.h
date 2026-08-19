@@ -107,6 +107,18 @@
 #define ACR0_FLAG_TRIGEN 0x08
 #define ACR0_FLAG_V20VCLIMIT 0x04
 
+/*
+ * TPUART_BUSMON_INTEGRITY (opt-in, define it in the product's build flags)
+ *
+ * In bus monitor mode the chip is transparent: no U_FrameEnd.ind, no CRC, no byte stuffing (DS Table 11 +
+ * p.36), so every gap in the capture has to be detected and reported host-side. With this defined:
+ *   - a truncated telegram is forwarded to the monitor instead of being swept into the discard ring,
+ *   - a poll telegram is counted out and forwarded instead of being swept byte by byte,
+ *   - the chip's per-octet bit-error flag is collected (NCN 9-bit UART parity encoding, DS p.27).
+ * They fill the cEMI busmonitor Lost and Bit-error flags (03_06_03 4.1.5.8.1). Platforms without a
+ * per-octet error channel (ArduinoSerial) simply never set the bit-error flag.
+ */
+
 namespace TPUart
 {
     typedef enum

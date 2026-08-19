@@ -87,6 +87,21 @@ namespace TPUart
                 processCompleteFrame();
                 return;
         }
+
+#ifdef TPUART_BUSMON_INTEGRITY
+        // Cut short on the bus: forward what arrived before the sweep discards it (03_06_03 4.1.5.8.1,
+        // a lost frame piece sets the Lost flag; the FCS is the monitor application's job). Length from
+        // the timeout marker, never size() -- that is the promised length, not what actually arrived.
+        if (_dll.isMonitoring() && _searchBuffer.timeout() > 0 &&
+            (_state == RX_FRAME || _state == RX_FRAME_DESTINATION || _state == RX_FRAME_SIZE))
+        {
+            Frame &frame = _searchBuffer.frame();
+            frame.addFlags(TP_FRAME_FLAG_TRUNCATED);
+            if (_byteErrorInFrame) frame.addFlags(TP_FRAME_FLAG_BIT_ERROR);
+            _dll.pushRxFrameBuffer(frame, (unsigned short)_searchBuffer.timeout());
+        }
+#endif
+
         processSearchBufferInvalid(4);
     }
 
@@ -133,6 +148,9 @@ namespace TPUart
         if (value != -1)
         {
             _lastReceivedTime = millis();
+#ifdef TPUART_BUSMON_INTEGRITY
+            if (_dll._interface->lastByteErrored()) _byteErrorInFrame = true;
+#endif
 
             const uint start = micros();
             _dll._statistics.incrementRxReceivedBytes();
@@ -204,6 +222,9 @@ namespace TPUart
                 _dll.getTransmitter().finalize();
             }
 
+#ifdef TPUART_BUSMON_INTEGRITY
+            if (_byteErrorInFrame) _searchBuffer.frame().addFlags(TP_FRAME_FLAG_BIT_ERROR);
+#endif
             unsigned short size = _searchBuffer.frame().size();
             if (!_dll.isMonitoring() && _dll._modeExtendedCRC) size += 2;
             if (acknowledge) size++; // Es hängt noch ein ACKN oder DATA_CON dran
@@ -217,6 +238,7 @@ namespace TPUart
             _searchBuffer.move(size);
             _awaitBytes = 1;
             _state = RX_IDLE;
+            _byteErrorInFrame = false;
 
             // Wenn der buffer leer ist, kann auch das invalid flag zurückgesetzt werden
             //_dll.printError("FV! %u %u %u", _dll._interface->available(), _searchBuffer.position(), _awaitBytes);
@@ -288,6 +310,7 @@ namespace TPUart
 
         _searchBuffer.frame().resetFlags();
         _state = RX_IDLE;
+        _byteErrorInFrame = false;
         _invalid = true;
         _awaitBytes = 1;
     }
@@ -471,6 +494,57 @@ namespace TPUart
         else if (_dll.isMonitoring() && (value == 0xFF || value == 0xFD))
         {
         }
+        else if (value == L_POLL_DATA_IND)
+        {
+            /*
+             * Poll telegram (DS p.53, Fig. 56): F0 SAH SAL PAH PAL SlotCount FCS + SlotCount slots.
+             * Swept byte by byte instead, the sweep stops at the first frame-looking byte -- for a master
+             * at 1.0.x that is its own source-address high byte 0x10, and the phantom frame gets
+             * ACKNOWLEDGED on the bus. The FCS check separates a real header from a stray 0xF0.
+             */
+            if (_searchBuffer.position() < 7)
+            {
+                _awaitBytes = 7;
+                return;
+            }
+
+            uint8_t chk = 0;
+            for (uint8_t i = 0; i < 6; i++)
+                chk ^= (uint8_t)_searchBuffer.get(i);
+
+            if ((uint8_t)(~chk) != (uint8_t)_searchBuffer.get(6))
+            {
+                // Not a poll header -- behave exactly as before for an unexpected byte.
+                _lastDiscarded = millis();
+                asm volatile("" ::: "memory");
+                _discardedBytes.push((char)value);
+                _dll._statistics.incrementRxDiscardedBytes();
+                _invalid = true;
+            }
+            else
+            {
+                const unsigned short total = 7 + (uint8_t)_searchBuffer.get(5); // + slot octets
+                if (_searchBuffer.position() < total)
+                {
+                    _awaitBytes = total;
+                    return;
+                }
+#ifdef TPUART_BUSMON_INTEGRITY
+                // A real bus event -- without this it never appeared in the capture.
+                if (_dll.isMonitoring())
+                {
+                    Frame &frame = _searchBuffer.frame();
+                    frame.addFlags(TP_FRAME_FLAG_RAW);
+                    if (_byteErrorInFrame) frame.addFlags(TP_FRAME_FLAG_BIT_ERROR);
+                    _dll.pushRxFrameBuffer(frame, total);
+                    frame.resetFlags();
+                    _byteErrorInFrame = false;
+                }
+#endif
+                count = total;
+            }
+        }
+
         else if ((value & U_CONFIGURE_MASK) == U_CONFIGURE_IND)
         {
             _dll.receivedConfiguration(value);
@@ -504,6 +578,10 @@ namespace TPUart
         // if (!_invalid) _dll._statistics.incrementRxControlBytes(count);
         _searchBuffer.move(count);
         _awaitBytes = 1;
+#ifdef TPUART_BUSMON_INTEGRITY
+        // Belongs to the frame being assembled -- a flagged control byte must not tag the next one.
+        _byteErrorInFrame = false;
+#endif
     }
 
 } // namespace TPUart

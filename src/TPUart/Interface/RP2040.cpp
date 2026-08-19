@@ -20,15 +20,21 @@ namespace TPUart
     {
         RP2040::RP2040(pin_size_t rx, pin_size_t tx, uart_inst_t *uart, bool irq, bool dma) : _rx(rx), _tx(tx), _uart(uart), _irq(irq), _dma(dma)
         {
+            // The hardware ring masks the write address, so the buffer must start on a RING_BYTES
+            // boundary. This object is heap-allocated, so that depends on over-aligned new being
+            // honoured; without it the wrap lands mid-buffer and corrupts RX silently. Fall back instead.
+            if (_dma && ((uintptr_t)_dmaBuffer & (TPUART_RP2040_RING_BYTES - 1)) != 0)
+                _dma = false;
+
             if (_dma)
             {
                 _dmaChannel = dma_claim_unused_channel(true); // get free channel for dma
                 _dmaConfig = dma_channel_get_default_config(_dmaChannel);
-                channel_config_set_transfer_data_size(&_dmaConfig, DMA_SIZE_8);
+                channel_config_set_transfer_data_size(&_dmaConfig, TPUART_RP2040_DMA_XFER);
                 channel_config_set_read_increment(&_dmaConfig, false);
                 channel_config_set_write_increment(&_dmaConfig, true);
                 channel_config_set_high_priority(&_dmaConfig, true);
-                channel_config_set_ring(&_dmaConfig, true, TPUART_RP2040_BUFFER_EXP);
+                channel_config_set_ring(&_dmaConfig, true, TPUART_RP2040_RING_EXP); // ring wraps on BYTES
                 if (_uart == uart0) channel_config_set_dreq(&_dmaConfig, DREQ_UART0_RX);
                 if (_uart == uart1) channel_config_set_dreq(&_dmaConfig, DREQ_UART1_RX);
                 dma_channel_set_read_addr(_dmaChannel, &uart_get_hw(_uart)->dr, false);
@@ -147,12 +153,26 @@ namespace TPUart
         {
             // if (!_running) return false; // not necessary, because available() is already checking this
             if (!available()) return -1;
-            if (!_dma) return uart_getc(_uart);
+            if (!_dma)
+            {
+#ifdef TPUART_BUSMON_INTEGRITY
+                const uint32_t dr = uart_get_hw(_uart)->dr; // DATA + status in one access
+                _lastByteErrored = (dr & 0x0F00) != 0;
+                return (int)(dr & 0xFF);
+#else
+                return uart_getc(_uart);
+#endif
+            }
 
             // when transfer count and read counter too far apart, then reset the read counter to current transfer count - 1
             if (overflow()) _dmaReaderCount = dmaTransferCount() - 1;
 
-            int ret = _dmaBuffer[_dmaReaderCount++ % TPUART_RP2040_BUFFER_SIZE];
+            const TpuartDmaWord word = _dmaBuffer[_dmaReaderCount++ % TPUART_RP2040_BUFFER_SIZE];
+#ifdef TPUART_BUSMON_INTEGRITY
+            // DR[11:8] = OE|BE|PE|FE. The NCN drives PE for a bus-side bit error (DS p.27).
+            _lastByteErrored = (word & 0x0F00) != 0;
+#endif
+            int ret = (int)(word & 0xFF);
 
             // is the dma channel expired and last char, then restart the dma channel.
             if (!available() && !dma_channel_is_busy(_dmaChannel))
@@ -172,6 +192,16 @@ namespace TPUart
 
             return dmaTransferCount() - dmaReaderCount() > TPUART_RP2040_BUFFER_SIZE;
         };
+
+        bool RP2040::dmaActive()
+        {
+            return _dma;
+        }
+
+        bool RP2040::lastByteErrored()
+        {
+            return _lastByteErrored;
+        }
 
         bool RP2040::hasCallback()
         {

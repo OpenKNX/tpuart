@@ -5,6 +5,7 @@
 #include <hardware/uart.h>
 
 #include "TPUart/Interface/Abstract.h"
+#include "TPUart/Types.h"
 
 constexpr uint32_t TPUART_RP2040_TRANSFER_COUNT = UINT32_MAX >> 1; // aus irgendeinem Grund funktioniert UINT32_MAX nicht und ich musste den wert halbieren
 // constexpr unsigned int TPUART_RP2040_TRANSFER_COUNT = 5000;
@@ -15,7 +16,20 @@ constexpr unsigned long TPUART_RP2040_BUFFER_EXP = 11; // 2**BufferExp -> 2048 B
 // silently jump-discarded in read() (fast-transfer >4KB corruption) and a single max extended LPDU
 // (264 B incl. FCS) already exceeds it -> raw-busmon long frames are lost. 2048 B gives ample headroom.
 // (Previously reverted to 8 while isolating an unrelated KNXnet/IP routing issue; that net is clean now.)
-constexpr unsigned long TPUART_RP2040_BUFFER_SIZE = (1u << TPUART_RP2040_BUFFER_EXP);
+constexpr unsigned long TPUART_RP2040_BUFFER_SIZE = (1u << TPUART_RP2040_BUFFER_EXP); // entries
+
+// 16-bit entries carry the UART status bits DR[11:8] with the octet; DMA_SIZE_8 copies only DR[7:0]
+// and drops the chip's error signal. The ring wraps on BYTES, so 16-bit needs one exponent more.
+#ifdef TPUART_BUSMON_INTEGRITY
+typedef uint16_t TpuartDmaWord;
+    #define TPUART_RP2040_DMA_XFER DMA_SIZE_16
+constexpr unsigned long TPUART_RP2040_RING_EXP = TPUART_RP2040_BUFFER_EXP + 1;
+#else
+typedef uint8_t TpuartDmaWord;
+    #define TPUART_RP2040_DMA_XFER DMA_SIZE_8
+constexpr unsigned long TPUART_RP2040_RING_EXP = TPUART_RP2040_BUFFER_EXP;
+#endif
+constexpr unsigned long TPUART_RP2040_RING_BYTES = (1u << TPUART_RP2040_RING_EXP);
 
 namespace TPUart
 {
@@ -27,9 +41,10 @@ namespace TPUart
             int _dmaChannel;
             dma_channel_config _dmaConfig;
 
-            volatile uint8_t __attribute__((aligned(TPUART_RP2040_BUFFER_SIZE))) _dmaBuffer[TPUART_RP2040_BUFFER_SIZE] = {};
+            volatile TpuartDmaWord __attribute__((aligned(TPUART_RP2040_RING_BYTES))) _dmaBuffer[TPUART_RP2040_BUFFER_SIZE] = {};
             volatile uint _dmaReaderCount = 0;
             volatile uint _dmaRestartDiff = 0;
+            bool _lastByteErrored = false; // UART status bits of the octet last handed out by read()
 
             pin_size_t _rx, _tx;
             gpio_function_t _rxRestore, _txRestore;
@@ -51,6 +66,8 @@ namespace TPUart
             bool write(char value) override;
             int read() override;
             bool overflow() override;
+            bool lastByteErrored() override;
+            bool dmaActive(); // false if the ring buffer came back misaligned and DMA was refused
             bool hasCallback() override;
             void registerCallback(std::function<bool()> callback) override;
             void flush() override;
