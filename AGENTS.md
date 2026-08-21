@@ -246,8 +246,20 @@ Implementierungen, alle bisher ausgebaut:
   `uart_is_writable` bleibt also wahr, bis 32 Bytes drinliegen.
   Beides löst dieselbe Buchführung: Bytezeit aus der Baudrate, jedes übergebene Byte schreibt
   `_lineBusyUntil` fort, und was noch aussteht, folgt aus der Uhr. Gemeldet wird der Platz bis zur
-  erlaubten Tiefe. **Kein eigener Ring** - die FIFO darunter ist der Ring, sie wird nur nicht mehr
-  volllaufen gelassen. Ob die eingepackte Klasse überhaupt freien Sendeplatz meldet, wird **in
+  erlaubten Tiefe.
+  **Dazu ein vier Byte tiefer eigener Sendepuffer**, und hier stand einmal das Gegenteil ("kein eigener
+  Ring - die FIFO darunter ist der Ring"). Das widersprach der Anforderung in `Transmitter.h`, die einen
+  solchen Puffer ausdrücklich verlangt, und es ging schief: `availableForWrite()` ist eine RESERVIERUNG,
+  deren Einhaltung ohne Puffer an der eingepackten Klasse hängt - und die kann ablehnen, ohne dass diese
+  Ebene den Grund kennt. `SerialPIO` tut es, wenn seine `CoreMutex` belegt ist (Reentranz zwischen Tick und
+  Hauptkontext). Weil der Aufrufer Gruppen unteilbar absetzt, lag dann eine halbe Sequenz auf der
+  Hostleitung: am Bus gemessen meldete der Chip `PE` in Serie und liess etwa jedes zwanzigste Telegramm
+  unbestaetigt, jedes davon 10s Wachhund plus BCU-Reset. Gezaehlt hat es nichts - kein Überlauf, kein
+  Verlust, keine Meldung. Der Puffer nimmt jetzt an, was zugesagt war, und schiebt es nach; die erlaubte
+  Tiefe bleibt dieselbe, weil "noch bei uns" und "geschätzt noch unter uns" zusammen gezählt werden. Vor
+  einer zugelassenen Quittung liegen damit nie mehr als drei Bytes, die 2,8ms-Frist bleibt also gedeckt.
+  **Der Sendeweg dieses Adapters ist damit erstmals an echter Hardware gelaufen** - über `SerialPIO` in
+  `tpbridge`; empfangen hatte er dort vorher schon fehlerfrei. Ob die eingepackte Klasse überhaupt freien Sendeplatz meldet, wird **in
   `begin()`** festgestellt (unmittelbar danach ist der Sendepuffer leer, eine funktionierende
   Implementierung muss dort also mehr als 0 melden); tut sie es nicht, bremst allein die Uhr.
 - **`Dummy`** - simuliertes Interface für Tests, ohne echte Hardware (aber trotzdem über das

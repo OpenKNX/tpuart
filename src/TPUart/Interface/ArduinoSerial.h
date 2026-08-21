@@ -33,8 +33,15 @@ namespace Interface
 // Beides löst dieselbe Rechnung: der Adapter FÜHRT BUCH ÜBER DIE LEITUNG, statt zu fragen. Aus der Baudrate
 // folgt die Bytezeit (8E1 = 11 Bit je Zeichen), jedes übergebene Byte schreibt den Fahrplan fort, und daraus
 // ergibt sich jederzeit, wie viele Bytes noch unter uns stecken. Gemeldet wird der Platz bis zur erlaubten
-// Tiefe - eine Zahl, die stimmt, und eine Tiefe, die die Quittung nicht begräbt. Einen eigenen Ring braucht
-// es dafür nicht: die FIFO darunter IST der Ring, sie wird nur nicht mehr volllaufen gelassen.
+// Tiefe - eine Zahl, die stimmt, und eine Tiefe, die die Quittung nicht begräbt.
+//
+// DAZU EIN VIER BYTE TIEFER ZWISCHENPUFFER. Hier stand einmal, den brauche es nicht ("die FIFO darunter
+// IST der Ring") - das war falsch, und zwar nicht wegen der Tiefe, sondern wegen der ZUSAGE:
+// availableForWrite() ist eine Reservierung, und ohne Puffer hing deren Einhaltung an der eingepackten
+// Klasse. Die kann ablehnen, ohne dass diese Ebene den Grund kennt - SerialPIO tut es, wenn seine
+// CoreMutex belegt ist. Weil der Aufrufer Gruppen unteilbar absetzt, lag dann eine halbe Sequenz auf der
+// Leitung: der Chip meldete PE und bestätigte das Telegramm nie. Der Puffer nimmt an, was zugesagt war,
+// und schiebt es nach; die erlaubte Tiefe bleibt dieselbe, weil beides zusammen gezählt wird.
 //
 // Die Schätzung irrt in die unschädliche Richtung: die 11 Bit sind exakt (8E1), und ein Byte kann nur später
 // fertig sein als berechnet, nie früher - dann wird eben etwas mehr gebremst als nötig.
@@ -47,6 +54,42 @@ class ArduinoSerial : public Abstract
 
     uint32_t _byteTimeUs = 0;    // 0 = unbekannt, dann wird nicht gebremst
     uint32_t _lineBusyUntil = 0; // geschätzter Zeitpunkt, an dem alles Übergebene draußen ist
+
+    // DER ZWISCHENPUFFER, und er ist der Preis für eine haltbare Zusage. availableForWrite() ist eine
+    // RESERVIERUNG: wer n meldet, muss die nächsten n Schreibvorgänge annehmen, weil der Aufrufer Gruppen
+    // unteilbar absetzt. Ohne Puffer hing das an der eingepackten Klasse - und die kann aus Gründen
+    // ablehnen, die diese Ebene nicht kennt: SerialPIO nimmt in write() eine CoreMutex und liefert 0,
+    // wenn sie belegt ist (Reentranz zwischen Tick und Hauptkontext). Genau das zerriss Sequenzen.
+    //
+    // ER VERSTECKT KEINEN RÜCKSTAND, und das war der Einwand gegen einen Ring an dieser Stelle: die Tiefe
+    // bleibt gedeckelt, gezählt wird jetzt nur die Summe aus "noch bei uns" und "geschätzt noch unter uns".
+    // Mehr als TPUART_TX_INTERFACE_BUFFER Bytes stecken damit nie zwischen Aufrufer und Leitung - dieselbe
+    // Zusage wie vorher, nur eingehalten.
+    uint8_t _txBuffer[TPUART_TX_INTERFACE_BUFFER] = {};
+    uint8_t _txCount = 0;
+
+    // Schiebt so viel wie möglich weiter, ohne je zu blockieren. Was nicht durchgeht, bleibt liegen und
+    // wird beim nächsten Tick erneut versucht - der Aufrufer merkt davon nichts, denn seine Reservierung
+    // rechnet die liegengebliebenen Bytes mit.
+    void pump()
+    {
+        while (_txCount > 0)
+        {
+            if (_reportsWriteSpace && _serial.availableForWrite() <= 0) return;
+            if (_serial.write(_txBuffer[0]) != 1) return;
+
+            for (uint8_t i = 1; i < _txCount; i++)
+                _txBuffer[i - 1] = _txBuffer[i];
+
+            _txCount--;
+
+            // Fahrplan fortschreiben: ist die Leitung noch belegt, hängt das Byte hinten dran, sonst
+            // beginnt es jetzt.
+            uint32_t now = micros();
+            if ((int32_t)(_lineBusyUntil - now) < 0) _lineBusyUntil = now;
+            _lineBusyUntil += _byteTimeUs;
+        }
+    }
 
     // Meldet die Serial-Klasse ihren freien Sendeplatz überhaupt? Festgestellt in begin(): unmittelbar
     // danach ist der Sendepuffer leer, eine funktionierende Implementierung MUSS dort also mehr als 0
@@ -80,6 +123,7 @@ class ArduinoSerial : public Abstract
         _byteTimeUs = baud > 0 ? (uint32_t)(11000000UL / baud) : 0;
         _lineBusyUntil = micros();
         _reportsWriteSpace = _serial.availableForWrite() > 0;
+        _txCount = 0; // was vor dem Neuaufsetzen liegenblieb, gehört zu einer anderen Baudrate
         _running = true;
     }
 
@@ -108,11 +152,16 @@ class ArduinoSerial : public Abstract
     }
 
     // Der Platz bis zur erlaubten Tiefe - nicht der freie Platz der Hardware. Siehe Klassenkommentar.
+    //
+    // GEZÄHLT WIRD BEIDES: was noch bei uns liegt und was geschätzt noch unter uns steckt. Nur so ist die
+    // Zahl eine Reservierung, die write() auch einhalten kann - siehe _txBuffer.
     size_t availableForWrite() override
     {
         if (!_running) return 0;
 
-        size_t pending = outstanding();
+        pump();
+
+        size_t pending = outstanding() + _txCount;
         if (pending >= TPUART_TX_INTERFACE_BUFFER) return 0;
 
         return TPUART_TX_INTERFACE_BUFFER - pending;
@@ -128,18 +177,16 @@ class ArduinoSerial : public Abstract
     {
         if (!_running) return false;
 
-        // Die Tiefenprüfung steht hier zusätzlich zu availableForWrite(): der Vertrag sagt zwar, dass der
-        // Aufrufer vorher fragt, aber die Zusage "nie mehr als so viel unter uns" soll nicht daran hängen,
-        // dass er das auch tut.
-        if (outstanding() >= TPUART_TX_INTERFACE_BUFFER) return false;
-        if (_reportsWriteSpace && _serial.availableForWrite() <= 0) return false;
-        if (_serial.write((uint8_t)value) != 1) return false;
+        pump();
 
-        // Fahrplan fortschreiben: ist die Leitung noch belegt, hängt das Byte hinten dran, sonst beginnt es
-        // jetzt.
-        uint32_t now = micros();
-        if ((int32_t)(_lineBusyUntil - now) < 0) _lineBusyUntil = now;
-        _lineBusyUntil += _byteTimeUs;
+        // DIE EINZIGE ABLEHNUNG, die es noch gibt, und sie hat der Aufrufer selbst zu verantworten: er hat
+        // nicht gefragt oder mehr geschrieben als zugesagt. Alles, was die eingepackte Klasse betrifft,
+        // wird gepuffert statt abgelehnt - deshalb kann eine Gruppe hier nicht mehr zerreissen.
+        if (outstanding() + _txCount >= TPUART_TX_INTERFACE_BUFFER) return false;
+
+        _txBuffer[_txCount++] = (uint8_t)value;
+
+        pump();
 
         return true;
     }
