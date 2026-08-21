@@ -48,6 +48,13 @@ DataLinkLayer::DataLinkLayer(Interface::Abstract &interface) : _interface(&inter
 // KOMPAT: ohne Interface - es kommt dann über begin(bcuType, interface).
 DataLinkLayer::DataLinkLayer() : _transmitter(*this), _receiver(*this) {}
 
+// Siehe Header: der Timer darf keinen Zeiger auf ein zerstörtes Objekt behalten. remove() ist billig, wenn
+// die Instanz nie eingetragen war - es prüft zuerst contains().
+DataLinkLayer::~DataLinkLayer()
+{
+    Timer::instance().remove(*this);
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Zeitkritische Seite - läuft später aus einem Timer-Interrupt
 // ---------------------------------------------------------------------------------------------------
@@ -113,12 +120,17 @@ void DataLinkLayer::begin(BcuType bcuType)
     // ohne das Zurücksetzen zählte sie beim ersten Tick danach als Verzögerung.
     _tickLastUs = 0;
 
-    // Der Antrieb darf sofort loslaufen, obwohl noch keine Verbindung steht: bis _everConnected gesetzt
-    // ist, kehrt tick() gleich wieder um und fasst das Interface nicht an - die Baudratensuche gehört dem
-    // Hauptkontext (siehe searchBaudRate). Schlägt der Start fehl oder kennt die Plattform keinen Timer,
-    // bleibt es beim Antrieb aus process(); gemeldet wird das nicht, weil hier noch kein
-    // Message-Callback gesetzt sein muss - hasTickDriver() gibt jederzeit Auskunft.
-    if (_tickIntervalUs > 0 && !_externalTick) _tickDriver.start(*this, _tickIntervalUs);
+    // OHNE NACHFRAGE: der Timer wird immer benutzt, einen Schalter je Instanz gibt es nicht. Der Antrieb
+    // darf sofort loslaufen, obwohl noch keine Verbindung steht - bis _everConnected gesetzt ist, kehrt
+    // tick() gleich wieder um und fasst das Interface nicht an; die Baudratensuche gehört dem Hauptkontext
+    // (siehe searchBaudRate).
+    //
+    // Schlägt das Eintragen fehl - keine Timer-Plattform, Intervall 0 oder alle Plätze belegt -, bleibt es
+    // beim Antrieb aus process(), und usesTimer() sagt es. Gemeldet wird das hier NICHT: zu diesem
+    // Zeitpunkt muss noch kein Message-Callback gesetzt sein, die Meldung ginge ins Leere. Sichtbar wird es
+    // trotzdem, denn checkTickRate() aus loop() schlägt an, sobald der Antrieb zu langsam ist - und genau
+    // darauf kommt es an.
+    Timer::instance().add(*this);
 }
 
 // KOMPAT: die alte Library bekam das Interface hier statt im Konstruktor.
@@ -128,42 +140,21 @@ void DataLinkLayer::begin(BcuType bcuType, Interface::Abstract *interface)
     begin(bcuType);
 }
 
-void DataLinkLayer::setTickInterval(uint32_t intervalUs)
+// DYNAMISCH beantwortet, nicht bei begin() festgeschrieben - siehe Header. Beide Teile müssen stimmen: der
+// Timer muss laufen UND diese Instanz muss eingetragen sein. Läuft er für eine andere Instanz, während für
+// diese kein Platz war, ist die Antwort für uns trotzdem "nein".
+bool DataLinkLayer::usesTimer() const
 {
-    _tickIntervalUs = intervalUs;
-
-    // Ein laufender Antrieb wird angehalten, aber nicht neu gestartet - sonst hinge an einer bloßen
-    // Zahlenänderung ein Wechsel des Ausführungskontextes mitten im Betrieb.
-    if (intervalUs == 0) _tickDriver.stop();
-}
-
-// Ein laufender Timer wird sofort angehalten - ab jetzt tickt der Aufrufer, und zwei Kontexte auf derselben
-// Schnittstelle sind ein Defekt, kein Nachteil. Dass _tickIntervalUs unangetastet bleibt, ist Absicht: der
-// Wert beschreibt die gewünschte Taktrate, _externalTick den Antrieb. Nur begin() fragt beide zusammen.
-void DataLinkLayer::setExternalTick(bool enabled)
-{
-    _externalTick = enabled;
-
-    if (enabled) _tickDriver.stop();
-}
-
-bool DataLinkLayer::hasTickDriver() const
-{
-    return _tickDriver.running();
-}
-
-uint32_t DataLinkLayer::tickInterval() const
-{
-    return _tickIntervalUs;
+    return Timer::instance().running() && Timer::instance().contains(*this);
 }
 
 // KOMPAT: Gegenstück zu begin(). Das Interface wird geschlossen, aber NICHT freigegeben - es gehört dem
 // Aufrufer.
 void DataLinkLayer::end()
 {
-    // ZUERST den Antrieb anhalten: danach ist garantiert kein tick() mehr unterwegs, der gleich in ein
-    // geschlossenes Interface greifen würde.
-    _tickDriver.stop();
+    // ZUERST austragen: Timer::remove() kehrt erst zurück, wenn garantiert kein tick() mehr für diese
+    // Instanz unterwegs ist - einer, der gleich in ein geschlossenes Interface greifen würde.
+    Timer::instance().remove(*this);
 
     _initialized = false;
     _connected = false;
@@ -171,12 +162,28 @@ void DataLinkLayer::end()
     if (_interface != nullptr) _interface->end();
 }
 
-// KOMPAT: ein Einstieg für beide Hälften, wie in der alten Library. Der Tick kommt nur dann von hier, wenn
-// ihn sonst niemand antreibt - weder der eigene Timer noch ein externer Antrieb (setExternalTick). Beides
-// wäre ein zweiter Kontext in derselben State-Machine, und der zerlegt Sende- wie Empfangsstrom.
+// KOMPAT: ein Einstieg für beide Hälften, wie in der alten Library.
+//
+// GETICKT WIRD HIER NUR, WENN DER TIMER GEWOLLT IST, ABER NICHT LÄUFT. Beide Teile der Bedingung tragen,
+// und die Reihenfolge, in der man sie liest, ist der ganze Punkt:
+//
+// HIER WIRD NICHT GETICKT. NIE. Der Hauptloop ist kein Antrieb für tick() - das ist eine ausdrückliche
+// Festlegung des Anwenders und keine Auslegungsfrage.
+//
+// Der Grund steht im Klassenkommentar: tick() bewegt ein Byte je Richtung und Aufruf, der Durchsatz und die
+// 2,8ms-Quittungsfrist hingen also an der Loopfrequenz einer fremden Anwendung. Genau das war der Zustand,
+// der im Router 457 Ticks/s statt 2000 ergab und 12% der Quittungen gekostet hat. Ein Rückfall auf den
+// Hauptloop macht diesen Zustand zum stillen Normalfall - er sieht aus wie "es läuft", und niemand erfährt,
+// dass der Antrieb fehlt.
+//
+// DER ANTRIEB IST DER TIMER, oder Timer::trigger() aus einem Kontext, den der Aufrufer selbst stellt. Gibt
+// es beides nicht, tickt nichts, und das ist die richtige Antwort: eine Plattform ohne Timer braucht eine
+// Entscheidung des Entwicklers, keine stillschweigende Notlösung.
+//
+// process() bleibt als KOMPAT-Einstieg der alten Library und ruft nur noch loop(). Für einen Aufrufer mit
+// laufendem Timer ändert das nichts - dort tat process() schon vorher nichts anderes.
 void DataLinkLayer::process()
 {
-    if (!_tickDriver.running() && !_externalTick) tick();
     loop();
 }
 
@@ -457,11 +464,11 @@ void DataLinkLayer::loop()
 // DER ANTRIEB ÜBERWACHT SICH SELBST, und das ist die Lehre aus einem Fehler, der Stunden gekostet hat: die
 // Taktrate war zu niedrig, und das zeigte sich AUSSCHLIESSLICH als Folgeschaden - unterdrückte Quittungen,
 // Rückstand im Interface. Die Ursache stand nirgends, sie war nur auf ausdrückliche Nachfrage über
-// hasTickDriver() zu erfahren, und danach fragt im Betrieb niemand.
+// usesTimer() zu erfahren, und danach fragt im Betrieb niemand.
 //
 // GEMESSEN WIRD DIE ERREICHTE RATE, nicht die eingestellte. Damit gilt der Wächter für JEDEN Antrieb - den
-// eigenen Timer, einen externen Tick und den Hauptloop - und er misst das, was tatsächlich passiert, statt
-// das, was gemeint war. Ein Wächter auf hasTickDriver() hätte genau den Fall verfehlt, in dem jemand
+// den zentralen Timer, einen selbst gebauten Antrieb und den Hauptloop - und er misst das, was tatsächlich passiert, statt
+// das, was gemeint war. Ein Wächter auf usesTimer() hätte genau den Fall verfehlt, in dem jemand
 // absichtlich selbst tickt und dabei zu langsam ist.
 //
 // DIE SCHWELLE KOMMT AUS DEM BUS, nicht aus der Konfiguration, und deshalb ist sie keine Geschmacksfrage:

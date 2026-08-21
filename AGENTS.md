@@ -64,7 +64,7 @@ Implementierungen, alle bisher ausgebaut:
   9600 Baud, gegen einen 500µs-Tick - und das schließt das Echo unseres eigenen Versands ein
   (263 Oktetts gemessen als ~355ms, also Busgeschwindigkeit, nicht Host-Geschwindigkeit). Nur
   Steuerbytes kommen im Takt der Host-Strecke, und sie kommen zu zweit, nicht zu Hunderten.
-  Die Zeichenzeit des Hosts ist die Grenze der *Schreib*seite (siehe `TickDriver`). Und selbst
+  Die Zeichenzeit des Hosts ist die Grenze der *Schreib*seite (siehe `Timer`). Und selbst
   wenn der Tick zurückfällt, meldet `available()` weiterhin den Rückstand, es wird also keine
   Stille vorgetäuscht und kein Frame zerschnitten: die Quittung kommt lediglich zu spät und
   wird unterdrückt - eingeschränkte Funktion, ehrliche Daten. Ein stapelndes Interface
@@ -321,20 +321,53 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   *neuer* als das bereits eingefrorene `now`; die vorzeichenlose Differenz läuft auf ~4,29
   Milliarden über und die Frist schlägt sofort zu. Das erzeugte im IP-Router eine Flut unechter
   `BCU disconnected`-Meldungen, nur unter Last (bei 38400 Baud landet alle ~286µs ein Byte in
-  diesem Fenster) und unmöglich vor dem `TickDriver`, als beide Hälften in einem Kontext liefen.
+  diesem Fenster) und unmöglich vor dem `Timer`, als beide Hälften in einem Kontext liefen.
   Die Regel: **erst den Zeitstempel lesen, dann die Uhr**, und trotzdem als `int32_t` vergleichen -
   der Tick kann gleich danach erneut schreiben, und ein leicht vorauseilender Zeitstempel bedeutet
   "gerade eben", nicht "vor Ewigkeiten". Jeder andere Zeitvergleich der Library bleibt innerhalb
   eines Kontexts (`_awaitSince`, `_emptySince`, `_detectRequestSentAt` im Tick;
   `_lastStateRequestAt`, `_lastBusLoadTime`, der Wiederholungsfilter im Hauptkontext); die beiden
   `_detectNextAttemptAt`-Prüfungen waren bereits vorzeichenbehaftet.
-- **Die Library treibt `tick()` selbst an** (`TickDriver.{h,cpp}`, gestartet aus `begin()`,
-  gestoppt in `end()`, Vorgabe 500µs). Das gibt es, weil `tick()` **ein Byte je Richtung und
+- **Die Library treibt `tick()` selbst an** (`Timer.{h,cpp}`, eingetragen aus `begin()`, ausgetragen
+  in `end()`, Vorgabe 500µs). Das gibt es, weil `tick()` **ein Byte je Richtung und
   Aufruf** bewegt: aus einem Host-`loop()` getrieben hängen Durchsatz und die 2,8ms-Quittungsfrist
   beide an der Loopfrequenz der Anwendung. In der echten Firmware gemessen, wo der knx-Wrapper
   `process()` einmal je Durchlauf ruft, reichte das nicht.
+  **`TPUart::Timer` ist ein SINGLETON - ein Timer für alle BCUs**, und das ist keine Stilfrage. Die
+  Library unterstützt mehrere BCUs an einem Gerät, und ein Timer je Instanz trägt das nicht: der RP2040
+  hat genau **vier** Hardware-Alarme (`NUM_ALARMS`), von denen der Default-Pool einen belegt - noch im
+  Runtime-Init, also vor `main()`, weshalb unser `claimOwnPool()` ihm nichts wegnehmen kann und nichts
+  abstürzt. Frei sind damit drei, und die vierte Instanz fiel **stillschweigend** auf den Default-Pool
+  zurück: Priorität 0x80 statt 0x40, serialisiert mit fremden Callbacks - genau der Zustand, dessen
+  Beseitigung den eigenen Pool überhaupt gerechtfertigt hat, und nichts meldete es.
+  Getrennte Timer brächten auch nichts ein: mehrere Alarme auf 0x40 verdrängen sich **nicht** gegenseitig
+  (gleiche Priorität verdrängt nicht), sie serialisieren genauso wie ein gemeinsamer Timer - nur
+  unvorhersehbar statt in fester Reihenfolge.
+  Der Preis ist, dass die Ticks aller Instanzen hintereinander in **einem** Aufruf laufen. Gemessener
+  Höchstwert eines einzelnen Ticks: 660µs, davon 269µs im Quittungs-Callback des Aufrufers; Median 1-2µs.
+  Drei Instanzen im schlimmsten Fall wären also rund 2ms gegen ein Quittungsfenster von 2,8ms - praktisch
+  unkritisch, aber `getTickDurationMaxUs()` gibt es weiterhin **je `DataLinkLayer`**, damit es sichtbar
+  bleibt.
+  **`TPUART_TIMER_MAX_CLIENTS` ist 1**, weil eine BCU der Normalfall ist; zwei oder drei kosten ein `-D`.
+  Der Grund ist **nicht** die Laufzeit - hier stand einmal, ein größeres Array belaste den heißesten Code,
+  und das war überzogen: vier Plätze sind grob 25 Takte von den 66.500, die bei 133MHz in einem 500µs-Tick
+  stecken, also 0,04%. Der Grund ist, dass eine Grenze sichtbar sein soll: wer eine zweite BCU anschließt,
+  schreibt das einmal ausdrücklich hin.
+  Ist kein Platz frei, wird die Instanz **abgewiesen** und die bereits eingetragene läuft weiter.
+  **Der Fehlfall ist laut**, und das trägt die Entscheidung: die abgewiesene Instanz wird gar nicht
+  getickt, `checkTickRate()` sieht in ihrem `loop()` null Ticks im Fenster und meldet
+  `Tick stopped - no tick in ... ms`; die Konsole zeigt zusätzlich `(no slot)`. Ein vergessenes `-D` fällt
+  damit binnen zwei Sekunden auf. Dass dieser Zweig existiert, war übrigens Glück und nicht Absicht - er ist
+  da, weil `delta == 0` sonst eine Division durch null wäre.
+  **Das Verzeichnis ist plattformunabhängig, nur der Timer ist es nicht**: `add()` trägt auch dort ein, wo
+  `supported()` falsch ist, und nur der Rückgabewert sagt, ob wirklich getickt wird. Ohne diese Trennung
+  wäre die Buchführung im nativen Testlauf gar nicht prüfbar.
+  **Der Destruktor des `DataLinkLayer` trägt aus**, und das ist kein Schmuck: der Timer hält einen
+  *Zeiger*, und der überlebte die Instanz sonst - der nächste Tick liefe in freigegebenen Speicher, auf dem
+  RP2040 aus einem Interrupt. `end()` zu verlangen genügt nicht, weil niemand verpflichtet ist, es vor dem
+  Wegwerfen zu rufen. `test_timer_slot_is_released_on_destruction` hält das fest (mutationsgeprüft).
   - **Die Vorgabe ist 500µs, und auf manchen Interfaces sollte ein Gerät, das viel sendet, sie
-    senken** (`-D TPUART_TICK_INTERVAL_US=…`). Zum Empfangen ist 500µs bequem (der Bus liefert
+    senken** (`-D TPUART_TIMER_INTERVAL_US=…`). Zum Empfangen ist 500µs bequem (der Bus liefert
     höchstens alle 1,354ms ein Byte), aber **Senden kann die Leitung aushungern**, und das ist
     gemessen, nicht geraten. Die sendende Hardware ist flach: der RP2040-UART läuft mit
     abgeschaltetem FIFO (die DMA will jedes empfangene Byte sofort), er hält also genau zwei Bytes -
@@ -363,7 +396,7 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
     **Er hängt in einem EIGENEN Alarmpool, nicht im Vorgabepool**, und das aus zwei Gründen, die beide
     gemessen sind: die Callbacks *eines* Pools laufen aus einem gemeinsamen IRQ-Handler und damit
     serialisiert, und nur ein eigener Pool hat einen eigenen Hardware-Alarm, dessen Priorität sich
-    anheben lässt. Sie steht auf `TPUART_RP2040_TICK_IRQ_PRIORITY` (0x40) statt auf den 0x80, die das SDK
+    anheben lässt. Sie steht auf `TPUART_RP2040_TIMER_IRQ_PRIORITY` (0x40) statt auf den 0x80, die das SDK
     beim Hochlauf jedem IRQ gibt.
     **Der Grund dafür ist eine Feinheit des Cortex-M, die leicht falsch erinnert wird**: ein Interrupt
     verdrängt dort sehr wohl einen anderen (dafür steht das N in NVIC), aber **nur bei echt höherer
@@ -389,19 +422,37 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
     `uart_write_bytes()` nimmt einen Treiber-Mutex. Bewusst auch kein festgenagelter Task mit
     `delayMicroseconds()` (so machte es das frühere Diagnosewerkzeug): das kostet einen ganzen Kern,
     und auf einem echten Gerät trägt Kern 0 WLAN und Bluetooth.
-  - **Sonst überall**: `TickDriver::supported()` ist falsch, `start()` scheitert, der Aufrufer
-    bleibt beim `process()`-Antrieb.
-  - **Genau ein Antrieb zur selben Zeit**, und es gibt zwei Stellschrauben, weil es zwei Fragen
-    gibt. `setTickInterval(0)` schaltet den *eigenen Timer der Library* ab - `process()` tickt dann
-    wieder aus dem Hauptloop, was ein Aufrufer will, der den Takt selbst in der Hand behalten
-    möchte. `setExternalTick(true)` sagt, dass *jemand anders `tick()` ruft* - aus einem Task, einem
-    fremden Timer oder vom zweiten Kern - und dann tickt `process()` gar nicht und `begin()` startet
-    keinen Timer.
-    **Die beiden zu verwechseln ist ein Defekt, keine Unbequemlichkeit**: `tick()` aus `loop1()` zu
-    treiben, während `process()` noch auf Kern 0 tickt, setzt zwei Leser und zwei Schreiber auf
-    einen UART. Im IP-Router ausprobiert, und der Chip meldete es sofort - `Unknown control byte`
-    für die gestohlenen Empfangsbytes, `PE` (Protokollfehler) in `U_State.ind` für die halbierten
-    Sequenzen. `hasTickDriver()` meldet, ob der eigene Timer der Library am Ende läuft.
+  - **Sonst überall**: `Timer::supported()` ist falsch und der Timer startet nicht. Dann tickt **nichts**,
+    bis der Aufrufer `Timer::trigger()` aus einem eigenen Kontext ruft - einen Rückfall gibt es nicht, siehe
+    den nächsten Punkt.
+  - **DER HAUPTLOOP TICKT NIE.** `process()` ruft ausschließlich `loop()`. Das ist eine ausdrückliche
+    Festlegung des Anwenders und keine Auslegungsfrage - und sie ist die Lehre aus dem Fall, der diese
+    ganze Messung ausgelöst hat: aus dem Hauptloop getrieben lief der Router mit 457 Ticks/s statt 2000 und
+    verlor 12% der Quittungen. Ein Rückfall auf den Hauptloop macht genau diesen Zustand zum **stillen
+    Normalfall** - er sieht aus wie "es läuft", und niemand erfährt, dass der Antrieb fehlt. Fehlt der
+    Timer, tickt lieber nichts: das verlangt eine Entscheidung des Entwicklers statt einer Notlösung.
+  - **KEINE STELLSCHRAUBE JE INSTANZ.** Der Timer wird immer benutzt, `begin()` trägt die Instanz ohne
+    Nachfrage ein, `end()` und der Destruktor tragen sie aus. Es gab dafür zwischenzeitlich ein
+    `setUseTimer(bool)`, und es ist bewusst wieder weg: ein Schalter mit der Bedeutung "ich mache es
+    selbst" ist genau die Zuständigkeitsübergabe, die niemand nachlesen kann - und was `process()` dann
+    tun soll, war für jeden Leser eine andere Antwort. Ebenso weg ist `setTickInterval()` an der Instanz:
+    das Intervall ist global, und eine Methode am Objekt, die alle Instanzen umstellt, wäre eine Falle.
+    **Was bleibt, ist genau zweierlei**: `Timer::setInterval(0)` hält den Takt an, und `Timer::trigger()`
+    treibt ihn von Hand. Wer beides kombiniert - Timer läuft UND jemand ruft `trigger()` -, hat zwei
+    Tick-Kontexte auf einer Schnittstelle. Im IP-Router ausprobiert (Kern 0 gegen Kern 1), und der Chip
+    meldete es sofort: `Unknown control byte` für die gestohlenen Empfangsbytes, `PE` (Protokollfehler) in
+    `U_State.ind` für die halbierten Sequenzen.
+    `usesTimer()` meldet, ob **diese** Instanz vom Timer getickt wird, **dynamisch** und nicht bei
+    `begin()` festgeschrieben (der Timer kann später anlaufen, wenn eine andere Instanz ihren Platz
+    freigibt). Es ist der einzige Diagnosewert zum Antrieb, und er ist wichtiger als er aussieht: liefert
+    er falsch, ohne dass jemand `trigger()` ruft, steht die Schicht still - und das sieht von außen aus wie
+    "die BCU antwortet nicht".
+  - **`Timer::trigger()` treibt den Takt von Hand** - ein `tick()` je eingetragener Instanz, genau das,
+    was der plattformeigene Callback tut. Das ist der **einzige** Weg neben dem Timer, und damit die
+    Antwort auf "Plattform ohne Timer-Unterstützung": kein Rückfall, sondern ein ausdrücklicher Aufruf aus
+    einem Kontext, den der Entwickler selbst stellt. Es gilt dieselbe Anforderung wie an den
+    Callback: der Kontext muss dürfen, was `tick()` tut - auf dem ESP32 also kein ISR, weil
+    `uart_write_bytes()` einen Mutex nimmt.
   - **Der Timer-Antrieb gibt eine Zusage, die zwei Kerne nicht geben.** Ein Interrupt läuft immer zu
     Ende und wird nie vom Hauptloop verdrängt, `tick()` und `loop()` konnten sich also nie
     verschränken. Mit `tick()` auf Kern 1 ist das weg. Die SPSC-Ringe überstehen es (der Kopf wird
@@ -656,16 +707,16 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   darin unterscheidet sich `abort()` von `restart()`, das nach einem Reset von vorn beginnt. Und eine
   eingefrorene Warteschlange ginge beim Verlassen auf einen Schlag hinaus, mit Telegrammen, die dann
   längst überholt sind.
-  **Es läuft im Tick, und daran hängt die Korrektheit gleich zweifach.** `_txState` behält einen
-  Schreiber - aus dem Hauptkontext kollidierte es mit `confirmed()`/`echoReceived()` aus dem
-  Empfangspfad. Und `_queueTail` ebenso: der naheliegende Weg, den Hauptkontext die Warteschlange
-  leeren zu lassen, weil dort der Heap zu Hause ist, **war ein Wettlauf und wurde zurückgenommen** -
-  er müsste `_queueTail` schreiben, und die Bedingung dafür ("im Busmonitor fasst der Tick die
-  Warteschlange nicht an") kann der Tick zwischen Prüfung und Schreiben aufheben, indem eine
-  `U_Reset.ind` eintrifft und `_busMonitor` löscht. Auf dem ESP32 läuft der Tick echt parallel, das
-  ist also kein reines Verdrängungsproblem. `abort()` zieht deshalb nur `_queueTail` bis an
-  `_queueHead` vor; freigegeben wird der Heap wie immer aus `loop()`, für das die übersprungenen
-  Einträge wie abgeholte aussehen.
+  **`abort()` läuft im Tick und verwirft dort NUR DIE VORLAGE**, nicht die Warteschlange. Das ist die
+  Aufteilung, die den früheren Wettlauf auflöst: `_txState` behält einen Schreiber (aus dem Hauptkontext
+  kollidierte es mit `confirmed()`/`echoReceived()` aus dem Empfangspfad), und die **Warteschlange gehört
+  dem Hauptkontext allein** - geräumt wird sie in `stageNextTelegram()`, das im Busmonitor `clear()` ruft.
+  Hier stand einmal, `abort()` ziehe `_queueTail` bis an `_queueHead` vor und der Heap werde aus `loop()`
+  freigegeben. Beides beschreibt den ersetzten Entwurf: es gibt weder `_queueTail`/`_queueHead` noch Heap
+  im Datenpfad, die Sendequeue ist ein linearer Bytepuffer (`TransmitQueue`). **Den Tick dort schreiben zu
+  lassen wäre ein echter Fehler** - er fasste `_head` und `_end[]` an, die der Hauptkontext in `push()`
+  und `compact()` ebenfalls schreibt, auf dem ESP32 echt parallel. Der Puffer liefe auseinander, und
+  `front()` gäbe eine falsche Länge zurück.
   **Busmon an heißt Busy aus, und Auto-Quittung aus.** Der Chip nimmt im Modus keine Telegramme mehr
   an und quittiert nichts; ein Busy-Modus, der das Quittieren nur ersetzt, kann es dort nicht geben,
   und heraus kommt man ohnehin nur per Reset. Der Zustand ist also nicht unbekannt, sondern bekannt
@@ -1076,7 +1127,7 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   Folgen - unterdrückte Quittungen, Interface-Überläufe -, und die Ursache musste geraten werden.
   Die Werte trennen verschiedene Krankheitsbilder, und erst zusammen ergeben sie eine Diagnose:
   - `getTicks()` gegen die Laufzeit ist die **mittlere** Rate. Deutlich unter dem eingestellten Soll
-    heißt: der eigene Antrieb läuft gar nicht, der Hauptloop tickt - dasselbe sagt `hasTickDriver()`.
+    heißt: der Timer treibt diese Instanz gar nicht, der Hauptloop tickt - dasselbe sagt `usesTimer()`.
   - `getTickDeferrals()` sagt, **wie oft** der Tick aufgehalten wurde (Schwelle
     `TPUART_TICK_DEFERRED_US`, die Zeichenzeit des Busses), `getTickLastDeferredUs()`, **wie lang die
     letzte** dauerte. Ein guter Mittelwert bei vorhandenen Verzögerungen heißt: der Antrieb stimmt, wird
@@ -1105,18 +1156,18 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   `begin()` ist kein Aussetzer des Antriebs, und ohne das Zurücksetzen stünde sie für immer als
   Höchstwert da, ausgerechnet auf einem Gerät, das die BCU neu verbindet (`test_tick_gap_survives_restart`).
   `DataLinkLayer::tickInterval()` liefert dazu das **eingestellte** Soll. Die drei Auskünfte sind
-  bewusst getrennt: `hasTickDriver()` sagt, *wer* tickt, `tickInterval()`, wie schnell es *gedacht* war,
+  bewusst getrennt: `usesTimer()` sagt, *wer* tickt, `Timer::interval()`, wie schnell es *gedacht* war,
   und `getTicks()`, was daraus *geworden* ist.
 - **Und der Antrieb meldet sich selbst, wenn er die Untergrenze reißt** (`checkTickRate()`, aus `loop()`,
   Fenster `TPUART_TICK_RATE_WINDOW_MS` = 2000). Das ist die Lehre aus dem Fall, der diese ganze Messung
   ausgelöst hat: im Router lag die Rate bei 457/s statt 2000/s, und **sichtbar war davon ausschließlich der
   Folgeschaden** - 12% unterdrückte Quittungen und ein Rückstand von 7 Byte. Die Ursache stand nirgends;
-  sie war nur auf ausdrückliche Nachfrage über `hasTickDriver()` zu erfahren, und danach fragt im Betrieb
+  sie war nur auf ausdrückliche Nachfrage über `usesTimer()` zu erfahren, und danach fragt im Betrieb
   niemand. Nach dem Umschalten auf den eigenen Timer: 0 unterdrückte Quittungen, unverändert am
   Protokollpfad.
   Zwei Entwurfsentscheidungen daran sind tragend:
-  - **Gemessen wird die ERREICHTE Rate, nicht die eingestellte.** Ein Wächter auf `hasTickDriver()` hätte
-    genau den Fall verfehlt, in dem jemand absichtlich selbst tickt (`setExternalTick`) und dabei zu langsam
+  - **Gemessen wird die ERREICHTE Rate, nicht die eingestellte.** Ein Wächter auf `usesTimer()` hätte
+    genau den Fall verfehlt, in dem jemand absichtlich selbst tickt (`Timer::trigger()`, eigener Task) und dabei zu langsam
     ist - und das war hier fast der Fall.
   - **Die Schwelle kommt aus dem Bus, nicht aus der Konfiguration**: `TPUART_TICK_DEFERRED_US` ist 1354, die
     Zeichenzeit auf TP1. Ein Tick bewegt ein Byte je Richtung; liegt der mittlere Abstand darüber, holt die
@@ -1132,7 +1183,7 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   verschiedene Ursachen, die sich im blossen Höchstwert nicht unterscheiden ließen - erst
   `getTickDeferrals()` hat sie getrennt:
   - **Dauerhaft, 2-4 mal je Sekunde**: ein gleichrangiger Interrupt auf 0x80. Behoben durch den eigenen
-    Alarmpool mit angehobener Priorität (siehe `TickDriver`), Ergebnis 0 Verzögerungen über 26000 Ticks bei einem
+    Alarmpool mit angehobener Priorität (siehe `Timer`), Ergebnis 0 Verzögerungen über 26000 Ticks bei einem
     Höchstwert von 520µs gegen 500µs Intervall.
   - **Einmalig und riesig**: ein Flash-Schreibvorgang. **Auf BEIDEN Plattformen gemessen** - RP2040
     53176µs, ESP32 40033µs -, es ist also keine Eigenheit des einen Ports. Der Mechanismus unterscheidet
@@ -1626,7 +1677,7 @@ Plattform. Ein Fall, der nativ besteht, kann auf Hardware knapp scheitern. **Vor
 die Hardwareläufe.**
 Möglich ist das **ohne eine Zeile Änderung in `src/`**: die Library benutzt aus Arduino nur `millis()`
 und `micros()`, und die plattformgebundenen Teile schalten sich über ihre eigenen
-`ARDUINO_ARCH_*`-Klammern selbst ab (`Interface/RP2040.cpp`, `ESP32.cpp`, und `TickDriver.cpp` hat
+`ARDUINO_ARCH_*`-Klammern selbst ab (`Interface/RP2040.cpp`, `ESP32.cpp`, und `Timer.cpp` hat
 einen `#else`-Zweig, der `supported()` auf `false` setzt). Den Ersatz liefert
 `test/test_tpuart/native/Arduino.h`; nur diese Env nimmt den Ordner über `-I` in den Suchpfad, in den
 Hardware-Envs liegt das echte `Arduino.h` davor.
@@ -1676,17 +1727,23 @@ Sammlung auch unbeaufsichtigt läuft); ohne das fehlt der erste Fall regelmäßi
 Lauf hält `loop()` die Verbindung offen und nimmt zwei Tasten entgegen: `r` fährt die Sammlung erneut,
 `b` setzt den RP2040 in den Bootloader.
 
-**Alle drei Umgebungen sind verifiziert**, nicht nur gebaut: 83 von 83 auf `pico_test` (~24s) und
-dieselben 83 auf `esp32_test` (~34s), beide auf echter Hardware, dazu `native_test` (~1,5s). Da die
+**Alle drei Umgebungen sind verifiziert**, nicht nur gebaut: 96 von 96 auf `pico_test` und dieselben
+96 auf `esp32_test` (~39s), beide auf echter Hardware, dazu `native_test` (~1,5s). Da die
 Fälle echte Fristen ausmessen, ist gerade die Übereinstimmung über zwei sehr verschiedene Uhren und
-Treiberpuffer hinweg das Interessante am Ergebnis.
+Treiberpuffer hinweg das Interessante am Ergebnis - besonders bei den Buslast-Fällen, deren Schranken
+an einer Messspanne von rund 1000ms hängen: nativ ist die deterministisch, auf Hardware nicht.
+**WAS DIE SAMMLUNG NICHT PRÜFT, ist der Antrieb selbst.** Die Vorrichtung hält `Timer::setInterval(0)`,
+getickt wird ausschließlich aus `pump()`/`tickOnly()`. Geprüft ist damit die Buchführung des Timers
+(Eintragen, Austragen, Plätze, Intervall) - dass der Hardware-Timer wirklich mit dem eingestellten Takt
+feuert, belegt nur der Betrieb auf einem Gerät. Für das Singleton steht dieser Nachweis noch aus; die
+Messungen mit 0 Verzögerungen über 26000 Ticks stammen vom vorherigen, instanzeigenen Antrieb.
 **Der native Lauf ersetzt die beiden Hardwareläufe trotzdem nicht**, und dafür gibt es jetzt einen
 Beleg statt einer Vermutung: er war grün, als `pico_test` rot war, und konnte den Fehler prinzipiell
 nicht sehen - dort hängt die Uhr an den Schleifendurchläufen und nicht an der Wanduhr, eine teure
 Testvorrichtung kostet also nichts (siehe die Zustellkosten weiter unten).
 
 **Die Testvorrichtung muss billig zustellen, sonst verfälscht sie Zeitmessungen.** Mit
-`setTickInterval(0)` laufen Tick und Loop serialisiert: was der Telegramm-Callback kostet, liegt
+angehaltenem Timer laufen Tick und Loop serialisiert: was der Telegramm-Callback kostet, liegt
 zwischen dem Tick, der das letzte Byte einer Sequenz verbraucht, und dem nächsten, der die Leere
 bemerkt und `_emptySince` setzt - die Zustellkosten verschieben also die Pausenerkennung nach hinten.
 `_frames` wuchs während eines Falls um und kopierte dabei jeden Eintrag samt Datenvektor neu;
@@ -1738,7 +1795,8 @@ Sekunden. Geprüft wird damit der Mechanismus, nicht die Zahl.
 Jeder Fall bekommt eine **frische Vorrichtung** (`Dummy` + `DataLinkLayer`, auf dem Heap in
 `setUp()`/`tearDown()`), weil `RxState`/`TxState` von außen nicht zurücksetzbar sind - ein
 liegengebliebener Resync sickerte sonst in den nächsten Fall. Die Vorrichtung setzt
-`setTickInterval(0)`, damit kein Timer nebenher läuft und `process()` synchron tickt. Einen Fall
+`Timer::setInterval(0)`, damit kein Timer nebenher läuft; getickt wird ausschließlich aus `pump()` bzw.
+`tickOnly()`. Einen Fall
 hinzuzufügen heißt, eine parameterlose Funktion zu schreiben und sie mit `RUN_TEST()` in `setup()`
 aufzuführen - diese Liste ist die einzige Stelle, die von ihm weiß.
 
@@ -1774,8 +1832,7 @@ Oberfläche fest. Drei Gruppen, und nur die erste ist schuldenfrei:
 2. **Im Code mit `KOMPAT` markiert, entfernbar, sobald die Verbraucher nachgezogen sind.** Doppelte
    Schreibweisen (`isMonitoring()`, `registerReceivedFrame()`, `getBcuStateInfo()`, `BcuType::BCU_*`,
    `AcknowledgeType`/`ACK_*`, `Statistics::getRxDiscardedBytes()` und Verwandte) und zusätzliche
-   Einstiegspunkte (`DataLinkLayer()` ohne Interface plus `begin(type, interface*)`, `process()` =
-   `tick()` + `loop()`, `end()`, `pushTransmitQueue(Frame*)`, das bei Erfolg den Besitz übernimmt und
+   Einstiegspunkte (`DataLinkLayer()` ohne Interface plus `begin(type, interface*)`, `process()` - heute nur noch `loop()`, früher `tick()` + `loop()` -, `end()`, `pushTransmitQueue(Frame*)`, das bei Erfolg den Besitz übernimmt und
    die Länge um eins kürzt, weil die Library die Prüfsumme selbst rechnet) und `Frame(const char*,
    size_t)`.
 3. **Platzhalter aus der Zeit des SearchBuffers**, den es hier nicht mehr gibt.
@@ -1798,6 +1855,10 @@ war und der Bau des Verbrauchers die eigentliche Prüfung ist. Wie leicht es pas
 Fund, den es dort gab: OFM-Network war gar nicht erfasst, bis der IP-Router zum ersten Mal gegen diese
 Library gebaut wurde - und die Signatur von `data()` brach sofort.
 **Baue nach einer Änderung an der Oberfläche einen Verbraucher, bevor du sie für fertig hältst.**
+Der schnellste ist **`OAM-TestApp`**: dort liegen die OpenKNX-Repositories als relative Symlinks in `lib/`,
+diese Library gehört als `lib/tpuart -> ../../tpuart` dazu (unter Windows `mklink /D`, und relativ wie die
+übrigen Einträge). Damit übersetzt ein Bau der TestApp `knx`, `OGM-Common` und `OFM-Network` gegen den
+Arbeitsstand hier - genau die drei Verbraucher, deren Aufrufe die Gruppen 2 und 3 festlegen.
 
 ## Fehler, die hier schon einmal gemacht wurden
 

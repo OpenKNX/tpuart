@@ -80,7 +80,7 @@ struct Fixture
 
     Fixture() : _dll(_interface)
     {
-        // DIE ZUSTELLUNG MUSS BILLIG SEIN, und das ist keine Kosmetik. Mit setTickInterval(0) laufen Tick
+        // DIE ZUSTELLUNG MUSS BILLIG SEIN, und das ist keine Kosmetik. Ohne laufenden Timer laufen Tick
         // und Loop serialisiert: was der Callback kostet, liegt zwischen dem Tick, der das letzte Byte einer
         // Sequenz verbraucht, und dem nächsten, der die Leere bemerkt und _emptySince setzt. Diese Kosten
         // verschieben also die Pausenerkennung nach hinten.
@@ -92,9 +92,14 @@ struct Fixture
         _frames.reserve(64);
         _errors.reserve(32);
 
-        // KEIN eigener Takt: process() führt den Tick dann synchron aus, und jeder Fall bestimmt selbst,
-        // wann wie oft getickt wird. Muss vor begin() stehen, sonst startet dort der Timer.
-        _dll.setTickInterval(0);
+        // KEIN LAUFENDER TIMER: das Intervall ist global, 0 hält ihn an. Getickt wird dann ausschließlich
+        // aus pump()/tickOnly(), jeder Fall bestimmt also selbst, wann wie oft. Nativ wäre das ohnehin so
+        // (Timer::supported() ist dort falsch), auf der Hardware nicht: dort liefe sonst ein echter Timer
+        // nebenher und tickte gegen die Fälle an - zwei Kontexte auf einem Interface.
+        //
+        // Die Instanz wird von begin() trotzdem eingetragen - das Verzeichnis ist plattformunabhängig, nur
+        // der Takt nicht. Ausgetragen wird sie vom Destruktor, jeder Fall fängt also sauber an.
+        Timer::instance().setInterval(0);
 
         _dll.registerFrameCallback([this](Frame &frame) {
             CapturedFrame captured;
@@ -129,24 +134,31 @@ struct Fixture
     // Schleife kommt. Damit misst die Sammlung dort tatsächliche Fristen - das ist ihr eigentlicher Wert.
     //
     // NATIV gibt es keine echte Zeit, also wird sie gestellt: die Uhr rückt in festen Schritten vor, und
-    // zwischen zwei Schritten läuft ein process(). Die Schrittweite IST damit die Tickrate. 50µs liegen
+    // zwischen zwei Schritten läuft ein tick()/loop()-Paar. Die Schrittweite IST damit die Tickrate. 50µs liegen
     // deutlich unter dem 500µs-Vorgabetakt der Library und weit unter der Bytezeit des Busses (1354µs),
     // die Pausenerkennung sieht also feiner auf als auf jeder echten Plattform - was Fälle durchgehen
     // lässt, die auf der Hardware knapp scheitern würden. Der native Lauf prüft die Protokolllogik, nicht
     // das Zeitverhalten.
+    // TICK UND LOOP AUSDRÜCKLICH, nicht über process(): process() tickt NICHT (der Hauptloop ist kein
+    // Antrieb, siehe DataLinkLayer::process()). Hier steht damit genau das, was im echten Gerät der Timer
+    // und der Hauptloop zusammen tun - nur serialisiert, damit jeder Fall die Reihenfolge in der Hand hat.
     void pump(uint32_t ms)
     {
 #ifdef ARDUINO
         uint32_t until = millis() + ms;
         while ((int32_t)(millis() - until) < 0)
-            _dll.process();
+        {
+            _dll.tick();
+            _dll.loop();
+        }
 #else
         constexpr uint32_t STEP_US = 50;
 
         for (uint32_t elapsed = 0; elapsed < ms * 1000; elapsed += STEP_US)
         {
             tpuartNativeClockUs() += STEP_US;
-            _dll.process();
+            _dll.tick();
+            _dll.loop();
         }
 #endif
     }
@@ -194,12 +206,17 @@ struct Fixture
     void connect(BcuType type = BcuType::Ncn5120)
     {
         _dll.begin(type);
-        _dll.process(); // schickt U_Reset.req an den ersten Kandidaten
+
+        _dll.tick(); // schickt U_Reset.req an den ersten Kandidaten
+        _dll.loop();
 
         _interface.addByte((char)U_RESET_IND, 0);
 
         for (int i = 0; i < 50 && !_dll.isConnected(); i++)
-            _dll.process();
+        {
+            _dll.tick();
+            _dll.loop();
+        }
 
         // Was die Verbindungsaufnahme selbst geschrieben hat (Reset, Konfiguration), interessiert die
         // Fälle nicht - sie prüfen gegen das, was DANACH rausgeht.
@@ -344,7 +361,6 @@ static void test_connect_reports_connected()
 // funktionierend gemeldet.
 static void test_connect_without_answer_stays_disconnected()
 {
-    fx->_dll.setTickInterval(0);
     fx->_dll.begin(BcuType::Ncn5120);
     fx->pump(120);
 
@@ -1882,6 +1898,162 @@ static void test_bus_load_counts_only_frame_bytes()
     TEST_ASSERT_EQUAL(before + 9, fx->_dll.getStatistics().getRxFrameBytes());
 }
 
+// ---------------------------------------------------------------------------------------------------
+// Der zentrale Timer
+// ---------------------------------------------------------------------------------------------------
+//
+// GEPRÜFT WIRD DIE BUCHFÜHRUNG, NICHT DER TAKT. Ob wirklich ein Hardware-Timer läuft, hängt an der
+// Plattform (Timer::supported()) und ist im nativen Lauf gar nicht gegeben - deshalb ist das Verzeichnis
+// bewusst plattformunabhängig gebaut: eingetragen wird immer, und nur der Rückgabewert von add() sagt, ob
+// tatsächlich getickt wird. Ohne diese Trennung wäre hier nichts prüfbar.
+//
+// Die Vorrichtung hält den Takt auf 0, jeder Fall beginnt also mit angehaltenem Timer - aber mit einer
+// Instanz, die begin() eingetragen hat, sobald connect() gelaufen ist.
+
+// begin() TRÄGT EIN, end() TRÄGT AUS - ohne Nachfrage, denn einen Schalter je Instanz gibt es bewusst
+// nicht. Das ist der Normalfall und die Grundlage aller weiteren Fälle.
+static void test_timer_registers_on_begin_and_releases_on_end()
+{
+    Timer &timer = Timer::instance();
+
+    TEST_ASSERT_FALSE(timer.contains(fx->_dll));
+    TEST_ASSERT_EQUAL(0, timer.clients());
+
+    fx->connect();
+
+    TEST_ASSERT_TRUE(timer.contains(fx->_dll));
+    TEST_ASSERT_EQUAL(1, timer.clients());
+
+    fx->_dll.end();
+
+    TEST_ASSERT_FALSE(timer.contains(fx->_dll));
+    TEST_ASSERT_EQUAL(0, timer.clients());
+}
+
+// ZWEIMAL EINTRAGEN BELEGT EINEN PLATZ, nicht zwei. Ein zweites begin() ist nichts Exotisches - jeder
+// Neustart der Verbindung geht darüber -, und mit TPUART_TIMER_MAX_CLIENTS = 1 wäre danach sonst Schluss.
+static void test_timer_registration_is_idempotent()
+{
+    Timer &timer = Timer::instance();
+
+    fx->connect();
+    TEST_ASSERT_EQUAL(1, timer.clients());
+
+    timer.add(fx->_dll);
+    fx->_dll.begin(BcuType::Ncn5120);
+
+    TEST_ASSERT_EQUAL(1, timer.clients());
+}
+
+// MEHR INSTANZEN ALS PLÄTZE: die überzählige wird ABGEWIESEN, nicht stillschweigend eingetauscht - die
+// bereits eingetragene läuft weiter. Die abgewiesene wird gar nicht getickt, und usesTimer() sagt es.
+//
+// Der Fall hängt an der Vorgabe TPUART_TIMER_MAX_CLIENTS = 1. Wer sie hochsetzt, muss ihn mitziehen -
+// deshalb steht die Zahl hier ausdrücklich in einer Zusicherung und nicht bloß im Kommentar.
+static void test_timer_rejects_more_clients_than_slots()
+{
+    TEST_ASSERT_EQUAL(1, TPUART_TIMER_MAX_CLIENTS);
+
+    Timer &timer = Timer::instance();
+
+    fx->connect();
+    TEST_ASSERT_EQUAL(1, timer.clients());
+
+    Interface::Dummy second;
+    DataLinkLayer secondDll(second);
+
+    TEST_ASSERT_FALSE(timer.add(secondDll));
+    TEST_ASSERT_FALSE(timer.contains(secondDll));
+
+    // Die erste bleibt unangetastet - das ist der Punkt.
+    TEST_ASSERT_TRUE(timer.contains(fx->_dll));
+    TEST_ASSERT_EQUAL(1, timer.clients());
+}
+
+// DER ZERSTÖRER MUSS AUSTRAGEN. Der Timer hält einen ZEIGER; überlebte er die Instanz, liefe der nächste
+// Tick in freigegebenen Speicher - auf dem RP2040 aus einem Interrupt heraus. end() zu verlangen genügt
+// nicht, denn niemand ist verpflichtet, es vor dem Wegwerfen zu rufen.
+static void test_timer_slot_is_released_on_destruction()
+{
+    Timer &timer = Timer::instance();
+
+    // Der einzige Platz muss frei sein, sonst wird die zweite Instanz gar nicht erst eingetragen.
+    TEST_ASSERT_EQUAL(0, timer.clients());
+
+    {
+        Interface::Dummy scoped;
+        DataLinkLayer scopedDll(scoped);
+
+        timer.add(scopedDll);
+        TEST_ASSERT_TRUE(timer.contains(scopedDll));
+        TEST_ASSERT_EQUAL(1, timer.clients());
+    }
+
+    TEST_ASSERT_EQUAL(0, timer.clients());
+}
+
+// DAS INTERVALL IST GLOBAL, nicht je Instanz - eine Zahl, eine Stelle. Geprüft wird auch der Weg zurück:
+// 0 hält den Timer an, ein Wert danach ist wieder gültig.
+//
+// Ohne eingetragene Instanz, damit der Fall auf echter Hardware keinen laufenden Timer erzeugt, der gegen
+// die übrigen Fälle antickt.
+static void test_timer_interval_is_global()
+{
+    Timer &timer = Timer::instance();
+
+    TEST_ASSERT_EQUAL(0, timer.clients());
+    TEST_ASSERT_EQUAL(0, timer.interval());
+
+    timer.setInterval(250);
+    TEST_ASSERT_EQUAL(250, timer.interval());
+    TEST_ASSERT_FALSE(timer.running()); // ohne Instanz läuft er nicht an
+
+    timer.setInterval(0);
+    TEST_ASSERT_EQUAL(0, timer.interval());
+    TEST_ASSERT_FALSE(timer.running());
+}
+
+// DER HAUPTLOOP TICKT NIE - process() ruft ausschliesslich loop(). Das ist eine ausdrueckliche Festlegung
+// und keine Auslegungsfrage: ein Rueckfall auf den Hauptloop macht genau den Zustand zum stillen
+// Normalfall, der im Router 457 Ticks/s statt 2000 ergab und 12% der Quittungen gekostet hat. Er sieht aus
+// wie "es laeuft", und niemand erfaehrt, dass der Antrieb fehlt.
+//
+// Der Fall haelt das fest, damit es niemand als fehlenden Rueckfall "repariert".
+static void test_process_never_ticks()
+{
+    fx->connect();
+
+    TEST_ASSERT_FALSE(fx->_dll.usesTimer());
+
+    uint32_t before = fx->_dll.getStatistics().getTicks();
+    fx->_dll.process();
+    fx->_dll.process();
+
+    TEST_ASSERT_EQUAL(before, fx->_dll.getStatistics().getTicks());
+}
+
+// VON HAND TREIBEN: trigger() tut genau das, was der plattformeigene Callback tut - ein tick() je
+// eingetragener Instanz. Das ist der Weg für eine Plattform ohne Timer-Unterstützung, und der Aufrufer
+// ruft dann loop() statt process().
+static void test_timer_trigger_ticks_registered_clients()
+{
+    fx->connect();
+
+    uint32_t before = fx->_dll.getStatistics().getTicks();
+    Timer::instance().trigger();
+
+    TEST_ASSERT_EQUAL(before + 1, fx->_dll.getStatistics().getTicks());
+
+    // Nach dem Austragen darf trigger() die Instanz NICHT mehr anfassen - sonst wäre das Austragen
+    // wirkungslos, und genau daran hängt die Sicherheit des Destruktors.
+    Timer::instance().remove(fx->_dll);
+
+    uint32_t after = fx->_dll.getStatistics().getTicks();
+    Timer::instance().trigger();
+
+    TEST_ASSERT_EQUAL(after, fx->_dll.getStatistics().getTicks());
+}
+
 // DIE BUSLAST IN PROZENT IST EINE ZEITRECHNUNG, keine umgerechnete Bytezahl - und genau das nagelt dieser
 // Fall fest. Die Telegrammzahl geht mit ein, weil vor jedem Telegramm 50 Bitzeiten frei sein müssen; aus
 // den Oktetts allein wäre das nicht ableitbar, denn 270 Oktetts sind ein großes Telegramm oder dreißig
@@ -2049,6 +2221,14 @@ static int runAllTests()
     RUN_TEST(test_tx_queue_overflow_is_counted);
     RUN_TEST(test_control_queue_overflow_is_counted);
     RUN_TEST(test_control_sequence_is_never_split);
+    RUN_TEST(test_timer_registers_on_begin_and_releases_on_end);
+    RUN_TEST(test_timer_registration_is_idempotent);
+    RUN_TEST(test_timer_rejects_more_clients_than_slots);
+    RUN_TEST(test_timer_slot_is_released_on_destruction);
+    RUN_TEST(test_timer_interval_is_global);
+    RUN_TEST(test_process_never_ticks);
+    RUN_TEST(test_timer_trigger_ticks_registered_clients);
+
     RUN_TEST(test_bus_load_counts_only_frame_bytes);
     RUN_TEST(test_bus_load_percent_counts_frame_gaps);
     RUN_TEST(test_bus_load_percent_is_not_capped);

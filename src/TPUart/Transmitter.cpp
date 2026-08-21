@@ -312,9 +312,11 @@ void Transmitter::abort()
     _state = TxState::Idle;
 }
 
-// Verglichen wird das VOLLSTÄNDIGE Telegramm - eine Prefix-Fassung für den halb eingelaufenen Fall gab es
-// einmal, sie wurde aber nur von der Acknowledge-Entscheidung gebraucht, und die kommt ohne aus (siehe
-// Receiver::sendAcknowledge).
+// Verglichen wird das VOLLSTÄNDIGE Telegramm. Für den halb eingelaufenen Fall gibt es isEchoPrefix()
+// direkt darunter - GEBRAUCHT WIRD ES, und zwar von Receiver::sendAcknowledge() bei Byte 6, damit das
+// eigene Echo nicht quittiert wird. Hier stand einmal, diese Fassung sei entfernt worden und die
+// Quittungsentscheidung komme ohne aus; das war der Stand, bevor ein IP-Router 4 Quittungen je eigenem
+// Telegramm gemeldet hat. Wer isEchoPrefix() als toten Code entfernt, holt das zurück.
 //
 // Zwei Bytes bleiben beim Vergleich außen vor, und beide aus demselben Grund: die BCU löscht beim
 // Wiederholen das Wiederholungs-Bit im Kontrollbyte. Das wird deshalb maskiert verglichen, und die
@@ -341,7 +343,11 @@ bool Transmitter::isEcho(const uint8_t *data, size_t length) const
 bool Transmitter::isEchoPrefix(const uint8_t *data, size_t length) const
 {
     if (_state == TxState::Idle) return false;
-    if (length == 0 || length > _frameSize) return false;
+    // STRIKT KÜRZER: ein vollständiges Telegramm ist kein Prefix, dafür ist isEcho() da. Bei Gleichheit
+    // würde hier auch das Prüfsummen-Oktett verglichen, und das unterscheidet sich bei einer Wiederholung
+    // (die BCU löscht das Wiederholungsbit im Steuerbyte, die Prüfsumme hängt daran) - der Vergleich
+    // schlüge also fehl, wo isEcho() zutrifft.
+    if (length == 0 || length >= _frameSize) return false;
     if (((data[0] ^ _buffer[0]) & (uint8_t)~0x20) != 0) return false;
 
     return memcmp(data + 1, _buffer + 1, length - 1) == 0;

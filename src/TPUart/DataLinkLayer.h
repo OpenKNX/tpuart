@@ -11,7 +11,7 @@
 #include "TPUart/RepetitionFilter.h"
 #include "TPUart/Statistics.h"
 #include "TPUart/SystemState.h"
-#include "TPUart/TickDriver.h"
+#include "TPUart/Timer.h"
 #include "TPUart/Transmitter.h"
 #include "TPUart/Types.h"
 
@@ -71,10 +71,12 @@ constexpr uint32_t TPUART_DETECT_RESPONSE_TIMEOUT_MS = 50;
 // ZWEI KONTEXTE, und die Trennlinie ist der Ringpuffer im Receiver:
 //
 //   tick()  - die zeitkritische Seite. Ein Byte je Richtung pro Aufruf, blockiert nie und hält sich
-//             nirgends auf, weil sie aus einem Timer läuft (Zielintervall 500µs, siehe TickDriver;
+//             nirgends auf, weil sie aus einem Timer läuft (Zielintervall 500µs, siehe Timer.h;
 //             der Bus liefert höchstens alle 1,354ms ein Byte - 9600 Baud, 13 Bitzeiten je TP1-Zeichen).
 //             "Ein Byte" heißt auf der Sendeseite: ein Byte DES TELEGRAMMS - die bis zu zwei zugehörigen
-//             Positionsbytes gehen im selben Tick mit raus, dafür ist TPUART_TX_ATOMIC_BYTES da.
+//             Positionsbytes gehen im selben Tick mit raus. Reserviert wird dafür, was wirklich anfällt:
+//             2 Bytes, oder 3 wenn ein Offsetbyte fällig ist (siehe Transmitter::process()).
+//             TPUART_TX_ATOMIC_BYTES ist nur noch die Obergrenze, aus der TPUART_TX_INTERFACE_BUFFER folgt.
 //             Jeder Tick ist damit ein Durchlauf mit fester Obergrenze an Arbeit.
 //   loop()  - die gemütliche Seite, aus dem Hauptloop aufgerufen. Leert den Ringpuffer: Telegramme gehen
 //             per Callback nach außen, Steuerbytes verarbeitet der Datalink Layer selbst.
@@ -119,11 +121,6 @@ class DataLinkLayer
     SystemState _systemState;
     RepetitionFilter _repetitionFilter;
 
-    // Der eigene Takt für tick(). begin() startet ihn, end() hält ihn an; abbestellen lässt er sich über
-    // setTickInterval(0). Solange er läuft, ruft process() NUR loop() - siehe TickDriver.h.
-    TickDriver _tickDriver;
-    uint32_t _tickIntervalUs = TPUART_TICK_INTERVAL_US;
-
     // Zeitstempel des vorigen tick(), allein für die Taktmessung (siehe Statistics::recordTick). Gehört dem
     // Tick, wird von niemandem sonst angefasst. 0 heißt "noch kein Vorgänger" - begin() setzt ihn zurück,
     // damit die Pause zwischen zwei Betriebsphasen nicht als Aussetzer erscheint.
@@ -134,9 +131,6 @@ class DataLinkLayer
     uint32_t _tickRateCheckedAt = 0;
     uint32_t _tickRateLastTicks = 0;
     bool _tickRateReported = false;
-
-    // Der Tick kommt von außen (siehe setExternalTick). Dann hält sich process() heraus.
-    bool _externalTick = false;
 
     // Seit wann der Busy-Modus läuft, 0 = aus. Siehe checkBusyMode(). Nur Hauptkontext.
     uint32_t _busyModeSince = 0;
@@ -373,6 +367,14 @@ class DataLinkLayer
     // tick()/loop() nichts.
     DataLinkLayer();
 
+    // TRÄGT SICH BEIM ZENTRALEN TIMER AUS, und das ist keine Höflichkeit: der Timer hält einen ZEIGER auf
+    // diese Instanz, und der überlebte sie sonst - der nächste Tick liefe in freigegebenen Speicher, aus
+    // einem Interrupt heraus. In einem echten Gerät lebt ein DataLinkLayer so lange wie das Gerät selbst,
+    // die Testvorrichtung legt aber für jeden Fall einen neuen an, und einem Aufrufer ist es ebenfalls
+    // erlaubt. end() allein genügt dafür nicht - es muss niemand end() rufen, bevor er das Objekt fallen
+    // lässt.
+    ~DataLinkLayer();
+
     // Startet die Verbindungsaufnahme: probiert die für bcuType in Frage kommenden Baudraten durch (siehe
     // BcuType), bis die BCU mit U_Reset.ind auf ein von uns gesendetes U_Reset.req antwortet - das bestätigt
     // Baudrate UND Reset in einem Schritt. NICHT BLOCKIEREND: begin() merkt sich nur den Chiptyp, gesucht
@@ -388,50 +390,45 @@ class DataLinkLayer
     // KOMPAT: Signatur der alten Library. Setzt das Interface und ruft dann begin(bcuType).
     void begin(BcuType bcuType, Interface::Abstract *interface);
 
-    // Taktrate des eigenen Antriebs, VOR begin() zu setzen. 0 bestellt ihn ab - dann tickt process() wieder
-    // selbst. Steht der Antrieb schon, wird er hier nur angehalten und nicht mit dem neuen Wert neu
-    // gestartet: das passiert beim nächsten begin().
-    void setTickInterval(uint32_t intervalUs);
-
-    // "ICH TICKE SELBST." Zu setzen, wenn tick() von außen kommt - aus einem eigenen Task, einem eigenen
-    // Timer oder dem zweiten Kern (loop1() auf dem RP2040). Danach ruft process() KEIN tick() mehr.
+    // WIRD DIESE INSTANZ GERADE VOM ZENTRALEN TIMER GETICKT? Falsch heißt: sie wird gar nicht getickt,
+    // solange nicht jemand Timer::trigger() ruft - denn der Hauptloop tickt NIE (siehe process()). Gründe
+    // für falsch: die Plattform hat keinen Timer (Timer::supported()), das Intervall steht auf 0
+    // (Timer::setInterval(0)), oder alle Plätze waren belegt (TPUART_TIMER_MAX_CLIENTS).
     //
-    // Das ist ausdrücklich etwas anderes als setTickInterval(0). Ohne diesen Schalter bedeutet ein
-    // abgeschalteter Timer nur "der Hauptloop übernimmt wieder" - wer dann zusätzlich selbst tickt, hat
-    // ZWEI Tick-Kontexte auf derselben Schnittstelle. Genau das ist einmal passiert: Kern 0 über process()
-    // und Kern 1 über loop1(), mit zerteilten Sendesequenzen (Protocol Error in U_State.ind) und
-    // gestohlenen Empfangsbytes (unbekannte Steuerbytes) als Folge.
+    // EINEN SCHALTER JE INSTANZ GIBT ES BEWUSST NICHT: der Timer wird IMMER benutzt, und begin() trägt die
+    // Instanz ohne Nachfrage ein. Wer den Takt selbst stellen will - eigener Task, fremder Timer, zweiter
+    // Kern, oder eine Plattform ohne Timer-Unterstützung -, schaltet ihn global ab
+    // (Timer::setInterval(0)) und ruft Timer::trigger() aus seinem eigenen Kontext.
     //
-    // Beides zusammen - eigener Timer UND externer Tick - lehnt die Library ab: setzt man dies auf true,
-    // wird ein laufender Timer angehalten und startet auch beim nächsten begin() nicht wieder.
-    void setExternalTick(bool enabled);
-
-    // Läuft der eigene Antrieb gerade? Falsch heißt: tick() muss von außen kommen. Auf Plattformen ohne
-    // Timer-Unterstützung ist das immer der Fall (TickDriver::supported()).
-    bool hasTickDriver() const;
-
-    // Die EINGESTELLTE Taktrate, nicht die erreichte - was tatsächlich herauskommt, sagt
-    // Statistics::getTicks() gegen die Laufzeit. Die beiden auseinanderzuhalten ist der ganze Zweck:
-    // hasTickDriver() sagt, WER tickt, dieser Wert, wie schnell es gedacht war, und der Zähler, was daraus
-    // geworden ist.
-    uint32_t tickInterval() const;
+    // NUR AUSKUNFT, KEINE MELDUNG. Dass eine Instanz nicht getickt wird, meldet die Library selbst über
+    // den Message-Callback - checkTickRate() sieht null Ticks im Fenster und schreibt "Tick stopped".
+    // Diese Methode ist für einen Aufrufer, der den Zustand abfragen will; sie ist ausdrücklich NICHT die
+    // Stelle, an der ein Verbraucher die Diagnose selbst zusammensetzen soll. Die `bcu`-Ausgabe von
+    // OGM-Common benutzt sie deshalb nicht: eine Diagnose an zwei Stellen läuft auseinander, und die dort
+    // wäre die schlechtere.
+    //
+    // Dynamisch beantwortet und nicht bei begin() festgeschrieben: der Timer kann später anlaufen, etwa
+    // wenn eine andere Instanz ihren Platz freigibt.
+    bool usesTimer() const;
 
     // KOMPAT: beendet den Betrieb und schließt das Interface. Der Parameter der alten Fassung
     // (deleteUart) fehlt bewusst - der DataLinkLayer besitzt das Interface nicht und darf es nicht
     // freigeben.
     void end();
 
-    // Zeitkritische Seite: ein Byte pro Aufruf, läuft aus dem TickDriver. Siehe Klassenkommentar. Von
-    // außen nur zu rufen, wenn der eigene Antrieb NICHT läuft - zwei Kontexte in einer State-Machine sind
-    // ein Defekt, kein Nachteil.
+    // Zeitkritische Seite: ein Byte pro Aufruf, läuft aus dem zentralen Timer. Siehe Klassenkommentar. Von
+    // außen nur zu rufen, wenn der Timer diese Instanz NICHT treibt - zwei Kontexte in einer State-Machine
+    // sind ein Defekt, kein Nachteil. Für den Regelfall gibt es Timer::trigger(), das alle eingetragenen
+    // Instanzen bedient.
     void tick();
 
     // Gemütliche Seite: leert den RX-Ringpuffer, ruft den Frame-Callback und verarbeitet Steuerbytes
     // intern. Muss aus dem Hauptloop kommen, nie aus einem Interrupt.
     void loop();
 
-    // KOMPAT: die alte Library kannte nur diesen einen Einstieg. Ruft loop() und, NUR falls kein eigener
-    // Antrieb läuft, davor tick().
+    // KOMPAT: die alte Library kannte nur diesen einen Einstieg. RUFT NUR NOCH loop() - hier wird NICHT
+    // getickt, nie. Der Hauptloop ist kein Antrieb für tick(); die Begründung steht an der Definition.
+    // Für einen Aufrufer mit laufendem Timer ändert das nichts, dort tat process() schon vorher nur loop().
     void process();
 
     bool isConnected() const;

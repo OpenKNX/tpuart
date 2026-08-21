@@ -3,7 +3,7 @@
 // ARDUINO-ERSATZ FÜR DEN NATIVEN LAUF - und der ist überraschend klein, weil die Library aus Arduino
 // GENAU ZWEI FUNKTIONEN benutzt: millis() und micros(). Sonst nichts. Die plattformgebundenen Teile
 // schalten sich selbst ab (Interface/RP2040.cpp und ESP32.cpp stehen ganz hinter ihren ARDUINO_ARCH_*,
-// TickDriver.cpp hat einen else-Zweig, der supported() auf false setzt).
+// Timer.cpp hat einen else-Zweig, der supported() auf false setzt).
 //
 // DIESE DATEI WIRD NUR IN DER NATIVEN ENV GEFUNDEN, weil nur sie den Ordner über -I in den Suchpfad
 // nimmt. In den Hardware-Envs liegt das echte Arduino.h davor - der Schim ist dort unsichtbar.

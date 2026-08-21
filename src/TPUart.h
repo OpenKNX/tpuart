@@ -8,4 +8,5 @@
 #include "TPUart/RepetitionFilter.h"
 #include "TPUart/Statistics.h"
 #include "TPUart/SystemState.h"
+#include "TPUart/Timer.h"
 #include "TPUart/Types.h"

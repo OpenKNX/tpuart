@@ -376,7 +376,8 @@ class Statistics
     // eben nicht mehr auf die Sekunde.
     void sampleBusLoad();
 
-    // Bytes pro Sekunde über die letzten BUS_LOAD_WINDOW Sekunden, sekündlich nachgeführt.
+    // Bytes pro Sekunde der zuletzt abgeschlossenen Sekunde. Einen gleitenden Mittelwert gibt es hier
+    // NICHT mehr - der Wert beschreibt genau ein Messintervall (BUS_LOAD_INTERVAL_MS).
     // Das Ablesen verändert nichts und rechnet auch nichts - es liefert das Ergebnis der zuletzt
     // abgeschlossenen Sekunde, beliebig oft. Solange die erste noch läuft: 0.
     uint32_t getBusLoad() const;
@@ -389,7 +390,7 @@ class Statistics
     // dieselbe Trennung, aus der schon die Zuordnung "Fehlerbit -> Zähler" im DataLinkLayer liegt und
     // nicht in dieser Klasse: die Zählerklasse kennt keine Protokollkonstanten.
     //
-    // TPUART_TICK_DEFERRED_US in TickDriver.h trägt dieselbe Zahl aus demselben Grund, bleibt aber ein
+    // TPUART_TICK_DEFERRED_US in Timer.h trägt dieselbe Zahl aus demselben Grund, bleibt aber ein
     // eigenes, überschreibbares Makro: das ist eine Schwelle, die jemand verstellen können soll, und ein
     // -D darauf darf nicht stillschweigend den Nenner dieser Anzeige mitverschieben.
     static constexpr uint32_t BUS_OCTET_TIME_US = 1354;
