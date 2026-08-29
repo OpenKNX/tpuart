@@ -1,5 +1,46 @@
 # Changes
 
+
+## ec/v1.2.0-beta.1 -- second batch: 2026-08-29
+
+The tag was moved from `fa2eb70` to `f018d90`, so everything below is part of it.
+
+**Signed-char bugs (ESP32 only, RP2040 unaffected)**
+* Fix: `readByte()` returned the UART octet as `char`; a `0xFF` byte sign-extended to `-1` and aliased the no-data sentinel, so the byte was dropped
+* Fix: CRC16, source/destination address and hex printing read frame bytes signed; any octet `>= 0x80` sign-extended into a wrong checksum, a wrong address or wrong output
+* Fix: the receiver control byte was read signed, so the `0xFF`/`0xFE`/`0xFD`/`0xFC` comparisons never matched and the no-op swallow was dead code
+
+**Bus monitor**
+* Feature: `TPUART_BUSMON_INTEGRITY` (opt-in) reports every gap in a capture — in monitor mode the chip is transparent (no frame-end marker, no CRC, no byte stuffing, DS Table 11 p.36), so truncated telegrams and poll frames used to vanish into the discard ring
+  * frame flags widened to 16 bit (the low 8 were exhausted) and the received length carried along; the widening is unconditional, the reporting is not
+  * `rawLength()` returns the octets actually present, so a short carrier is never sized from `size()`
+  * a truncated telegram is forwarded with `TRUNCATED`, which sets the cEMI Lost flag (03_06_03 4.1.5.8.1)
+  * poll frames are counted out (F0 + 6 header octets + FCS + slots) instead of swept byte by byte; a swept poll body used to stop at the first frame-looking byte and get acknowledged on the bus
+  * the chip's per-octet bit error is read from the UART parity bit (DS p.27) into the Bit-error flag; RP2040 takes `DR[11:8]` from 16-bit DMA entries and refuses DMA on a misaligned heap buffer, ESP32 handles `UART_PARITY_ERR`/`UART_FRAME_ERR` instead of dropping the event
+  * busmon-only carriers are excluded from the repetition filter, which would read past them via `size()`/`source()`
+* Fix: no TX and no ACK while in bus-monitor mode — the transmit queue is skipped
+* Fix: a monitored frame with no trailing ACK stranded in `WAIT_ACKN` until the next byte, or was dropped on busmon disconnect; a monitor-gated idle timeout finalizes it
+
+**Reliability**
+* Fix: a control byte is never interpreted while the receiver is desynced — `processSearchBuffer()` honoured `U_RESET_IND` at position 0 unconditionally, bypassing the `_invalid` gate. Seen on hardware: a `0x2703` CRC low byte taken for a reset dropped the in-flight frame and the whole transmit queue. A desync watchdog now forces a guarded BCU reset after 20 s latched, with a 60 s cooldown, and stays off in `BUSMONITOR` where a reset would end the capture
+* Fix: `U_TPUART2_SET_REPETITION_REQ` wrote a value that collapsed to 0 or 1 — the old expression used logical `||` instead of a bit combination
+* Fix: `NORMAL` mode compared the `0x33` constant against `mode()`'s masked 2-bit value, so it could never match
+* Fix: two `pop()` calls in one expression had undefined evaluation order; sequenced into locals and read unsigned
+
+**Priority and bus state**
+* Fix: medium-access priority is honoured on TP egress — four per-priority FIFOs (system > urgent > normal > low), taken from the frame's own CTRL bits, with headroom reserved so a low-priority burst cannot starve a higher class. An ETS system-priority `T_Connect`/`T_Ack` now reaches the medium instead of queuing behind a backlog; the per-byte TX path is untouched, so throughput is unchanged
+* Feature: `busOperational()` for the tunnel heartbeat — `isConnected()` only tracks the host-to-chip link, which stays up on an externally powered NCN when the KNX bus voltage drops. The new call combines the link state with the NCN System State VBUS bit; `SystemState::seen()` makes a non-NCN chip fall back to the link state instead of reporting a false bus-down
+
+**Diagnostics (opt-in, no effect on a normal build)**
+* Feature: `OPENKNX_CON_DIAG` counts echo recognition, `WAIT_ACKN`/complete stages, frames dropped on rx-buffer overflow and frames handed to `TX_TRANSMIT`; without the flag the build is byte-identical
+* Feature: `TPUART_BCU_MARKER` adds a console `bcu marker on|off` to measure what the chip emits at frame end. Bench use only — the parser does not handle `0xCB`/`0x13`, so the device stops delivering frames while it is on
+
+**Bus load**
+* Feature: `Statistics::getRxFrameBits()` adds up the line time every received frame occupied, in bit times per 03_02_02 — 11 bit per character plus 2 bit to the next one, the 15 bit ACK window, the 11 bit ACK character when one was actually on the line, the two extra characters of an extended-CRC frame, and the 50 bit bus-free time
+* Feature: this makes real line occupancy computable, which a byte rate alone cannot express — the ACK and the bus-free gap fall per telegram, not per byte
+* Note: the ACK character is taken from the frame ACK flag, not from the local acknowledge bool, which is also true when the CON reports that nobody answered
+* Note: `TODO(tpuart-v2)` marks booking the bits by frame timestamp instead of by completion time
+
 ## ec/v1.2.0-beta.1: 2026-08-09
 
 Enhanced TPUart release. All perf/stability behaviours below are **on by default**; the opt-in
