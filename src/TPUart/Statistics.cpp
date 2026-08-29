@@ -14,6 +14,7 @@ namespace TPUart
         _rxFrameBufferOverflow = 0;
         _rxFrames = 0;
         _rxFrameBytes = 0;
+        _rxFrameBits = 0;
         _rxLastBusBytes = 0;
         _rxLastBusLoadTime = 0;
         _rxOverflowFrameBuffer = 0;
@@ -33,6 +34,11 @@ namespace TPUart
     void Statistics::incrementRxRepetitions(int increment /* = 1 */)
     {
         _rxRepetitions += increment;
+    }
+
+    void Statistics::incrementRxFrameBits(int increment /* = 1 */)
+    {
+        _rxFrameBits += increment;
     }
 
     void Statistics::incrementRxFrameBytes(int increment /* = 1 */)
@@ -143,6 +149,11 @@ namespace TPUart
     unsigned int Statistics::getRxRepetitions()
     {
         return _rxRepetitions;
+    }
+
+    unsigned int Statistics::getRxFrameBits()
+    {
+        return _rxFrameBits;
     }
 
     unsigned int Statistics::getRxFrameBytes()

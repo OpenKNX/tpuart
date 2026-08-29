@@ -228,12 +228,27 @@ namespace TPUart
             unsigned short size = _searchBuffer.frame().size();
             if (!_dll.isMonitoring() && _dll._modeExtendedCRC) size += 2;
             if (acknowledge) size++; // Es hängt noch ein ACKN oder DATA_CON dran
+            const bool ackOnLine = _searchBuffer.frame().isAck(); // read before resetFlags() clears it
             _dll.pushRxFrameBuffer(_searchBuffer.frame());
             _searchBuffer.frame().resetFlags();
 
             _dll._statistics.incrementRxFrameBytes(_searchBuffer.frame().size());
             // _dll._statistics.incrementRxControlBytes(size - _searchBuffer.frame().size());
             _dll._statistics.incrementRxFrames();
+
+            // Line time this frame occupied, in bit times (03_02_02). Counted here because only this
+            // point knows whether an ACK actually followed.
+            const unsigned short frameSize = _searchBuffer.frame().size();
+            if (frameSize)
+            {
+                unsigned int busBits = 13u * (unsigned int)frameSize - 2u;
+                if (!_dll.isMonitoring() && _dll._modeExtendedCRC) busBits += 26u; // two more characters
+                busBits += 15u;                                                    // ACK window, elapses either way
+                if (ackOnLine) busBits += 11u;                                     // ACK character, only if one came
+                busBits += 50u;                                                    // mandatory bus-free time
+                _dll._statistics.incrementRxFrameBits((int)busBits);
+                // TODO(tpuart-v2): book by frame timestamp, not by completion time.
+            }
 
             _searchBuffer.move(size);
             _awaitBytes = 1;

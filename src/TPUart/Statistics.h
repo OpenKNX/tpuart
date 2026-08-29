@@ -12,6 +12,7 @@ namespace TPUart
         volatile unsigned int _rxFrameBufferOverflow;
         volatile unsigned int _rxFrames;
         volatile unsigned int _rxFrameBytes;
+        volatile unsigned int _rxFrameBits; // line time each frame occupied, in bit times (03_02_02)
         volatile unsigned int _rxLastBusBytes;
         volatile unsigned long _rxLastBusLoadTime;
         volatile unsigned int _rxOverflowFrameBuffer;
@@ -48,6 +49,7 @@ namespace TPUart
         void incrementRxRepetitions(int increment = 1);
         void incrementRxFrames(int increment = 1);
         void incrementRxFrameBytes(int increment = 1);
+        void incrementRxFrameBits(int increment = 1);
         // void incrementRxControlBytes(int increment = 1);
         void incrementRxDiscardedBytes(int increment = 1);
         void incrementRxReceivedBytes(int increment = 1);
@@ -67,6 +69,7 @@ namespace TPUart
 
         unsigned int getRxRepetitions();
         unsigned int getRxFrameBytes();
+        unsigned int getRxFrameBits();
         unsigned int getTxFrames();
         unsigned int getRxFrames();
         unsigned int getRxBusBytes();
