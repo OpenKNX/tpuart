@@ -351,6 +351,7 @@ namespace TPUart
         char *cemiData()
         {
             char *cemiBuffer = (char *)malloc(cemiSize());
+            if (cemiBuffer == nullptr) return nullptr; // callers must check: every dereference below writes
 
             // Das CEMI erwartet die Daten im Extended format inkl. zwei zusätzlicher Bytes am Anfang.
             cemiBuffer[0] = 0x29;
