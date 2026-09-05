@@ -73,27 +73,38 @@ namespace TPUart
         _lastTryInitialize = millis();
 
         uint baudrates[2] = {19200, 38400};
-        for (uint baudrate : baudrates)
+        // Two passes. A reset indication alone does not prove the baud rate: reading a stream at the wrong
+        // rate hands out re-framed fragments of neighbouring octets, and one of them looking like
+        // U_RESET_IND is enough for the old single-byte test. A framing error, on the other hand, means the
+        // octet did not fit the configured rate at all -- so pass 1 accepts only a clean probe. Pass 2
+        // repeats the old, weaker rule so a board that always reports framing errors still comes up.
+        for (uint pass = 0; pass < 2; pass++)
         {
-            if (_bcuType == BCU_TPUART2 && baudrate != 19200) continue;
-
-            if (tryInitialize(baudrate))
+            for (uint baudrate : baudrates)
             {
-                setBCUState(BCU_CONNECTED, baudrate);
-                _uReset = true;
-                _bcuState = BCU_CONNECTED;
-                return;
+                if (_bcuType == BCU_TPUART2 && baudrate != 19200) continue;
+
+                bool framingError = false;
+                if (tryInitialize(baudrate, framingError) && (pass == 1 || !framingError))
+                {
+                    if (framingError) printMessage("Baud %d accepted despite framing errors", baudrate);
+                    setBCUState(BCU_CONNECTED, baudrate);
+                    _uReset = true;
+                    _bcuState = BCU_CONNECTED;
+                    return;
+                }
             }
         }
     }
 
-    bool DataLinkLayer::tryInitialize(uint baudrate)
+    bool DataLinkLayer::tryInitialize(uint baudrate, bool &framingError)
     {
         printMessage("Try Initialize %d", baudrate);
 
         _interface->end(); // End interface is already initialized
         _interface->begin(baudrate);
         _interface->write(U_RESET_REQ);
+        framingError = false;
         unsigned long start = millis();
         do
         {
@@ -102,6 +113,7 @@ namespace TPUart
 #endif
             int value = _interface->read();
             if (value == -1) continue; // Queu is empty
+            if (_interface->lastByteStatus() & 0x01) framingError = true; // only an octet that arrived counts
             if (value == 0) continue;  // TPUart send zeros at the beginning
             // Serial.printf("%02X", value);
 

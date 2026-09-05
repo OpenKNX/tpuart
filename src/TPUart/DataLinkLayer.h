@@ -134,7 +134,7 @@ namespace TPUart
         void processRequestState();
 
         void tryInitialize();
-        bool tryInitialize(uint baudrate);
+        bool tryInitialize(uint baudrate, bool &framingError);
         // Synchronous single-register read; ONLY safe inside the init busy-wait (no async/bus traffic).
         uint8_t readRegisterBlocking(char readOpcode);
         // One-shot NCN RevID + ASR0 snapshot, taken during init (NCN family only).
