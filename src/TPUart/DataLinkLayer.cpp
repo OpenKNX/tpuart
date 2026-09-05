@@ -136,8 +136,12 @@ namespace TPUart
         if (_bcuState == BCU_UNINITIALIZED) return;
         printMessage("Reset BCU");
 
-        rxLock(true);
+        // MUST be ahead of rxLock: reset() re-takes rxLock itself, and the mutex is non-recursive on both
+        // RP2040 and ESP32 -- calling it inside the hold would hang the device. It also keeps the
+        // dropped-frame notification, which calls up into the stack, off the RX path.
         _transmitter.reset();
+
+        rxLock(true);
         _uState = 0;
         _uReset = false;
         _receiver.reset();
@@ -267,12 +271,10 @@ namespace TPUart
 
             run++;
 
-            // Skip the repetition filter for busmon-only carriers (FCS-failed frames and 1-byte standalone
-            // acknowledges): they must not pollute the per-source repetition map, are never delivered up,
-            // and a 1-byte ack carrier has no valid size()/source() for the filter to read.
-            // Busmon-only carriers never reach the link layer: size()/source() would read past their
-            // buffer (an ack is 1 octet, a truncated frame is shorter than its length octet claims).
-            if (!frame.isErrored() && !frame.isAckOnly() && !frame.isTruncated())
+            // Skip the repetition filter for busmon-only carriers: they are either not an LPDU at all
+            // (a 1-byte acknowledge, a raw poll frame) or their buffer is shorter than size() claims, so
+            // size()/source() would read past it and pollute the per-source repetition map.
+            if (!frame.isErrored() && !frame.isAckOnly() && !frame.isTruncated() && !frame.isRaw())
             {
                 bool alreadFound;
                 alreadFound = _repetitionFilter.check(frame);
@@ -712,7 +714,7 @@ namespace TPUart
 
         // Set Address for AutoACK Unicast
         {
-            if (_ownAddress > 0)
+            if (_ownAddress > 0 && _chipAutoAck)
             {
                 char buffer[10];
                 sprintf(buffer, "%u.%u.%u", (_ownAddress >> 12 & 0b1111), (_ownAddress >> 8 & 0b1111), (_ownAddress & 0b11111111));
@@ -1091,6 +1093,18 @@ namespace TPUart
         applyConfiguration(); // apply new address, if datalinklayer is already initialized
     };
 
+    void DataLinkLayer::chipAutoAcknowledge(bool state)
+    {
+        if (_chipAutoAck == state) return;
+        // The reset below would drop the chip out of monitor mode while the tunnel still believes it is
+        // monitoring, so refuse rather than end someone's busmonitor session behind their back.
+        if (isMonitoring()) { printMessage("Chip auto-acknowledge: refused, busmonitor is active"); return; }
+        _chipAutoAck = state;
+        printMessage("Chip auto-acknowledge: %s", state ? "on" : "off (host acknowledges only)");
+        // The chip keeps the address until it is reset, so the setting only takes hold after one.
+        reset();
+    };
+
     void DataLinkLayer::setBCUState(BcuState state, int baudrate)
     {
         if (_bcuState == state) return;
@@ -1180,7 +1194,9 @@ namespace TPUart
         _modeExtendedCRC = false;
         _modeAutoAcknowlage = false;
         _receiver._invalid = false; // reset indication -> the stream restarts in sync, so clear the desync flag (the parser also clears it on the U_RESET_IND)
-        _transmitter.reset();       // unsolicited chip reset -> abandon the stale in-flight TX (also clears _lastOffset)
+        // The stale in-flight TX is abandoned in handleReset(): _uReset is consumed by process() before the
+        // RX drain and the TX pump, and this runs in RX context (UART IRQ on RP2040) where the transmitter
+        // must not be touched -- it is mutated unlocked by the main loop and txLock(true) would block here.
         setBCUState(BCU_CONNECTED);
     }
 

@@ -19,6 +19,11 @@
 #include "freertos/semphr.h"
 #endif
 
+// Feature level for dependents: 2 adds the chip-config accessors, the acknowledge-drop counter, the
+// per-octet byte-status counters and chipAutoAcknowledge(). Consumers gate on it so they still build
+// against an older TPUart. Never nest this in another guard -- it must not depend on a product knob.
+#define TPUART_API_LEVEL 2
+
 #ifndef TPUART_MAX_PROCESS_TIME_PER_LOOP
 #define TPUART_MAX_PROCESS_TIME_PER_LOOP 30
 #endif
@@ -51,6 +56,7 @@ namespace TPUart
         bool _initialized = false;
         char _repetitions = 0b00110011; // 0-3 Nack (Default 3) // 5-7 Busy (Default 3)
         short _ownAddress = 0;
+        bool _chipAutoAck = true; // false -> the chip address is withheld, so only the host acknowledges
         volatile bool _uReset = false;
         volatile char _uState = 0;
         volatile bool _modeAutoAcknowlage = false;
@@ -211,6 +217,14 @@ namespace TPUart
         bool stopMode(bool state);
         bool busyMode(bool state);
         void setOwnAddress(short address);
+        // U_SetAddress.req is what turns the chip's automatic acknowledge on. Withholding the address
+        // leaves every acknowledge decision to checkAcknowledge(), so the chip can no longer NACK a frame
+        // it mis-received on its own -- which would otherwise destroy that telegram for every other device.
+        void chipAutoAcknowledge(bool state);
+        bool chipAutoAcknowledge() const { return _chipAutoAck; }
+        // Config state the chip reported in its last U_CONFIGURE_IND, not what we asked for.
+        bool isAutoAcknowledge() { return _modeAutoAcknowlage; }
+        bool isExtendedCRC() { return _modeExtendedCRC; }
         bool startMonitoring();
         BcuState getBcuState();
         const char *getBcuStateInfo();
