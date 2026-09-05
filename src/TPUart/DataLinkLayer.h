@@ -107,6 +107,7 @@ namespace TPUart
         SystemState _systemState;
 
         std::vector<std::function<void(Frame &)>> _callbacksReceivedFrame;
+        std::function<void(Frame &)> _callbackDroppedFrame;
         std::function<AcknowledgeType(unsigned short, bool)> _callbackCheckAcknowledge;
         std::function<void(const char *, bool error)> _callbackMessage;
 
@@ -119,6 +120,8 @@ namespace TPUart
         // void processWaitForAcknTimer();
         void processRxFrameBuffer();
         AcknowledgeType checkAcknowledge(unsigned short destination, bool isGroupAddress);
+        // An accepted frame was discarded before it was confirmed (transmitter reset).
+        void droppedFrame(Frame &frame);
         bool rxLock(bool blocking = false);
         bool txLock(bool blocking = false);
         void rxUnlock();
@@ -167,6 +170,7 @@ namespace TPUart
         void registerMessage(std::function<void(const char *, bool)> callback);
         void registerReceivedFrame(std::function<void(Frame &)> callback);
         void registerCheckAcknowledge(std::function<AcknowledgeType(unsigned short, bool)> callback);
+        void registerDroppedFrame(std::function<void(Frame &)> callback);
 
         bool processReceviedByte();
         void processTransmitByte();

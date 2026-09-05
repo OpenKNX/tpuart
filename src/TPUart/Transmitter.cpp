@@ -45,7 +45,7 @@ namespace TPUart
      */
     Transmitter::~Transmitter()
     {
-        reset();
+        reset(false); // no callback: the DataLinkLayer callbacks are destroyed before this member
     }
 
     /**
@@ -90,9 +90,14 @@ namespace TPUart
             _lastOffset = 0; // reset the mirror with _transmitPos: U_L_DataStart.req of the next frame resets the chip's offset (DS p.49)
         }
 
-        // pick the highest-priority non-empty bucket; _txCount>0 guarantees one exists in [0..3]
+        // pick the highest-priority non-empty bucket; _txCount>0 should guarantee one exists in [0..3]
         unsigned char r = 0;
-        while (r < 3 && _queue[r].empty()) ++r;
+        while (r < 4 && _queue[r].empty()) ++r;
+        if (r == 4) // all buckets empty: stale count, never front() an empty deque
+        {
+            _txCount = 0;
+            return;
+        }
         _frame = _queue[r].front();
         _queue[r].pop();
         --_txCount;
@@ -337,45 +342,73 @@ namespace TPUart
     }
 
     /**
-     * @brief Resets the Transmitter by clearing the message queue and resetting the state.
+     * @brief Resets the Transmitter: drops the in-flight frame and the queue entries present on entry.
      *
-     * This function performs the following actions:
-     * - Empties the message queue and deletes each message.
-     * - Resets the _awaitResponse flag to false.
-     * - Ensures memory barriers are respected using inline assembly.
-     * - Deletes the current frame if it exists.
+     * Main-loop context only (handleReset, DataLinkLayer::reset, the TX/desync watchdogs). Every dropped
+     * frame is reported through DataLinkLayer::droppedFrame() first, so the layer above can confirm it
+     * negatively instead of waiting for its transport timeout. The callback runs OUTSIDE txLock: it calls
+     * up into the stack and must not block the RX-context acknowledge path.
+     *
+     * @param notify false skips the callback (destructor only).
      */
-    void Transmitter::reset()
+    void Transmitter::reset(bool notify /* = true */)
     {
+        // rxLock first, then txLock: the receiver takes them in that order (processReceviedByte holds
+        // rxLock and calls sendAcknowledge -> txLock), so detaching in the same order cannot invert the
+        // hierarchy. It matters because the receiver reads _frame via currentFrame() to match our TX echo,
+        // and it does so entirely within one rxLock hold -- detaching under that lock means no snapshot of
+        // the pointer can still be in use once we own it, so the delete below is safe without the lock.
+        _dll.rxLock(true);
         _dll.txLock(true);
-        for (unsigned char r = 0; r < 4; ++r)
-            while (!_queue[r].empty())
-            {
-                delete _queue[r].front();
-                _queue[r].pop();
-            }
-        _txCount = 0;
-
-        if (_frame != nullptr)
-        {
-            delete _frame;
-            _frame = nullptr;
-            _transmitPos = 0;
-            _lastOffset = 0; // reset the mirror with _transmitPos: U_L_DataStart.req of the next frame resets the chip's offset (DS p.49)
-        }
-
+        Frame *frame = _frame;
+        // _frame is not cleared when a frame completes: finalize() only sets TX_IDLE and processQueue()
+        // deletes it on the next send. Reporting it unconditionally would emit a second, negative
+        // L_Data.con for a telegram already confirmed positively -- a tunnel client sees two answers.
+        const bool inFlight = (_state == TX_TRANSMIT || _state == TX_AWAIT);
+        _frame = nullptr;
+        _transmitPos = 0;
+        _lastOffset = 0; // reset the mirror with _transmitPos: U_L_DataStart.req of the next frame resets the chip's offset (DS p.49)
         _state = TX_IDLE;
         resetWatchdogTimer();
+        const size_t pending = _txCount;
         _dll.txUnlock();
+        _dll.rxUnlock();
+
+        if (frame != nullptr)
+        {
+            if (notify && inFlight) _dll.droppedFrame(*frame);
+            delete frame;
+        }
+
+        // One frame per lock hold, bounded by the entry count taken above, so a callback that re-queues
+        // cannot extend the loop. A frame the callback pushes is drained too while that budget remains
+        // and stays queued once it is spent -- _txCount matches the queue contents either way.
+        for (size_t i = 0; i < pending; ++i)
+        {
+            frame = nullptr;
+            _dll.txLock(true);
+            for (unsigned char r = 0; r < 4 && frame == nullptr; ++r)
+                if (!_queue[r].empty())
+                {
+                    frame = _queue[r].front();
+                    _queue[r].pop();
+                    --_txCount;
+                }
+            _dll.txUnlock();
+
+            if (frame == nullptr) break;
+            if (notify) _dll.droppedFrame(*frame);
+            delete frame;
+        }
     }
 
     /**
      * @brief Sends an acknowledge message.
      *
-     * This function sends an acknowledge message of the specified type. If the
-     * transmitter lock is acquired successfully, the acknowledge message is sent
-     * immediately. Otherwise, the acknowledge message is cached for later
-     * transmission.
+     * This function sends an acknowledge message of the specified type. If the transmitter lock is
+     * taken, the acknowledge is parked and flushAcknowledge() writes it as soon as the lock frees.
+     * It is discarded once TPUART_ACK_WINDOW_US has elapsed -- past that the chip would apply it to
+     * whatever frame it is receiving then, acknowledging a foreign telegram and suppressing its repetition.
      *
      * @param acknowledge The type of acknowledge message to send.
      */

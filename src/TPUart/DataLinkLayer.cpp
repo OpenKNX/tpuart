@@ -480,11 +480,16 @@ namespace TPUart
             processReceviedByte();
 
         _receiver.process();
-        _transmitter.processQueue();
+        // A reset seen during this pass's RX drain: arming the next frame here would only have the pump
+        // refuse it below and handleReset() discard it next pass, burning it for a negative confirm.
+        if (!_uReset) _transmitter.processQueue();
 
         start = millis();
         while (_transmitter.isTransmitting())
         {
+            // The chip reported a reset since this pass began: its transmit buffer is gone, so the
+            // remaining bytes would go out as a partial LPDU. handleReset() discards the frame next pass.
+            if (_uReset) break;
             processTransmitByte();
 #ifdef ARDUINO_ARCH_ESP32
             taskYIELD(); // bytes go to the non-blocking HW TX FIFO; the TP wire serializes them anyway (no per-byte vTaskDelay tax)
@@ -497,7 +502,8 @@ namespace TPUart
         // The CON for the just-sent frame may have been parsed in this same process() pass; if TX is now idle,
         // pop+arm the NEXT queued frame now instead of stalling a full main-loop period. Still STRICTLY
         // one-in-flight: processQueue() returns unless _state==TX_IDLE -- no pipelining past an unconfirmed CON.
-        _transmitter.processQueue();
+        // Same _uReset gate as above, or a frame armed here is dropped unsent by the next handleReset().
+        if (!_uReset) _transmitter.processQueue();
 
         // Show state changes and errors
         showOverflowError();
@@ -588,6 +594,9 @@ namespace TPUart
         printMessage("Reset received");
         _uReset = false;
 
+        // Deferred from receivedReset() (UART IRQ / RX task): the chip dropped the in-flight TX, so the
+        // transmitter is reset here, in main-loop context, where it may take txLock and call up the stack.
+        _transmitter.reset();
         applyConfiguration();
         requestState();
     }
@@ -605,6 +614,23 @@ namespace TPUart
     void DataLinkLayer::registerCheckAcknowledge(std::function<AcknowledgeType(uint16_t, bool)> callback)
     {
         _callbackCheckAcknowledge = callback;
+    }
+
+    void DataLinkLayer::registerDroppedFrame(std::function<void(Frame &)> callback)
+    {
+        _callbackDroppedFrame = callback;
+    }
+
+    /*
+     * Called by the transmitter for the in-flight frame and every queued frame it discards on a reset,
+     * before the frame is deleted. The frame is handed up as-is; the layer above turns it into its own
+     * negative confirmation.
+     */
+    void DataLinkLayer::droppedFrame(Frame &frame)
+    {
+        if (!_callbackDroppedFrame) return;
+
+        _callbackDroppedFrame(frame);
     }
 
     AcknowledgeType DataLinkLayer::checkAcknowledge(unsigned short destination, bool isGroupAddress)

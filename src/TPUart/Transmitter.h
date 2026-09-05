@@ -22,7 +22,7 @@ namespace TPUart
 
       public:
         std::queue<Frame *> _queue[4];
-        size_t _txCount = 0;
+        volatile size_t _txCount = 0;
         Transmitter(DataLinkLayer &dll);
         ~Transmitter();
 
@@ -32,7 +32,8 @@ namespace TPUart
 
         bool pushQueue(Frame *frame);
         size_t queueSize();
-        void reset();
+        // notify=false suppresses the dropped-frame callback (destructor only, see Transmitter::reset).
+        void reset(bool notify = true);
         void sendAcknowledge(AcknowledgeType acknowledge = ACK_None);
         void setQueueSize(unsigned long size);
 
