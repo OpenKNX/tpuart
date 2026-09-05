@@ -1,1 +1,4 @@
 .vscode/*
+
+# ON Semiconductor datasheets: local vendor copies, redistribution not permitted
+doc/datasheets/
