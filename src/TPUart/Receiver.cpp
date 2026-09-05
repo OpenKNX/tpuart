@@ -242,9 +242,9 @@ namespace TPUart
             if (frameSize)
             {
                 unsigned int busBits = 13u * (unsigned int)frameSize - 2u;
-                if (!_dll.isMonitoring() && _dll._modeExtendedCRC) busBits += 26u; // two more characters
-                busBits += 15u;                                                    // ACK window, elapses either way
-                if (ackOnLine) busBits += 11u;                                     // ACK character, only if one came
+                // 03_02_02 2.3.1: the 50 bit times of bus-free run from the last bit of the message
+                // cycle, so without an acknowledge the 15 bit times of ACK idle are inside them.
+                if (ackOnLine) busBits += 15u + 11u;                                // ACK idle + ACK character
                 busBits += 50u;                                                    // mandatory bus-free time
                 _dll._statistics.incrementRxFrameBits((int)busBits);
                 // TODO(tpuart-v2): book by frame timestamp, not by completion time.

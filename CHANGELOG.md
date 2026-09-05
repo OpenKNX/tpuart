@@ -36,7 +36,7 @@ The tag was moved from `fa2eb70` to `f018d90`, so everything below is part of it
 * Feature: `TPUART_BCU_MARKER` adds a console `bcu marker on|off` to measure what the chip emits at frame end. Bench use only — the parser does not handle `0xCB`/`0x13`, so the device stops delivering frames while it is on
 
 **Bus load**
-* Feature: `Statistics::getRxFrameBits()` adds up the line time every received frame occupied, in bit times per 03_02_02 — 11 bit per character plus 2 bit to the next one, the 15 bit ACK window, the 11 bit ACK character when one was actually on the line, the two extra characters of an extended-CRC frame, and the 50 bit bus-free time
+* Feature: `Statistics::getRxFrameBits()` adds up the line time every received frame occupied, in bit times per 03_02_02 — 11 bit per character plus 2 bit to the next one, the 15 bit ACK window, the 11 bit ACK character when one was actually on the line, and the 50 bit bus-free time
 * Feature: this makes real line occupancy computable, which a byte rate alone cannot express — the ACK and the bus-free gap fall per telegram, not per byte
 * Note: the ACK character is taken from the frame ACK flag, not from the local acknowledge bool, which is also true when the CON reports that nobody answered
 * Note: `TODO(tpuart-v2)` marks booking the bits by frame timestamp instead of by completion time
