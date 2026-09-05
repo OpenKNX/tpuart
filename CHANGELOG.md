@@ -1,20 +1,7 @@
 # Changes
 
 
-## unreleased
-
-**NCN chip identification**
-* Fix: the identification read the RevID register while the KNX receiver was on, so the header-less reply was whatever octet arrived first -- a bus telegram byte, an acknowledge or a state indication became the chip id
-* Fix: the part number was taken as `revid & 0x1F` with no plausibility check, so eight different byte values each read as an NCN5130 and eight more as an NCN5121
-* Fix: the read ran inside the per-baud probe, so it also executed on baud rates the probe went on to reject, writing register opcodes into the chip at the wrong rate
-* The read now runs once on the accepted baud, inside a Stop-mode window, and is preceded by a watchdog-register read whose reset value 0x0F is documented for all three parts -- a mismatch means the byte did not come from the register file
-* An NCN5120 is identified by the ACR1 reset value, which is documented on all three parts, so the undefined opcode 0x3D is only sent to a part that has the register; a RevID reply carrying no documented part number reports "unknown" instead of guessing
-* U_ExitStopMode.req is ignored outside Stop and nothing can prove Stop was reached, so the window always closes with U_Reset.req -- an armed U_StopMode.req firing later would switch the receiver off while U_State.req keeps answering, which the liveness watchdog cannot see
-* Gated behind `TPUART_BCU_REGISTER_INFO`: a product that does not report the chip keeps its previous boot sequence
-* `TPUART_API_LEVEL` raised to 3 for `getNcnChip`/`getNcnChipName`/`ncnChipInferred`/`ncnAsr0Valid`
-
-
-## unreleased
+## ec/1.3.0-beta.1: 2026-09-03
 
 **Transmit path**
 * Fix: a dropped frame is reported only when one was actually in flight -- `reset()` reported the in-flight frame unconditionally, so a frame already confirmed positively produced a second, negative `L_Data.con` on every console reset, busmonitor exit and watchdog reset
@@ -47,6 +34,15 @@
 **Initialisation**
 * Fix: the probed baud rate is cross-checked before it is accepted -- one octet looking like `U_RESET_IND` was enough, and reading a stream at the wrong rate hands out re-framed fragments of neighbouring octets. The first pass now requires a probe without a framing error; the second repeats the old rule so a board that always reports one still comes up
 
+**NCN chip identification**
+* Fix: the identification read the RevID register while the KNX receiver was on, so the header-less reply was whatever octet arrived first -- a bus telegram byte, an acknowledge or a state indication became the chip id
+* Fix: the part number was taken as `revid & 0x1F` with no plausibility check, so eight different byte values each read as an NCN5130 and eight more as an NCN5121
+* Fix: the read ran inside the per-baud probe, so it also executed on baud rates the probe went on to reject, writing register opcodes into the chip at the wrong rate
+* The read now runs once on the accepted baud, inside a Stop-mode window, and is preceded by a watchdog-register read whose reset value 0x0F is documented for all three parts -- a mismatch means the byte did not come from the register file
+* An NCN5120 is identified by the ACR1 reset value, which is documented on all three parts, so the undefined opcode 0x3D is only sent to a part that has the register; a RevID reply carrying no documented part number reports "unknown" instead of guessing
+* U_ExitStopMode.req is ignored outside Stop and nothing can prove Stop was reached, so the window always closes with U_Reset.req -- an armed U_StopMode.req firing later would switch the receiver off while U_State.req keeps answering, which the liveness watchdog cannot see
+* Gated behind `TPUART_BCU_REGISTER_INFO`: a product that does not report the chip keeps its previous boot sequence
+* `TPUART_API_LEVEL` raised to 3 for `getNcnChip`/`getNcnChipName`/`ncnChipInferred`/`ncnAsr0Valid`
 
 
 ## ec/v1.2.0-beta.1 -- second batch: 2026-08-29
