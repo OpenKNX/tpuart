@@ -30,32 +30,151 @@ namespace TPUart
     BcuType DataLinkLayer::getBcuType() { return _bcuType; }
     uint8_t DataLinkLayer::getNcnAsr0() { return _ncnAsr0; }
     uint8_t DataLinkLayer::getNcnRevId() { return _ncnRevId; }
+    NcnChip DataLinkLayer::getNcnChip() { return _ncnChip; }
+    bool DataLinkLayer::ncnChipInferred() { return _ncnChipInferred; }
     bool DataLinkLayer::ncnRegValid() { return _ncnRegValid; }
+    bool DataLinkLayer::ncnAsr0Valid() { return _ncnAsr0Valid; }
 
-    // Synchronous single-register read. ONLY valid inside the init busy-wait: the request reply is a
-    // single header-less data byte, which is only unambiguous while no async bus traffic contends the UART.
-    uint8_t DataLinkLayer::readRegisterBlocking(char readOpcode)
+    const char *DataLinkLayer::getNcnChipName()
     {
+        switch (_ncnChip)
+        {
+            case NCN_CHIP_5130: return "NCN5130";
+            case NCN_CHIP_5121: return "NCN5121";
+            case NCN_CHIP_5120: return "NCN5120";
+            default: return "unknown";
+        }
+    }
+
+    // Discard whatever arrives until the expected header shows up. Octets received before the KNX
+    // receiver went off are still draining when the Stop-mode confirmation comes in.
+    bool DataLinkLayer::awaitByteBlocking(uint8_t expected, unsigned long timeout)
+    {
+        unsigned long start = millis();
+        do
+        {
+            // Drain what is queued before yielding: at 38400 the UART delivers ~3.5 octets per millisecond,
+            // so one read per FreeRTOS tick would fall behind a busy bus and never reach the header.
+            int value;
+            while ((value = _interface->read()) >= 0)
+                if (value == (int)expected) return true;
+#ifdef ARDUINO_ARCH_ESP32
+            vTaskDelay(pdMS_TO_TICKS(1)); // yield only once the queue ran dry
+#endif
+        } while ((millis() - start) < timeout);
+        return false;
+    }
+
+    // Bounded discard of what is buffered right now, so a reply that arrived after its own timeout is
+    // not captured as the answer to the NEXT request -- the replies carry no header to tell them apart
+    // (DS Fig 43, p.41). An octet still on the wire is not covered; the anchor value is what catches that.
+    void DataLinkLayer::drainInterface()
+    {
+        for (uint8_t guard = 0; guard < NCN_DRAIN_GUARD; guard++)
+            if (_interface->read() < 0) return;
+    }
+
+    // Synchronous single-register read. The reply is a bare data byte with no header, so it is only
+    // unambiguous inside the Stop-mode window, where the chip's KNX receiver is off (DS Fig 29, p.31).
+    // false = no reply within the timeout, which is how an absent register address presents itself.
+    bool DataLinkLayer::readRegisterBlocking(uint8_t readOpcode, uint8_t &result)
+    {
+        drainInterface();              // a late reply to the previous request must not answer this one
         _interface->write(readOpcode); // read request = opcode only, no data byte
         unsigned long start = millis();
         do
         {
             int value = _interface->read();
-            if (value >= 0) return (uint8_t)value; // first reply byte = register content
-        } while ((millis() - start) < 20);
-        return 0; // no reply (non-NCN chip / register absent / timeout)
+            if (value >= 0)
+            {
+                result = (uint8_t)value;
+                return true;
+            }
+#ifdef ARDUINO_ARCH_ESP32
+            vTaskDelay(pdMS_TO_TICKS(1));
+#endif
+        } while ((millis() - start) < NCN_REG_READ_TIMEOUT);
+        return false;
     }
 
-    // One-shot RevID + ASR0 snapshot during init. RevID (0x05) exists only on NCN5121/5130; on an
-    // NCN5120 the read yields no valid code -> _ncnRevId stays 0 -> reported as "NCN5120". ASR0 (0x03)
-    // is present on the whole NCN family and carries the rails + TW + latched TSD (thermal-shutdown) bit.
-    // Registers per NCN5130/D Rev.8 p.56: ASR0 Table 20/21, RevID Table 22/23.
-    void DataLinkLayer::readNcnRegisterSnapshot()
+    /**
+     * @brief Identify the NCN part and snapshot ASR0 once, at the end of init.
+     *
+     * Register reads are only advised in Stop, Power-Up Stop or Power-Up state; elsewhere "erroneous
+     * behavior could occur" (DS p.41), and in Sync/Normal the KNX receiver is on (DS Fig 29, p.31), so a
+     * header-less reply cannot be told apart from a bus octet. Stop switches the receiver off. The
+     * watchdog register is read first as a sanity anchor: U_Reset.req has just restored its documented
+     * reset value 0x0F, identical on all three parts, so a mismatch means the byte did not come from the
+     * register file. ACR1 then separates the parts by its reset value -- documented on all three -- so the
+     * NCN5120 is identified from a register it actually has, and the RevID register (0x05, absent there)
+     * is only requested for a part that has it. The driver never writes ACR1, so the defaults stand.
+     *
+     * The anchor cannot prove we reached Stop -- U_IntRegRd.req is executed in every state (DS Table 11,
+     * p.32) -- and U_StopMode.ind is a single unframed byte a bus octet can imitate. The exit therefore
+     * never relies on knowing the state: see the reset below.
+     */
+    void DataLinkLayer::identifyNcnChip()
     {
-        if (_bcuType != BCU_NCN5120) return; // register reads are NCN-family only
-        _ncnRevId = readRegisterBlocking(U_INT_REG_RD_REQ_RID);
-        _ncnAsr0 = readRegisterBlocking(U_INT_REG_RD_REQ_ASR0);
-        _ncnRegValid = true;
+        _ncnChip = NCN_CHIP_UNKNOWN; // a re-run must never report the previous chip
+        _ncnChipInferred = false;
+        _ncnRegValid = false;
+        _ncnAsr0Valid = false;
+        _ncnRevId = 0;
+        _ncnAsr0 = 0;
+        if (_bcuType != BCU_NCN5120) return; // register services are NCN family only
+
+        _interface->write(U_STOP_MODE_REQ);
+        // From Normal the chip only enters Stop after 30 Tbits of bus silence (DS Fig 29, p.31), so on a
+        // busy bus the request stays armed well past this timeout.
+        if (awaitByteBlocking(U_STOP_MODE_IND, NCN_STOP_MODE_TIMEOUT))
+        {
+            uint8_t wd = 0;
+            if (readRegisterBlocking(U_INT_REG_RD_REQ_WD, wd) && wd == NCN_WD_REGISTER_RESET)
+            {
+                _ncnRegValid = true;
+
+                // ACR1 first: its reset value separates the NCN5120 from the NCN5121/5130 and is
+                // documented on all three parts, so the older part is identified from a register that
+                // exists there -- 0x05 is only ever requested once ACR1 says the part has it.
+                uint8_t acr1 = 0;
+                if (readRegisterBlocking(U_INT_REG_RD_REQ_ACR1, acr1))
+                {
+                    if (acr1 == NCN_ACR1_RESET_5120)
+                    {
+                        _ncnChip = NCN_CHIP_5120;
+                        _ncnChipInferred = true; // read from the ACR1 default, not from a part-number field
+                    }
+                    else if (acr1 == NCN_ACR1_RESET_51X1)
+                    {
+                        uint8_t rid = 0;
+                        if (readRegisterBlocking(U_INT_REG_RD_REQ_RID, rid))
+                        {
+                            _ncnRevId = rid; // kept even when unrecognised, so a new part can be reported
+                            switch (rid & NCN_PART_NUMBER_MASK)
+                            {
+                                case NCN_PART_NUMBER_5130: _ncnChip = NCN_CHIP_5130; break;
+                                case NCN_PART_NUMBER_5121: _ncnChip = NCN_CHIP_5121; break;
+                                default: break; // no documented part number -> stay unknown
+                            }
+                        }
+                        // ACR1 says 5121/5130 yet 0x05 stayed silent: contradictory, so stay unknown.
+                    }
+                    // Any other ACR1 value means the defaults were not intact -> stay unknown.
+                }
+
+                _ncnAsr0Valid = readRegisterBlocking(U_INT_REG_RD_REQ_ASR0, _ncnAsr0);
+            }
+        }
+
+        // U_ExitStopMode.req is IGNORED outside Stop (DS Table 11, p.32), so it cannot cancel a request
+        // that has not taken effect yet, and nothing here can prove whether Stop was reached. An armed
+        // U_StopMode.req firing later would switch the KNX receiver off for good: U_State.req still
+        // answers in Stop, so the liveness watchdog keeps seeing a healthy BCU and never reconnects.
+        // U_Reset.req is executed in every state and is the only exit that closes that hole. It costs
+        // nothing here -- the caller sets _uReset, so applyConfiguration() re-runs either way.
+        _interface->write(U_EXIT_STOP_MODE_REQ);
+        _interface->write(U_RESET_REQ);
+        awaitByteBlocking(U_RESET_IND, NCN_RESET_IND_TIMEOUT);
     }
 
     void DataLinkLayer::begin(BcuType bcuType, Interface::Abstract *interface)
@@ -88,6 +207,12 @@ namespace TPUart
                 if (tryInitialize(baudrate, framingError) && (pass == 1 || !framingError))
                 {
                     if (framingError) printMessage("Baud %d accepted despite framing errors", baudrate);
+#ifdef TPUART_BCU_REGISTER_INFO
+                    // Only on the accepted baud, and still ahead of _bcuState = BCU_CONNECTED, which is
+                    // what lets processReceviedByte() take bytes off the interface. Gated: a product that
+                    // does not report the chip pays neither the boot excursion nor its risk.
+                    identifyNcnChip();
+#endif
                     setBCUState(BCU_CONNECTED, baudrate);
                     _uReset = true;
                     _bcuState = BCU_CONNECTED;
@@ -118,13 +243,7 @@ namespace TPUart
             // Serial.printf("%02X", value);
 
             // War direkt erfolgreich - Top
-            if (value == U_RESET_IND)
-            {
-                // Safe here: synchronous, before the async RX pump owns the stream and before any
-                // bus/tunnel traffic -> the header-less register replies cannot be mis-captured.
-                readNcnRegisterSnapshot();
-                return true;
-            }
+            if (value == U_RESET_IND) return true;
             break;
         }
         while (!((millis() - start) >= 50));

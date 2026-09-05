@@ -88,11 +88,31 @@
 #define U_INT_REG_RD_REQ_ACR0 0x39
 #define U_INT_REG_RD_REQ_ACR1 0x3A
 #define U_INT_REG_RD_REQ_ASR0 0x3B
-// Revision ID register (0x05): opcode 0x38|0x05. Present on NCN5121/NCN5130 only (NCN5120 has no 0x05).
-// NCN5130/D Rev.8 p.56 Table 22/23 (Revision ID Register): [7:5] silicon rev, [4:0] part number.
+// Revision ID register (0x05): opcode 0x38|0x05. Present on NCN5121/NCN5130 only -- NCN5120/D Rev.8 p.51
+// lists 0x00-0x03 and no 0x05, where 0x3D is an undefined opcode whose behaviour no datasheet specifies.
+// NCN5130/D Rev.8 p.59 Table 22/23: [7:5] silicon rev, [4:0] part number. The opcode carries 3 address
+// bits (38-3F, Rev.9 Table 12 p.32); Rev.8 p.33 prints 38-3B, which is an erratum.
 #define U_INT_REG_RD_REQ_RID 0x3D
+// Part numbers in RevID[4:0]: NCN5130/D p.59 Table 23 and NCN5121/D p.56 Table 23.
+#define NCN_PART_NUMBER_5130 0x0C
+#define NCN_PART_NUMBER_5121 0x0D
+#define NCN_PART_NUMBER_MASK 0x1F
+// Watchdog register (0x00) reset value, identical on all three parts (NCN5120/D p.51, NCN5130/D p.57
+// Table 14). Read back after U_Reset.ind it proves the register-read transport works on this chip.
+#define NCN_WD_REGISTER_RESET 0x0F
+// ACR1 (0x02) reset value tells the NCN5120 apart from the NCN5121/5130 without touching 0x05: the older
+// part has SLP + reserved bits (all 0), the newer ones default the voltage-monitor masks V20V_OK_M and
+// VDD2_OK_M to 1. Documented on all three (NCN5120/D p.52, NCN5121/D p.55, NCN5130/D p.58, Table 18).
+#define NCN_ACR1_RESET_5120 0x00
+#define NCN_ACR1_RESET_51X1 0x60
+// Init-only busy-wait budgets for the identification. Worst case 50 + 4 x 20 + 50 = 180 ms, once per
+// BCU connect, entirely before the RX pump goes live.
+#define NCN_STOP_MODE_TIMEOUT 50
+#define NCN_RESET_IND_TIMEOUT 50
+#define NCN_REG_READ_TIMEOUT 20
+#define NCN_DRAIN_GUARD 64 // bounded discard of a late reply before the next request
 // Analog Status Register 0 (ASR0, reg 0x03) bit masks: [6]V20V [5]VDD2 [4]VBUS [3]VFILT [2]XTAL [1]TW [0]TSD.
-// NCN5130/D Rev.8 p.56 Table 20/21 (Analog Status Register); bit 7 reserved.
+// NCN5130/D Rev.8 p.59 Table 20/21 (Analog Status Register); bit 7 reserved.
 #define ASR0_V20V 0x40
 #define ASR0_VDD2 0x20
 #define ASR0_VBUS 0x10
@@ -126,6 +146,16 @@ namespace TPUart
         BCU_TPUART2, // SIEMENS 5WG1117-2AB12 TPUart 2
         BCU_NCN5120  // OnSemi NCN5120, NCN5121, NCN5130
     } BcuType;
+
+    // Which NCN part the RevID register identified. UNKNOWN also covers "not identified": Siemens BCU,
+    // no Stop-mode window, anchor mismatch, or a reply carrying no documented part number.
+    typedef enum
+    {
+        NCN_CHIP_UNKNOWN = 0,
+        NCN_CHIP_5120,
+        NCN_CHIP_5121,
+        NCN_CHIP_5130
+    } NcnChip;
 
     typedef enum
     {

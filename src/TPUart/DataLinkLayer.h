@@ -22,7 +22,7 @@
 // Feature level for dependents: 2 adds the chip-config accessors, the acknowledge-drop counter, the
 // per-octet byte-status counters and chipAutoAcknowledge(). Consumers gate on it so they still build
 // against an older TPUart. Never nest this in another guard -- it must not depend on a product knob.
-#define TPUART_API_LEVEL 2
+#define TPUART_API_LEVEL 3
 
 #ifndef TPUART_MAX_PROCESS_TIME_PER_LOOP
 #define TPUART_MAX_PROCESS_TIME_PER_LOOP 30
@@ -74,10 +74,15 @@ namespace TPUart
         unsigned long _lastDiscardedBytes = 0;
         volatile size_t _rxFrameBufferEntries = 0;
         volatile BcuType _bcuType;
-        // NCN5121/5130 boot register snapshot (read once in tryInitialize; static/latched values).
-        uint8_t _ncnAsr0 = 0;      // ASR0 @ boot: rails + TW + TSD (thermal-shutdown history)
-        uint8_t _ncnRevId = 0;     // RevID register: [7:5] silicon rev, [4:0] part number (0 = none / NCN5120)
-        bool _ncnRegValid = false; // true once the boot snapshot was taken
+        // NCN boot register snapshot, taken once in tryInitialize (see identifyNcnChip).
+        uint8_t _ncnAsr0 = 0;          // ASR0 @ boot; sampled in Stop, where only the latched TSD bit is
+                                       // meaningful -- the rails are the Power-Up exit condition and may
+                                       // legitimately still read 0 at that point
+        uint8_t _ncnRevId = 0;         // RevID register: [7:5] silicon rev, [4:0] part number
+        NcnChip _ncnChip = NCN_CHIP_UNKNOWN;
+        bool _ncnChipInferred = false; // chip concluded from an absent RevID register, not read from it
+        bool _ncnRegValid = false;     // a register read answered with its documented reset value
+        bool _ncnAsr0Valid = false;    // ASR0 actually replied (separate: _ncnRegValid does not cover it)
         volatile BcuState _bcuState = BCU_UNINITIALIZED;
         volatile int _baudrate = 0; // last negotiated BCU baudrate (19200/38400), stored on connect
 
@@ -157,10 +162,14 @@ namespace TPUart
 
         void tryInitialize();
         bool tryInitialize(uint baudrate, bool &framingError);
-        // Synchronous single-register read; ONLY safe inside the init busy-wait (no async/bus traffic).
-        uint8_t readRegisterBlocking(char readOpcode);
-        // One-shot NCN RevID + ASR0 snapshot, taken during init (NCN family only).
-        void readNcnRegisterSnapshot();
+        // Synchronous single-register read; ONLY safe inside the Stop-mode window (KNX receiver off).
+        bool readRegisterBlocking(uint8_t readOpcode, uint8_t &result);
+        // Discard bytes until one specific header arrives; used for the Stop-mode confirmation.
+        bool awaitByteBlocking(uint8_t expected, unsigned long timeout);
+        // Bounded discard of whatever is queued, so a late reply cannot be read as the next one.
+        void drainInterface();
+        // One-shot NCN chip identification + ASR0 snapshot, taken during init (NCN family only).
+        void identifyNcnChip();
 
         void exitBusyModeTimer();
         void setBCUState(BcuState state, int baudrate = 0);
@@ -207,11 +216,15 @@ namespace TPUart
         Receiver &getReceiver();
         Transmitter &getTransmitter();
 
-        // NCN family identity + boot register snapshot (see tryInitialize).
+        // NCN family identity + boot register snapshot (see identifyNcnChip).
         BcuType getBcuType();
         uint8_t getNcnAsr0();
         uint8_t getNcnRevId();
+        NcnChip getNcnChip();
+        const char *getNcnChipName();
+        bool ncnChipInferred();
         bool ncnRegValid();
+        bool ncnAsr0Valid();
 
         bool powerControl(bool state);
         bool stopMode(bool state);
