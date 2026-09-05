@@ -3,6 +3,8 @@
 
 ## ec/1.3.0-beta.1: 2026-09-03
 
+The tag was moved from `340897e` so the volatile-counter fix below is part of it.
+
 **Transmit path**
 * Fix: a dropped frame is reported only when one was actually in flight -- `reset()` reported the in-flight frame unconditionally, so a frame already confirmed positively produced a second, negative `L_Data.con` on every console reset, busmonitor exit and watchdog reset
 * Feature: a frame the driver has to drop is handed to a new dropped-frame callback, so the upper layer can confirm it negatively instead of leaving the caller in a timeout
@@ -43,6 +45,9 @@
 * U_ExitStopMode.req is ignored outside Stop and nothing can prove Stop was reached, so the window always closes with U_Reset.req -- an armed U_StopMode.req firing later would switch the receiver off while U_State.req keeps answering, which the liveness watchdog cannot see
 * Gated behind `TPUART_BCU_REGISTER_INFO`: a product that does not report the chip keeps its previous boot sequence
 * `TPUART_API_LEVEL` raised to 3 for `getNcnChip`/`getNcnChipName`/`ncnChipInferred`/`ncnAsr0Valid`
+
+**Build**
+* Fix: the counters no longer use `++`/`--` on a volatile-qualified type, which C++20 deprecates -- eight warnings in every product build. `+= 1`/`-= 1` is what these files already used for every other counter, the result value was unused at all eight sites, and the object code is byte-identical
 
 
 ## ec/v1.2.0-beta.1 -- second batch: 2026-08-29
