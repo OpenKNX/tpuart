@@ -44,7 +44,9 @@ namespace TPUart
             volatile TpuartDmaWord __attribute__((aligned(TPUART_RP2040_RING_BYTES))) _dmaBuffer[TPUART_RP2040_BUFFER_SIZE] = {};
             volatile uint _dmaReaderCount = 0;
             volatile uint _dmaRestartDiff = 0;
-            bool _lastByteErrored = false; // UART status bits of the octet last handed out by read()
+            bool _lastByteErrored = false; // FE|PE of the octet last handed out by read()
+            bool _lastByteOverrun = false;  // BE|OE of that octet -- host link lost data, bus unaffected
+            unsigned char _lastByteStatus = 0;    // the four DR[11:8] bits, kept apart for diagnosis
 
             pin_size_t _rx, _tx;
             gpio_function_t _rxRestore, _txRestore;
@@ -67,6 +69,8 @@ namespace TPUart
             int read() override;
             bool overflow() override;
             bool lastByteErrored() override;
+            bool lastByteOverrun() override;
+            unsigned char lastByteStatus() override;
             bool dmaActive(); // false if the ring buffer came back misaligned and DMA was refused
             bool hasCallback() override;
             void registerCallback(std::function<bool()> callback) override;

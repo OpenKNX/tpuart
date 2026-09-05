@@ -26,6 +26,8 @@ namespace TPUart
              * without access return false and may report coarser than per-octet.
              */
             virtual bool lastByteErrored() { return false; }
+            virtual bool lastByteOverrun() { return false; }
+            virtual unsigned char lastByteStatus() { return 0; } // bit0 FE, bit1 PE, bit2 BE, bit3 OE
             virtual bool hasCallback() { return false; }
             virtual void registerCallback(std::function<bool()> callback) {}
         };

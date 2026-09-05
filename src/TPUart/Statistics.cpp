@@ -146,6 +146,19 @@ namespace TPUart
         _rxUartOverflow += increment;
     }
 
+    void Statistics::incrementRxByteStatus(unsigned char bits)
+    {
+        if (bits & 0x01) _rxByteFraming++;
+        if (bits & 0x02) _rxByteParity++;
+        if (bits & 0x04) _rxByteBreak++;
+        if (bits & 0x08) _rxByteOverrun++;
+    }
+
+    unsigned int Statistics::getRxByteFraming() { return _rxByteFraming; }
+    unsigned int Statistics::getRxByteParity()  { return _rxByteParity; }
+    unsigned int Statistics::getRxByteBreak()   { return _rxByteBreak; }
+    unsigned int Statistics::getRxByteOverrun() { return _rxByteOverrun; }
+
     unsigned int Statistics::getRxRepetitions()
     {
         return _rxRepetitions;

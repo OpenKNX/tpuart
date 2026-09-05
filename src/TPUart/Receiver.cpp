@@ -150,6 +150,9 @@ namespace TPUart
             _lastReceivedTime = millis();
 #ifdef TPUART_BUSMON_INTEGRITY
             if (_dll._interface->lastByteErrored()) _byteErrorInFrame = true;
+            // Counted, not acted on: the four causes need separate numbers or a starved host link and a
+            // bus-side bit error are indistinguishable.
+            _dll._statistics.incrementRxByteStatus(_dll._interface->lastByteStatus());
 #endif
 
             const uint start = micros();

@@ -21,6 +21,10 @@ namespace TPUart
         volatile unsigned int _rxReceivedBytes;
         volatile unsigned int _rxSearchBufferOverflow;
         volatile unsigned int _rxUartOverflow;
+        volatile unsigned int _rxByteFraming = 0;
+        volatile unsigned int _rxByteParity = 0;
+        volatile unsigned int _rxByteBreak = 0;
+        volatile unsigned int _rxByteOverrun = 0;
         volatile unsigned int _txFrames;
         volatile unsigned int _txOverflowFrameBuffer;
         volatile unsigned int _rxRepetitions;
@@ -56,6 +60,7 @@ namespace TPUart
         void incrementRxSearchBufferOverflow(int increment = 1);
         void incrementRxFrameBufferOverflow(int increment = 1);
         void incrementRxUartOverflow(int increment = 1);
+        void incrementRxByteStatus(unsigned char bits); // DR[11:8] FE|PE|BE|OE of one received octet
         void incrementTxOverflowFrameBuffer(int increment = 1);
         void incrementTxFrames(int increment = 1);
         void incrementBcuResets(int increment = 1);
@@ -79,6 +84,10 @@ namespace TPUart
         unsigned int getRxSearchBufferOverflow();
         unsigned int getRxFrameBufferOverflow();
         unsigned int getRxUartOverflow();
+        unsigned int getRxByteFraming();  // host link: baud/clock mismatch
+        unsigned int getRxByteParity();   // NCN encodes a bus-side bit error here (DS p.27)
+        unsigned int getRxByteBreak();
+        unsigned int getRxByteOverrun();  // host link: octets lost before they were read
         unsigned int getBusLoad();
         unsigned int getTxOverflowFrameBuffer();
         unsigned int getRxOverflowFrameBuffer();

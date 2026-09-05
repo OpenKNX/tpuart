@@ -18,6 +18,7 @@ namespace TPUart
         // Coarse: the IDF reports the error as an event without naming the octet, so this latches until
         // the next read() and may tag a neighbour. The busmon flag is per telegram, so that is enough.
         volatile bool _byteErrored = false;
+        volatile unsigned char _byteStatus = 0; // bit0 FE, bit1 PE -- kept apart: FE means the baud is wrong
         QueueHandle_t _taskQueue = nullptr;
         TaskHandle_t _taskHandle = nullptr;
         std::function<void(void)> _callback;
@@ -38,17 +39,23 @@ namespace TPUart
                         case UART_PARITY_ERR:
                         case UART_FRAME_ERR:
                             // NCN: bus-side bit error, encoded into the octet's parity bit (DS p.27).
+                            // A FRAME error is different -- it means the octet did not fit the configured
+                            // baud rate at all, which is what a wrong baud looks like.
                             _byteErrored = true;
+                            _byteStatus |= (event.type == UART_FRAME_ERR) ? 0x01 : 0x02;
                             // fall through: the octets around it must still be drained
                         case UART_FIFO_OVF:
                         case UART_BUFFER_FULL:
-                            // Reached by the fall-through above, so it must test the event. Overflow means
-                            // octets were LOST; a parity error does not. Setting it there latched
+                            // Both reached by the fall-through above, so both must test the event. Overflow
+                            // means octets were LOST; a parity error does not. Setting it there latched
                             // Receiver::_invalid, and processQueue() refuses to transmit while that is set --
                             // one bus-side bit error (the NCN encodes those in the parity bit) silenced the
                             // device until the desync watchdog recovered it.
                             if (event.type == UART_FIFO_OVF || event.type == UART_BUFFER_FULL)
+                            {
+                                _byteStatus |= 0x08; // host link lost octets, the bus is unaffected
                                 _interface->_overflow = true;
+                            }
                             // fall through: drain whatever the driver still holds so we keep up
                         case UART_DATA:
                         {
@@ -77,6 +84,10 @@ namespace TPUart
         void ESP32::begin(int baud)
         {
             if (_running) end();
+            // Same reason as the RP2040 path: the latches survive an end()/begin() pair, so a probe at
+            // another baud rate would inherit the previous rate's framing error before an octet arrives.
+            _byteErrored = false;
+            _byteStatus = 0;
             uart_config_t uart_config = {
                 .baud_rate = baud,
                 .data_bits = UART_DATA_8_BITS,
@@ -152,6 +163,13 @@ namespace TPUart
             if (!_byteErrored) return false;
             _byteErrored = false;
             return true;
+        }
+
+        unsigned char ESP32::lastByteStatus()
+        {
+            const unsigned char s = _byteStatus;
+            _byteStatus = 0;
+            return s;
         }
 
         bool ESP32::overflow()

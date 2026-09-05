@@ -67,6 +67,11 @@ namespace TPUart
         void RP2040::begin(int baud)
         {
             if (_running) end();
+            // The status latches survive an end()/begin() pair; a probe at another baud rate would
+            // otherwise inherit the previous rate's framing error before a single octet has arrived.
+            _lastByteErrored = false;
+            _lastByteOverrun = false;
+            _lastByteStatus = 0;
             uart_init(_uart, baud);
             uart_set_format(_uart, 8, 1, UART_PARITY_EVEN);
             uart_set_hw_flow(_uart, false, false);
@@ -157,7 +162,9 @@ namespace TPUart
             {
 #ifdef TPUART_BUSMON_INTEGRITY
                 const uint32_t dr = uart_get_hw(_uart)->dr; // DATA + status in one access
-                _lastByteErrored = (dr & 0x0F00) != 0;
+                _lastByteErrored = (dr & 0x0300) != 0; // FE|PE -- same set the ESP32 path reports
+                _lastByteOverrun = (dr & 0x0C00) != 0; // BE|OE -- host link, not the bus
+                _lastByteStatus = (unsigned char)((dr >> 8) & 0x0F);
                 return (int)(dr & 0xFF);
 #else
                 return uart_getc(_uart);
@@ -169,8 +176,12 @@ namespace TPUart
 
             const TpuartDmaWord word = _dmaBuffer[_dmaReaderCount++ % TPUART_RP2040_BUFFER_SIZE];
 #ifdef TPUART_BUSMON_INTEGRITY
-            // DR[11:8] = OE|BE|PE|FE. The NCN drives PE for a bus-side bit error (DS p.27).
-            _lastByteErrored = (word & 0x0F00) != 0;
+            // DR[11:8] = OE|BE|PE|FE. The NCN drives PE for a bus-side bit error (DS p.27); FE can be
+            // either. OE|BE mean this host link lost octets and say nothing about the bus, so they are
+            // counted apart -- lumping them in reported a bus fault for what was a starved UART.
+            _lastByteErrored = (word & 0x0300) != 0;
+            _lastByteOverrun = (word & 0x0C00) != 0;
+            _lastByteStatus = (unsigned char)((word >> 8) & 0x0F);
 #endif
             int ret = (int)(word & 0xFF);
 
@@ -201,6 +212,16 @@ namespace TPUart
         bool RP2040::lastByteErrored()
         {
             return _lastByteErrored;
+        }
+
+        bool RP2040::lastByteOverrun()
+        {
+            return _lastByteOverrun;
+        }
+
+        unsigned char RP2040::lastByteStatus()
+        {
+            return _lastByteStatus;
         }
 
         bool RP2040::hasCallback()
