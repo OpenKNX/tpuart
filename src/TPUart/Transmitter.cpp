@@ -23,11 +23,10 @@ namespace TPUart
      *
      * This constructor initializes the Transmitter object with the provided
      * DataLinkLayer reference. It also sets the initial values for
-     * _cachedAcknowledge, _awaitResponse, and _time to 0.
+     * _awaitResponse and _time to 0.
      */
     Transmitter::Transmitter(DataLinkLayer &dll) : _dll(dll)
     {
-        _cachedAcknowledge = 0;
         _state = TX_IDLE;
         _transmitPos = 0;
         _lastOffset = 0; // the chip resets its own offset on U_L_DataStart.req (DS p.49)
@@ -244,11 +243,18 @@ namespace TPUart
 
     void Transmitter::processTransmitByte()
     {
+        // Before the state check: a parked acknowledge must go out even while TX is idle.
+        flushAcknowledge();
+
         if (_state != TX_TRANSMIT) return;
         // if (!_awaitResponse) return;
         if (!_dll.txLock()) return;
         // Double check
-        if (_state != TX_TRANSMIT) return;
+        if (_state != TX_TRANSMIT)
+        {
+            _dll.txUnlock(); // a second caller (OPENKNX_DUALCORE loop1) must not leak the lock here
+            return;
+        }
 
         const unsigned short size = _frame->size();
         // if (_transmitPos >= size)
@@ -288,8 +294,6 @@ namespace TPUart
 
         _transmitPos++;
         _dll.txUnlock();
-
-        sendCachedAcknowledge();
     }
 
     /**
@@ -421,20 +425,51 @@ namespace TPUart
         }
         else
         {
-            _cachedAcknowledge = U_ACK_REQ | acknowledge;
+            _pendingAcknowledge = (((micros() >> 6) & 0x00FFFFFFul) << 8) | (unsigned long)(U_ACK_REQ | acknowledge);
         }
     }
 
-    void Transmitter::sendCachedAcknowledge()
+    /**
+     * @brief Writes a parked acknowledge, or discards it once its bus window has elapsed.
+     *
+     * Called from the top of the transmit pump and once per process() pass, so a park is resolved
+     * whether or not a transmission is running -- the old cache was flushed only after a transmitted
+     * byte and therefore survived, off-window, into an unrelated frame.
+     */
+    void Transmitter::flushAcknowledge()
     {
-        if (!_cachedAcknowledge) return;
+        const unsigned long parked = _pendingAcknowledge;   // single read: byte and timestamp cannot disagree
+        const unsigned char pending = (unsigned char)(parked & 0xFF);
+        if (!pending) return;
+
+        if (_dll.isMonitoring())
+        {
+            // Monitor mode must stay electrically passive: an acknowledge parked just before the switch
+            // would otherwise still be written onto the line. Discard it, and do not count it as too slow.
+            if (_pendingAcknowledge == parked) _pendingAcknowledge = 0;
+            return;
+        }
+
+        // 24 bits of 64us ticks cover 1073s, so a long main-loop stall cannot alias a stale park back
+        // into the window; the arithmetic stays correct across the micros() wrap.
+        const unsigned long age = (((micros() >> 6) & 0x00FFFFFFul) - (parked >> 8)) & 0x00FFFFFFul;
+        if (age > (TPUART_ACK_WINDOW_US >> 6))
+        {
+            if (_pendingAcknowledge == parked) { _pendingAcknowledge = 0; _droppedAcknowledges++; }
+            return;
+        }
 
         if (_dll.txLock())
         {
-            _dll._interface->write(_cachedAcknowledge);
-            _cachedAcknowledge = 0;
+            _dll._interface->write(pending);
+            if (_pendingAcknowledge == parked) _pendingAcknowledge = 0; // a newer park stays for the next pass
             _dll.txUnlock();
         }
+    }
+
+    unsigned int Transmitter::droppedAcknowledges()
+    {
+        return _droppedAcknowledges;
     }
 
     /**

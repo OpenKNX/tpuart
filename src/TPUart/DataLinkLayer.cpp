@@ -480,6 +480,7 @@ namespace TPUart
             processReceviedByte();
 
         _receiver.process();
+        _transmitter.flushAcknowledge(); // resolve a parked acknowledge even when nothing is transmitting
         // A reset seen during this pass's RX drain: arming the next frame here would only have the pump
         // refuse it below and handleReset() discard it next pass, burning it for a negative confirm.
         if (!_uReset) _transmitter.processQueue();

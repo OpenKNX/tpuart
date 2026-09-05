@@ -27,6 +27,19 @@
 #define TPUART_MAX_RXQUEUE_TIME_PER_LOOP 20
 #endif
 
+// How long a parked acknowledge stays writable, past which it would land on the NEXT frame.
+// 03_02_02 at 9600 baud = 104.167us per bit time. awaitDestination() is 6, so the decision falls once
+// octet 5 is in = bus time 13*5+11 = 76; the acknowledge must start at 13N-2+15 = 13N+13 (2.2.7 p.32),
+// leaving 13N-63 bit times. The bound is the shortest standard frame, LG=0 -> N=8 (a T_Connect to a
+// tunnel address, which the chip does not auto-acknowledge): 41 bit times = 4271us, minus the 11-bit
+// host-UART character that carried octet 5 (573us at the 19200 strap) = 3698us. 3000 keeps margin for
+// chip forwarding and loop jitter and covers requestState() (2 bytes, ~1.1ms). It deliberately does NOT
+// cover applyConfiguration() (up to ~10 bytes, ~5.7ms) -- an acknowledge parked during that init/reset
+// path is discarded rather than sent late onto the following frame.
+#ifndef TPUART_ACK_WINDOW_US
+#define TPUART_ACK_WINDOW_US 3000
+#endif
+
 namespace TPUart
 {
     class DataLinkLayer

@@ -11,7 +11,10 @@ namespace TPUart
     class Transmitter
     {
         DataLinkLayer &_dll;
-        volatile char _cachedAcknowledge;
+        volatile unsigned int _droppedAcknowledges = 0; // acknowledges dropped because their window elapsed (see sendAcknowledge)
+        // One word, because two fields cannot be read consistently from two contexts: bits 0-7 hold the
+        // parked acknowledge (0 = none), bits 8-31 the micros() it was parked at, truncated to 24 bits.
+        volatile unsigned long _pendingAcknowledge = 0;
         size_t _transmitPos;
         unsigned char _lastOffset; // NCN5130 keeps the data-index offset until it is changed (DS p.42)
         volatile unsigned long _time;
@@ -35,13 +38,14 @@ namespace TPUart
         // notify=false suppresses the dropped-frame callback (destructor only, see Transmitter::reset).
         void reset(bool notify = true);
         void sendAcknowledge(AcknowledgeType acknowledge = ACK_None);
+        void flushAcknowledge();
         void setQueueSize(unsigned long size);
 
         void processTransmitByte();
         Frame *currentFrame();
         bool isTransmitting();
         bool awaitResponse();
-        void sendCachedAcknowledge();
+        unsigned int droppedAcknowledges();
         void processQueue();
         void resetWatchdogTimer();
     };
