@@ -20,8 +20,9 @@
 #endif
 
 // Feature level for dependents: 2 adds the chip-config accessors, the acknowledge-drop counter, the
-// per-octet byte-status counters and chipAutoAcknowledge(). Consumers gate on it so they still build
-// against an older TPUart. Never nest this in another guard -- it must not depend on a product knob.
+// per-octet byte-status counters, chipAutoAcknowledge() and registerDroppedFrame(); 3 adds
+// getNcnChip()/getNcnChipName()/ncnChipInferred()/ncnAsr0Valid(). Consumers gate on it so they still
+// build against an older TPUart. Never nest this in another guard -- it must not depend on a product knob.
 #define TPUART_API_LEVEL 3
 
 #ifndef TPUART_MAX_PROCESS_TIME_PER_LOOP
