@@ -1,6 +1,41 @@
 # Changes
 
 
+## unreleased
+
+**Transmit path**
+* Fix: a dropped frame is reported only when one was actually in flight -- `reset()` reported the in-flight frame unconditionally, so a frame already confirmed positively produced a second, negative `L_Data.con` on every console reset, busmonitor exit and watchdog reset
+* Feature: a frame the driver has to drop is handed to a new dropped-frame callback, so the upper layer can confirm it negatively instead of leaving the caller in a timeout
+* Fix: `receivedReset()` no longer resets the transmitter from the UART interrupt, where its blocking `txLock` hung the device whenever the main loop held that lock -- `handleReset()` does it in main-loop context
+* Fix: the transmit pump and both `processQueue()` calls stop while a chip reset is pending, so no partial LPDU reaches the line and no frame is armed only to be dropped unsent
+* Fix: an early return in `processTransmitByte` left `txLock` held permanently, which killed every acknowledge and all transmission
+* Fix: the queue scan checked three buckets and then took `front()` of the fourth unconditionally, which is undefined on an empty deque
+* Fix: the repetition filter skips raw busmonitor carriers, whose buffer is shorter than `size()` claims
+
+**Acknowledge**
+* Fix: a blocked acknowledge is parked and written as soon as `txLock` frees, instead of being cached and flushed only at the end of `processTransmitByte` -- which returns immediately while the transmitter is idle, so the cached acknowledge sat until the next transmission and was then applied to whatever frame the chip was receiving at that moment, acknowledging a foreign telegram and suppressing the TP1 repetition its receiver depends on
+* Fix: a parked acknowledge is discarded once its bus window has elapsed. The window is derived from 03_02_02: the decision falls six octets in, the acknowledge must start at `13N+13`, so the budget is `13N-63` bit times; the shortest standard frame is LG 0 at N=8, which leaves 41 bit times, minus the 11-bit host character at the 19200 strap
+* Fix: byte and timestamp live in one word, because two fields cannot be read consistently from the receive context and the main loop; the timestamp counts 64 us ticks, so 24 bits cover 1073 s and a long main-loop stall cannot alias a stale park back into the window
+* Fix: monitor mode discards a parked acknowledge instead of writing it, because the chip is passive there
+* Feature: what no longer fits its window is counted and shown in `bcu stat`
+
+**Receive path**
+* Fix: a bus-side bit error no longer silences the transmitter. On ESP32 `UART_PARITY_ERR`/`UART_FRAME_ERR` fell through into the overflow case, so a parity error set `_overflow` like a lost octet; `Receiver` turns that into `_invalid` and `processQueue()` refuses to transmit while it is set. The NCN encodes a bus-side bit error into the parity bit, so a single bit error muted the device for the full 20 s watchdog period while its address kept acknowledging on the wire
+* Fix: `Frame::cemiData()` checks its allocation before writing into the buffer
+
+**Diagnostics**
+* Feature: the UART byte status is split into framing, parity, break and overrun and counted separately -- the receive path had one flag for all of them, so a starved host link, a wrong baud rate and a bus-side bit error were indistinguishable
+* Feature: `TPUART_API_LEVEL` lets a dependent gate on the new accessors, so it still builds against an older driver
+* Feature: `bcu autoack on|off` withholds `U_SetAddress.req`, which is what turns the chip's automatic acknowledge on; the host then decides every acknowledge alone. Default unchanged; refused while a busmonitor runs
+
+**Bus load**
+* Fix: only the bit times that reach TP1 are counted -- the sum added 26 bit times per frame for the two CRC-CCITT octets the NCN appends on the host UART, and the 15 bit times of the acknowledge window even when no acknowledge followed, although 03_02_02 2.3.1 measures the 50 bit times of bus-free from the last bit of the message cycle. Reported load was 6 to 20 percent too high
+
+**Initialisation**
+* Fix: the probed baud rate is cross-checked before it is accepted -- one octet looking like `U_RESET_IND` was enough, and reading a stream at the wrong rate hands out re-framed fragments of neighbouring octets. The first pass now requires a probe without a framing error; the second repeats the old rule so a board that always reports one still comes up
+
+
+
 ## ec/v1.2.0-beta.1 -- second batch: 2026-08-29
 
 The tag was moved from `fa2eb70` to `f018d90`, so everything below is part of it.
