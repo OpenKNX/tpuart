@@ -99,7 +99,7 @@ namespace TPUart
         }
         _frame = _queue[r].front();
         _queue[r].pop();
-        --_txCount;
+        _txCount -= 1;
         _dll._statistics.incrementTxFrames();
 
         // Fallback if the frame is too big - Filtered on DLL, too
@@ -317,7 +317,7 @@ namespace TPUart
         if (_txCount >= limit) return false;
 
         _queue[r].push(frame);
-        ++_txCount;
+        _txCount += 1;
         return true;
     }
 
@@ -396,7 +396,7 @@ namespace TPUart
                 {
                     frame = _queue[r].front();
                     _queue[r].pop();
-                    --_txCount;
+                    _txCount -= 1;
                 }
             _dll.txUnlock();
 
@@ -455,7 +455,7 @@ namespace TPUart
         const unsigned long age = (((micros() >> 6) & 0x00FFFFFFul) - (parked >> 8)) & 0x00FFFFFFul;
         if (age > (TPUART_ACK_WINDOW_US >> 6))
         {
-            if (_pendingAcknowledge == parked) { _pendingAcknowledge = 0; _droppedAcknowledges++; }
+            if (_pendingAcknowledge == parked) { _pendingAcknowledge = 0; _droppedAcknowledges += 1; }
             return;
         }
 

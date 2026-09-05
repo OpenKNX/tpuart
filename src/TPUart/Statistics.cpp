@@ -148,10 +148,10 @@ namespace TPUart
 
     void Statistics::incrementRxByteStatus(unsigned char bits)
     {
-        if (bits & 0x01) _rxByteFraming++;
-        if (bits & 0x02) _rxByteParity++;
-        if (bits & 0x04) _rxByteBreak++;
-        if (bits & 0x08) _rxByteOverrun++;
+        if (bits & 0x01) _rxByteFraming += 1;
+        if (bits & 0x02) _rxByteParity += 1;
+        if (bits & 0x04) _rxByteBreak += 1;
+        if (bits & 0x08) _rxByteOverrun += 1;
     }
 
     unsigned int Statistics::getRxByteFraming() { return _rxByteFraming; }
