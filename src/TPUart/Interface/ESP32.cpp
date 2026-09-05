@@ -42,7 +42,13 @@ namespace TPUart
                             // fall through: the octets around it must still be drained
                         case UART_FIFO_OVF:
                         case UART_BUFFER_FULL:
-                            _interface->_overflow = true;
+                            // Reached by the fall-through above, so it must test the event. Overflow means
+                            // octets were LOST; a parity error does not. Setting it there latched
+                            // Receiver::_invalid, and processQueue() refuses to transmit while that is set --
+                            // one bus-side bit error (the NCN encodes those in the parity bit) silenced the
+                            // device until the desync watchdog recovered it.
+                            if (event.type == UART_FIFO_OVF || event.type == UART_BUFFER_FULL)
+                                _interface->_overflow = true;
                             // fall through: drain whatever the driver still holds so we keep up
                         case UART_DATA:
                         {
