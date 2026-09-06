@@ -64,11 +64,17 @@ namespace TPUart
 
       public:
         Frame(const char *data) : _data(data) {}
+        // Copies the octets into own storage. On heap exhaustion no octet is written through a null
+        // pointer, but the frame is then unusable: data() returns nullptr and every accessor that reads
+        // the buffer -- size(), rawLength(), source(), destination(), isValid() -- dereferences it.
+        // A caller MUST check data() against nullptr before using the frame for anything else.
         Frame(const char *data, unsigned short size)
         {
+            _data = (const char *)malloc(size);
+            if (_data == nullptr) return;
+
             _len = size;
             _deleteData = true;
-            _data = (const char *)malloc(size);
             memcpy((char *)_data, data, size);
         }
         Frame(const char *data, bool deleteData) : _data(data), _deleteData(deleteData) {}
