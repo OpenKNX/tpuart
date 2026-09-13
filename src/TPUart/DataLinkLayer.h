@@ -85,6 +85,13 @@ namespace TPUart
         bool _ncnRegValid = false;     // a register read answered with its documented reset value
         bool _ncnAsr0Valid = false;    // ASR0 actually replied (separate: _ncnRegValid does not cover it)
         volatile BcuState _bcuState = BCU_UNINITIALIZED;
+        // Every U_Reset.ind the parser accepted. The best chip-sourced evidence that a reset request was
+        // executed -- _bcuState cannot tell, reset() sets BCU_CONNECTED before the request even goes out,
+        // so it mirrors intent. Read it as a POSITIVE signal only: an in-sync 0x03 from the bus stream
+        // can imitate the indication (see the CRC-low-byte note in Receiver), and while the receiver is
+        // desynced a real one is discarded -- so "no increment" is inconclusive unless receiverDesynced()
+        // is false. Pair the two.
+        volatile uint32_t _resetIndCount = 0;
         volatile int _baudrate = 0; // last negotiated BCU baudrate (19200/38400), stored on connect
 
         // Overflow
@@ -244,6 +251,13 @@ namespace TPUart
         const char *getBcuStateInfo();
         int getBaudrate();
         bool isMonitoring() const;
+        /** @brief Count of U_Reset.ind received; compare two samples to see whether a reset was executed. */
+        uint32_t resetIndCount() const { return _resetIndCount; }
+        /**
+         * @brief Receiver lost byte sync. While set, processSearchBufferInvalid() DISCARDS control bytes,
+         * so a genuine U_Reset.ind never reaches the parser -- a missing indication then proves nothing.
+         */
+        bool receiverDesynced() const { return _receiver._invalid; }
         bool isConnected() const;
         // "Is the KNX bus actually usable?" for the tunnel connectionstate heartbeat: host<->chip link up AND,
         // on an NCN, the bus-voltage (VBUS) bit set. isConnected() alone misses bus-power loss on an

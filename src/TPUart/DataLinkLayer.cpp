@@ -574,8 +574,10 @@ namespace TPUart
         {
             // Active reconnect: the NCN went mute/desynced. Clean the parser, flush, poke U_RESET_REQ -- all
             // under rxLock, no UART teardown. The only way back to CONNECTED is receivedReset() on a genuine
-            // U_RESET_IND (parsed unconditionally even while _invalid), so a wedged chip dribbling noise can't
-            // look alive.
+            // U_RESET_IND, so a wedged chip dribbling noise can't look alive. The _receiver.reset() below is
+            // what makes that reachable: while _invalid is set the parser DISCARDS control bytes, so the
+            // indication would never arrive -- clearing the desync before each poke is load-bearing, not
+            // tidiness (an earlier version of this comment claimed the indication is parsed regardless).
             _lastReconnectAttempt = millis();
             printMessage("BCU reconnect: U_RESET_REQ");
             rxLock(true);
@@ -1310,6 +1312,9 @@ namespace TPUart
         _lastValidRx = millis();
         _reconnectBackoff = 1000; // a real reconnect succeeded -> reset the poke backoff to fast
         _uReset = true;
+        // Counted, not timestamped: two indications inside one millisecond would share a stamp, and a
+        // counter is wrap-safe for the only question anyone asks of it ("did a new one arrive?").
+        _resetIndCount++;
         _modeExtendedCRC = false;
         _modeAutoAcknowlage = false;
         _receiver._invalid = false; // reset indication -> the stream restarts in sync, so clear the desync flag (the parser also clears it on the U_RESET_IND)
