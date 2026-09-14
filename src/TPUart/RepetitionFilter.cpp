@@ -1,87 +1,91 @@
-#include "RepetitionFilter.h"
+#include "TPUart/RepetitionFilter.h"
+
 #include <Arduino.h>
+
+#include "TPUart/Frame.h"
 
 namespace TPUart
 {
-    unsigned short RepetitionFilter::crc(Frame &frame)
+
+uint16_t RepetitionFilter::fingerprint(const Frame &frame)
+{
+    uint16_t crc = 0x1D0F;
+    constexpr uint16_t POLYNOMIAL = 0x1021;
+
+    // Nur über das, was wirklich ankam: bei einem abgeschnittenen Telegramm ist size() größer als die
+    // vorhandenen Daten. Das Prüfsummen-Oktett bleibt außen vor.
+    size_t length = frame.length();
+    if (frame.size() <= length) length = frame.size() - 1;
+
+    for (size_t i = 0; i < length; i++)
     {
-        // CRC-16/SPI-FUJITSU
-        unsigned short crc = 0x1D0F;
-        unsigned short polynomial = 0x1021;
+        uint8_t value = frame.data(i);
+        if (i == 0) value |= 0b100000; // Wiederholungs-Bit vereinheitlichen
 
-        const size_t s = frame.size() - 1; // without checksum
-        for (size_t i = 0; i < s; i++)
-        {
-            char data = frame.data(i);
-            if (i == 0) data = data | 0b100000; // retry bit
-
-            crc ^= (data << 8);
-            for (size_t j = 0; j < 8; j++)
-                if (crc & 0x8000)
-                    crc = (crc << 1) ^ polynomial;
-                else
-                    crc <<= 1;
-        }
-        return crc;
+        crc ^= (uint16_t)(value << 8);
+        for (size_t bit = 0; bit < 8; bit++)
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ POLYNOMIAL) : (uint16_t)(crc << 1);
     }
 
-    bool RepetitionFilter::check(Frame &frame)
+    return crc;
+}
+
+bool RepetitionFilter::check(const Frame &frame)
+{
+    uint16_t source = frame.source();
+    uint16_t checksum = fingerprint(frame);
+    uint32_t now = millis();
+
+    Entry *slot = nullptr;
+    Entry *oldest = &_entries[0];
+    bool seen = false;
+
+    for (size_t i = 0; i < TPUART_REPETITION_FILTER_COUNT; i++)
     {
-        const unsigned short source = frame.source();
-        const unsigned short checksum = crc(frame);
+        Entry &entry = _entries[i];
 
-        const unsigned long start = micros();
-        auto it = _map.find(source);
-        if (it != _map.end())
+        if (!entry._used)
         {
-            unsigned short ref = it->second->second;
-            // Key existiert bereits -> aktualisieren & Eintrag nach vorne schieben
-            // 1) Alten Eintrag aus Liste entfernen
-            _entries.erase(it->second);
-            // 2) Neuer Eintrag wird am Kopf (Front) eingefügt
-            _entries.push_front({source, checksum});
-            // 3) Iterator in der Map updaten
-            _map[source] = _entries.begin();
-
-            if (ref == checksum) return true;
-        }
-        else
-        {
-            // Key existiert nicht -> neuer Eintrag
-            if (_entries.size() == MAX_SIZE)
-            {
-                // Falls wir bereits 50 Einträge haben, entfernen wir den ältesten (hinten)
-                auto lastIt = --(_entries.end());
-                uint16_t oldKey = lastIt->first;
-                // Aus der Map löschen
-                _map.erase(oldKey);
-                // Aus der Liste löschen
-                _entries.pop_back();
-            }
-            // Neuen Eintrag vorne einfügen
-            _entries.push_front({source, checksum});
-            // Und in Map speichern
-            _map[source] = _entries.begin();
+            if (slot == nullptr) slot = &entry;
+            continue;
         }
 
-        unsigned long duration = micros() - start;
-        _avg += duration;
-        _avgCnt++;
+        if (entry._source == source)
+        {
+            seen = (entry._checksum == checksum);
+            slot = &entry; // derselbe Absender überschreibt immer seinen eigenen Eintrag
+            break;
+        }
 
-        // Serial.printf("duration %lu\n", duration);
-        // Serial.printf("duration AVG %lu\n", _avg / _avgCnt);
-        return false;
+        if ((uint32_t)(now - entry._timestamp) > (uint32_t)(now - oldest->_timestamp)) oldest = &entry;
     }
 
-    void RepetitionFilter::clear()
-    {
-        _entries.clear();
-        _map.clear();
-    }
+    // Alles belegt und der Absender noch nicht dabei: der am längsten nicht mehr gesehene Absender
+    // fällt raus. Das ist die einzige Art, wie ein Eintrag verschwindet - neue Telegramme verdrängen
+    // alte, so wie die 50er-Liste der alten Library.
+    if (slot == nullptr) slot = oldest;
 
-    std::size_t RepetitionFilter::size()
-    {
-        return _entries.size();
-    }
+    slot->_source = source;
+    slot->_checksum = checksum;
+    slot->_timestamp = now;
+    slot->_used = true;
+
+    return seen;
+}
+
+void RepetitionFilter::clear()
+{
+    for (size_t i = 0; i < TPUART_REPETITION_FILTER_COUNT; i++)
+        _entries[i]._used = false;
+}
+
+size_t RepetitionFilter::size() const
+{
+    size_t count = 0;
+    for (size_t i = 0; i < TPUART_REPETITION_FILTER_COUNT; i++)
+        if (_entries[i]._used) count++;
+
+    return count;
+}
 
 } // namespace TPUart
