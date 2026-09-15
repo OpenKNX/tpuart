@@ -3,6 +3,15 @@
 
 ## ec/1.3.0-beta.1: 2026-09-03
 
+The tag was moved again on 2026-09-15, from `472d7ca` to `8de964d`, so the two entries directly below
+are part of it. It had been left behind: `knx` pins this tag, and the stack already used members that
+only the newer commit carries, so every consumer that resolved the tag failed to compile while a local
+checkout built fine.
+
+* Feature: `U_Reset.ind` is counted, so a chip that swallowed a reset request can be told from one that
+  answered it -- the driver saw only the absence of a reply and could not distinguish the two
+* Fix: a failed frame allocation is not copied into
+
 The tag was moved from `340897e` so the volatile-counter fix below is part of it.
 
 **Transmit path**
