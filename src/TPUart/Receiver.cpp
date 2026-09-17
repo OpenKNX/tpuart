@@ -6,6 +6,14 @@
 #define TPUART_RX_TIMEOUT 5
 #endif
 
+// Quiet window before a missing L_Data.con is declared lost. Not TPUART_RX_TIMEOUT, which guards an
+// intra-frame gap: the chip's own retransmission needs 30 bit times of acknowledge window plus 50 idle
+// (NACK) or 150 (BUSY) before the first retry octet, and hundreds of ms for a full 3+3 sequence.
+// The 8 s TX backstop remains the outer net.
+#ifndef TPUART_TX_CON_QUIET_MS
+#define TPUART_TX_CON_QUIET_MS 200
+#endif
+
 #ifdef OPENKNX_CON_DIAG
 // L_Data.con-generation diagnostics (counters dumped by the IP tunnel server). Gated by OPENKNX_CON_DIAG.
 uint16_t g_rxTxWaitAckn = 0, g_rxTxCompleted = 0, g_txAwaitEcho = 0, g_echoMismatch = 0, g_echoTxIdle = 0;
@@ -29,7 +37,7 @@ namespace TPUart
         // would act -> "Reset BCU". So on the loop tick -- where the watchdog also lives -- force the
         // SAME completion the burst case uses, but ONLY for our own proven echo (structural gate).
         if (_state == RX_FRAME_WAIT_ACKN
-            && millis() - _lastReceivedTime >= TPUART_RX_TIMEOUT
+            && millis() - _lastReceivedTime >= TPUART_TX_CON_QUIET_MS
             && _searchBuffer.frame().isTransmitted()
             && _dll.getTransmitter().awaitResponse())
         {
@@ -40,7 +48,7 @@ namespace TPUart
                 && _searchBuffer.frame().isTransmitted()
                 && _dll.getTransmitter().awaitResponse()
                 && !_dll._interface->available()
-                && millis() - _lastReceivedTime >= TPUART_RX_TIMEOUT)
+                && millis() - _lastReceivedTime >= TPUART_TX_CON_QUIET_MS)
             {
 #ifdef TPUART_BCU_DEBUG
                 _dll.printError("CONr: idleBus");
