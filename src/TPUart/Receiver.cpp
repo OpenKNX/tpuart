@@ -155,7 +155,14 @@ namespace TPUart
 
         if (value != -1)
         {
-            _lastReceivedTime = millis();
+            const unsigned long now = millis();
+            // Measure the gap that preceded this byte. processTimeout() is loop-driven and runs only after the
+            // drain loop has pushed the whole UART buffer through the parser, so a pause between two telegrams
+            // inside one drain was invisible and the next telegram was appended to a parked torso.
+            if (_searchBuffer.position() && !_searchBuffer.timeout() && (now - _lastReceivedTime) >= TPUART_RX_TIMEOUT)
+                _searchBuffer.timeout(_searchBuffer.position());
+
+            _lastReceivedTime = now;
 #ifdef TPUART_BUSMON_INTEGRITY
             if (_dll._interface->lastByteErrored()) _byteErrorInFrame = true;
             // Counted, not acted on: the four causes need separate numbers or a starved host link and a
