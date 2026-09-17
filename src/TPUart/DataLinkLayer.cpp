@@ -596,7 +596,9 @@ namespace TPUart
         handleReset();
         unsigned long start;
 
-        start = millis();
+        // The RX drain is deliberately unbounded: the byte rate is capped by TP1 itself, and cutting it
+        // short would leave bytes in the UART FIFO to overflow instead. (A `start = millis()` used to sit
+        // here and was overwritten below without ever being read -- the remains of an abandoned bound.)
         // if (!_interface->hasCallback())
         while (_interface->available())
             processReceviedByte();

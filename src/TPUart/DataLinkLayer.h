@@ -25,9 +25,10 @@
 // build against an older TPUart. Never nest this in another guard -- it must not depend on a product knob.
 #define TPUART_API_LEVEL 3
 
-#ifndef TPUART_MAX_PROCESS_TIME_PER_LOOP
-#define TPUART_MAX_PROCESS_TIME_PER_LOOP 30
-#endif
+// (TPUART_MAX_PROCESS_TIME_PER_LOOP removed: it was never referenced anywhere, so setting it did nothing.
+//  Bounding the RX drain in process() was considered and deliberately NOT added -- it would trade a loop
+//  stall for a UART FIFO overflow, and which of the two is worse is a measurement, not a guess.
+//  TPUART_MAX_RXQUEUE_TIME_PER_LOOP below IS live, see DataLinkLayer.cpp.)
 
 #ifndef TPUART_MAX_RXQUEUE_TIME_PER_LOOP
 #define TPUART_MAX_RXQUEUE_TIME_PER_LOOP 20
