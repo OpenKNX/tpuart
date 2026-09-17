@@ -1,6 +1,10 @@
 #include "RepetitionFilter.h"
 #include <Arduino.h>
 
+#ifndef TPUART_REPETITION_TTL_MS
+#define TPUART_REPETITION_TTL_MS 3000
+#endif
+
 namespace TPUart
 {
     unsigned short RepetitionFilter::crc(Frame &frame)
@@ -31,19 +35,21 @@ namespace TPUart
         const unsigned short checksum = crc(frame);
 
         const unsigned long start = micros();
+        const unsigned long now = millis();
         auto it = _map.find(source);
         if (it != _map.end())
         {
-            unsigned short ref = it->second->second;
+            unsigned short ref = it->second->checksum;
+            const bool fresh = (now - it->second->timestamp) <= TPUART_REPETITION_TTL_MS;
             // Key existiert bereits -> aktualisieren & Eintrag nach vorne schieben
             // 1) Alten Eintrag aus Liste entfernen
             _entries.erase(it->second);
             // 2) Neuer Eintrag wird am Kopf (Front) eingefügt
-            _entries.push_front({source, checksum});
+            _entries.push_front({source, checksum, now});
             // 3) Iterator in der Map updaten
             _map[source] = _entries.begin();
 
-            if (ref == checksum) return true;
+            if (ref == checksum && fresh) return true;
         }
         else
         {
@@ -52,14 +58,14 @@ namespace TPUart
             {
                 // Falls wir bereits 50 Einträge haben, entfernen wir den ältesten (hinten)
                 auto lastIt = --(_entries.end());
-                uint16_t oldKey = lastIt->first;
+                uint16_t oldKey = lastIt->source;
                 // Aus der Map löschen
                 _map.erase(oldKey);
                 // Aus der Liste löschen
                 _entries.pop_back();
             }
             // Neuen Eintrag vorne einfügen
-            _entries.push_front({source, checksum});
+            _entries.push_front({source, checksum, now});
             // Und in Map speichern
             _map[source] = _entries.begin();
         }

@@ -390,10 +390,9 @@ namespace TPUart
 
             run++;
 
-            // Skip the repetition filter for busmon-only carriers: they are either not an LPDU at all
-            // (a 1-byte acknowledge, a raw poll frame) or their buffer is shorter than size() claims, so
-            // size()/source() would read past it and pollute the per-source repetition map.
-            if (!frame.isErrored() && !frame.isAckOnly() && !frame.isTruncated() && !frame.isRaw())
+            // Our own echo is excluded too: a chip retransmission otherwise matched its own original and the
+            // confirmation was swallowed.
+            if (!frame.isErrored() && !frame.isAckOnly() && !frame.isTruncated() && !frame.isRaw() && !frame.isTransmitted())
             {
                 bool alreadFound;
                 alreadFound = _repetitionFilter.check(frame);
