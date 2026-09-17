@@ -56,7 +56,7 @@ namespace TPUart
       private:
         bool _initialized = false;
         char _repetitions = 0b00110011; // 0-3 Nack (Default 3) // 5-7 Busy (Default 3)
-        short _ownAddress = 0;
+        uint16_t _ownAddress = 0;   // unsigned: a PA >= 0x8000 (areas 8-15, and the 15.15.255 default) must not read as negative
         bool _chipAutoAck = true; // false -> the chip address is withheld, so only the host acknowledges
         volatile bool _uReset = false;
         volatile char _uState = 0;
@@ -237,7 +237,7 @@ namespace TPUart
         bool powerControl(bool state);
         bool stopMode(bool state);
         bool busyMode(bool state);
-        void setOwnAddress(short address);
+        void setOwnAddress(uint16_t address);
         // U_SetAddress.req is what turns the chip's automatic acknowledge on. Withholding the address
         // leaves every acknowledge decision to checkAcknowledge(), so the chip can no longer NACK a frame
         // it mis-received on its own -- which would otherwise destroy that telegram for every other device.
