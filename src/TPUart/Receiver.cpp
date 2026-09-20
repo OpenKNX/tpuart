@@ -93,6 +93,12 @@ namespace TPUart
         // Without this a host blockage swept a complete telegram and latched _invalid behind it.
         if (_dll._interface->available()) return;
 
+        // A two-octet chip indication that asked for its companion is not a desynchronised frame, and the
+        // companion may arrive later than the intra-frame timeout. The marker is then older than the
+        // octets it would sweep: outside a frame only U_SYSTEM_STAT_IND raises _awaitBytes, so this cannot
+        // reach the frame resynchronisation. Measured on hardware: 29 ms between 4B and its data octet.
+        if (_state == RX_IDLE && _awaitBytes > 1 && _searchBuffer.position() >= _awaitBytes) return;
+
         if(_state == RX_FRAME_WAIT_ACKN)
         {
                 _state = RX_FRAME_COMPLETE;
