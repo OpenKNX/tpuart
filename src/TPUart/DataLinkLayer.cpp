@@ -390,9 +390,10 @@ namespace TPUart
 
             run++;
 
-            // Our own echo is excluded too: a chip retransmission otherwise matched its own original and the
-            // confirmation was swallowed.
-            if (!frame.isErrored() && !frame.isAckOnly() && !frame.isTruncated() && !frame.isRaw() && !frame.isTransmitted())
+            // Our own transmissions are recorded too: without the original, a chip retransmission arrived
+            // as a foreign telegram carrying our own source address. Safe now, because the confirmation
+            // branch in the knx receive path runs BEFORE the filter gate.
+            if (!frame.isErrored() && !frame.isAckOnly() && !frame.isTruncated() && !frame.isRaw())
             {
                 bool alreadFound;
                 alreadFound = _repetitionFilter.check(frame);
