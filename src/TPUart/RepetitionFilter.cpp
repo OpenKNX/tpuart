@@ -16,10 +16,10 @@ namespace TPUart
         const size_t s = frame.size() - 1; // without checksum
         for (size_t i = 0; i < s; i++)
         {
-            char data = frame.data(i);
+            uint8_t data = (uint8_t)frame.data(i); // a signed char shifted left is undefined for octets >= 80h
             if (i == 0) data = data | 0b100000; // retry bit
 
-            crc ^= (data << 8);
+            crc ^= (uint16_t)(data << 8);
             for (size_t j = 0; j < 8; j++)
                 if (crc & 0x8000)
                     crc = (crc << 1) ^ polynomial;
