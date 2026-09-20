@@ -156,10 +156,12 @@ namespace TPUart
         if (value != -1)
         {
             const unsigned long now = millis();
-            // Measure the gap that preceded this byte. processTimeout() is loop-driven and runs only after the
-            // drain loop has pushed the whole UART buffer through the parser, so a pause between two telegrams
-            // inside one drain was invisible and the next telegram was appended to a parked torso.
-            if (_searchBuffer.position() && !_searchBuffer.timeout() && (now - _lastReceivedTime) >= TPUART_RX_TIMEOUT)
+            // Measure the gap that preceded this byte. _lastReceivedTime is a READ time, so this is only a bus
+            // gap while the interface runs empty - with bytes still buffered it is the host's own blockage
+            // (a 4 KB flash erase runs with interrupts off), and marking that discarded a complete telegram.
+            const bool gap = _searchBuffer.position() && !_searchBuffer.timeout()
+                             && (now - _lastReceivedTime) >= TPUART_RX_TIMEOUT;
+            if (gap && !_dll._interface->available())
                 _searchBuffer.timeout(_searchBuffer.position());
 
             _lastReceivedTime = now;
