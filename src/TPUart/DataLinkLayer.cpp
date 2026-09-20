@@ -536,10 +536,11 @@ namespace TPUart
     {
         _initialized = false;
         _bcuState = BCU_UNINITIALIZED;
-        if (deleteUart && _interface == nullptr)
-        {
-            delete _interface;
-        }
+        // No delete: the interface belongs to the Platform, which hands it out through interface() and
+        // outlives this layer. The parameter is kept for the existing signature; the inverted test it
+        // used to carry never deleted anything, which is why nothing has noticed.
+        (void)deleteUart;
+        _interface = nullptr;
     }
 
     /*
