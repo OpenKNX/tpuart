@@ -88,6 +88,10 @@ namespace TPUart
     {
         if (!_searchBuffer.timeout()) return;
         if (_searchBuffer.timeout() >= _awaitBytes) return;
+        // Bytes still waiting means the marker cannot stand for a quiet bus, whoever set it: let the
+        // interface run empty and have the length and the checksum decide instead of a time estimate.
+        // Without this a host blockage swept a complete telegram and latched _invalid behind it.
+        if (_dll._interface->available()) return;
 
         if(_state == RX_FRAME_WAIT_ACKN)
         {
