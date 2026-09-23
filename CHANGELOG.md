@@ -1,6 +1,36 @@
 # Changes
 
 
+## unreleased
+
+Receive-path work, centred on the idle gap that decides where a telegram ends, plus the repetition
+filter and two signedness defects. The gap fixes are pinned by `HT-1.21` and `HT-1.22` of the host
+stack harness in OAM-IP-Interface, each proven red without its guard, and confirmed on hardware
+(RP2350 and NCN5130 against a NeoPixel device).
+
+**Receive path**
+* Fix: the idle gap is measured at the byte that follows it. `processTimeout()` runs from the loop, after the drain has already pushed the whole UART buffer through the parser, so a pause between two telegrams inside one drain was invisible and the telegram that arrived after it was appended to a parked torso instead of starting a frame
+* Fix: the gap marker is set only while the interface runs empty. `_lastReceivedTime` is a READ time, so a blocked host looked exactly like a bus that went quiet -- a 4 kB flash erase runs with interrupts off while the octets keep arriving, and a complete telegram was swept. Measured on an RP2350: a 27 ms gap with the telegram complete in the buffer, three destroyed in one download. The sweep latches `_invalid`, which then eats valid control bytes until a whole frame gets through again
+* Fix: a marker is not swept while octets are still waiting. Two detectors set it and only the loop-driven one consulted the interface; a marker that predates buffered octets cannot stand for a quiet bus, whoever set it. The length octet and the check octet decide now instead of a time estimate
+* Fix: a chip indication whose companion octet arrives late survives. `U_SYSTEM_STAT_IND` asks for a second octet, which on hardware followed 29 ms later; the marker was then older than the octets it swept and the chip's status answer was torn apart. Outside a frame only this indication raises `_awaitBytes`, so frame resynchronisation is untouched
+
+**Repetition filter**
+* Fix: an entry ages out. 03_02_02 2.4.2 p.39 suppresses the repetition of the directly preceding frame; with no bound, a repetition whose original this device missed was dropped forever whenever that source's last frame carried the same payload -- which is the normal state of a cyclic sensor. `TPUART_REPETITION_TTL_MS` defaults to 3000 ms, above the roughly 2.6 s a legitimate repetition burst of a maximum extended frame takes
+* Fix: this device's own transmissions are recorded as well. Keeping the echo out left the filter without the original, so a chip retransmission arrived as a foreign telegram carrying our own source address -- measured on the line as one answer plus three repetitions, after which the device reported its own individual address as duplicated. The confirmation branch in the knx receive path runs before the filter gate, so a retried transmission is still confirmed
+* Fix: the octet that keys the filter is shifted unsigned. `frame.data()` returns a signed char, and shifting one left is undefined from 80h up, so the CRC was undefined for exactly the frames it has to tell apart
+* Change: the cache entry carries named fields instead of a pair, so the source and the checksum cannot be swapped at a call site; the `cleanup()` declaration, which had no definition anywhere, is removed
+
+**Transmit path**
+* Fix: a transmission is waited out before its confirmation is declared lost. The rescue used `TPUART_RX_TIMEOUT`, which guards an intra-frame gap at 5 ms, while the chip's own retransmission needs 30 bit times of acknowledge window plus 50 idle on NACK or 150 on BUSY before the first retry octet, and hundreds of ms for a full sequence -- so a transmission still in progress was reported as failed. `TPUART_TX_CON_QUIET_MS` defaults to 200 ms; the 8 s transmit backstop stays the outer net
+
+**Addressing**
+* Fix: the own individual address is held unsigned. `_ownAddress` and `setOwnAddress()` were `short`, so an address at or above 0x8000 -- areas 8 to 15, and the 15.15.255 default -- was negative, and the test for a positive value excluded exactly those addresses from the chip acknowledge path
+
+**Housekeeping**
+* Fix: the interface pointer is no longer pretended to be deleted. The condition tested it for null before deleting, so nothing was ever deleted; the interface belongs to the Platform, which hands it out and outlives this layer. The parameter stays for the signature and the member is cleared
+* Change: a dead store at the top of the RX drain is removed, together with `TPUART_MAX_PROCESS_TIME_PER_LOOP`, which nothing referenced -- `TPUART_MAX_RXQUEUE_TIME_PER_LOOP` is the live one. Why the drain stays unbounded is recorded in place: cutting it short trades a loop stall for a UART FIFO overflow
+
+
 ## ec/1.3.0-beta.1: 2026-09-03
 
 The tag was moved again on 2026-09-15, from `472d7ca` to `8de964d`, so the two entries directly below
