@@ -184,8 +184,9 @@ class DataLinkLayer
     // Nur aus tick(), in Disconnected.
     void reconnect();
 
-    // Gemeinsamer Teil beider Wege: höchstens ein Byte ansehen, sonst die Frist prüfen.
-    DetectResult pollDetectResponse();
+    // Gemeinsamer Teil beider Wege: höchstens ein Byte ansehen, sonst die Frist prüfen. Bei der Suche lässt
+    // ein fremdes Byte den Kandidaten scheitern, mit bekannter Baudrate ist es Busverkehr und wird übergangen.
+    DetectResult pollDetectResponse(bool knownBaudRate);
 
     void connectDetected();
 

@@ -103,6 +103,9 @@ class Receiver
     // Bricht eine laufende Sequenz ab (Busmonitor an, Reset) und geht in den Resync.
     void forceResync();
 
+    // Verwirft eine angefangene Sequenz und geht nach Idle - nur, wenn der Bytestrom an einer Grenze neu beginnt.
+    void discardSequence();
+
   public:
     explicit Receiver(DataLinkLayer &dll);
 

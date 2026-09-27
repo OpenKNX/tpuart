@@ -386,6 +386,13 @@ void Receiver::forceResync()
     resetSequence(RxState::Resync);
 }
 
+void Receiver::discardSequence()
+{
+    _dll._statistics.incrementRxDroppedBytes((uint32_t)_bufferPos);
+
+    resetSequence(RxState::Idle);
+}
+
 // Schiebt die fertige Sequenz in den Ringpuffer und gibt den Empfangspuffer frei.
 void Receiver::completeSequence(uint8_t flags, RxState nextState)
 {

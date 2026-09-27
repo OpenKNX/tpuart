@@ -21,8 +21,13 @@ Teil von `AGENTS.md`.
   `uart_driver_install()` allokiert auf dem ESP32, und `ArduinoSerial` reicht an ein beliebiges
   fremdes `begin()` weiter. **Der Reconnect braucht nichts davon**: die Baudrate steht fest und kann
   sich nicht ändern, es ist also derselbe `U_Reset.req` und dieselbe Antwort auf einem bereits
-  offenen Interface - genau das, was der Tick ohnehin tut. Er verwirft dabei auch nicht mehr den
-  Empfangspuffer und initialisiert keine korrekt konfigurierte Hardware für nichts neu.
+  offenen Interface - genau das, was der Tick ohnehin tut, ohne korrekt konfigurierte Hardware für nichts
+  neu zu initialisieren. **Vor jedem Versuch leert er aber das Interface** (`flush()`): in `Disconnected`
+  liest niemand, bei Busverkehr läuft dort also Veraltetes auf, und das entschied sonst jeden Versuch -
+  eine Verbindung kam dann nie zurück, solange der Bus nicht ruhte. `RP2040::flush()` setzt deshalb nur
+  den Lesezeiger, statt im Interrupt Byte für Byte zu lesen. `connectDetected()` verwirft außerdem eine
+  angefangene Empfangssequenz (`Receiver::discardSequence()`): riss die Verbindung mitten in einem
+  Telegramm und lief der Tick bis zum Verlust nicht mehr, hinge das nächste sonst an dessen Rest.
   **Zwei Schreiber, ein Staffelstab**: der Tick schreibt alle Übergänge aus `Connected`, `BusMonitor`
   und `Disconnected`, der Hauptkontext die aus `Searching` und `Identifying`. Jede Seite schreibt nur aus
   Zuständen, die die andere nicht verlässt. Deshalb **schreibt auch den Verbindungsverlust der Tick**:
@@ -55,7 +60,9 @@ Teil von `AGENTS.md`.
   Nullbytes), alles, was nicht `U_RESET_IND` (`0x03`) ist, lässt den
   Kandidaten sofort scheitern (kein Aussitzen der restlichen Frist auf einen späten Treffer), und
   `U_RESET_IND` gelingt - womit Baudrate und der initiale Reset in einem Schritt bestätigt sind.
-  Beides ist ein Ereignis, nicht zwei.
+  Beides ist ein Ereignis, nicht zwei. **Beim Reconnect gilt das Scheitern am fremden Byte nicht**
+  (`pollDetectResponse(true)`): die Baudrate steht fest, ein anderes Byte ist ein Telegramm, das vor dem
+  Reset noch lief, und wird bis zur Frist übergangen. Die Frist gilt in beiden Fällen ausnahmslos.
   Ein gescheiterter oder abgelaufener Kandidat rückt sofort zum nächsten weiter; ist die ganze Liste
   durch, pausieren die Versuche `TPUART_DETECT_RETRY_INTERVAL_MS` (1000),
   bevor von vorn begonnen wird - **die BCU antwortet erst, wenn Busspannung anliegt**, und das kann

@@ -1803,6 +1803,82 @@ static void test_reconnect_when_bus_returns()
         TEST_ASSERT_NOT_EQUAL(U_STOP_MODE_REQ, written[i]);
 }
 
+// Beantwortet jede NEUE Reset-Anforderung mit prefix plus U_Reset.ind, bis die Verbindung steht. Liefert, wie
+// viele Anforderungen es dafür gebraucht hat.
+static int answerReconnect(const std::vector<uint8_t> &prefix)
+{
+    size_t answered = fx->_interface.writtenBytes().size();
+    int requests = 0;
+
+    for (int i = 0; i < 5000 && !fx->_dll.isConnected(); i++)
+    {
+        const std::vector<uint8_t> &out = fx->_interface.writtenBytes();
+        while (answered < out.size())
+        {
+            if (out[answered++] != U_RESET_REQ) continue;
+
+            requests++;
+            fx->append(prefix, 0);
+            fx->_interface.addByte((char)U_RESET_IND, 0);
+        }
+
+        fx->pump(1);
+    }
+
+    return requests;
+}
+
+// Busverkehr aus der Zeit ohne Verbindung darf den Versuch nicht entscheiden. So viele Bytes, dass sie
+// sich binnen einer Antwortfrist nicht einzeln abarbeiten lassen - nur das Verwerfen hilft.
+static void test_reconnect_discards_stale_bytes()
+{
+    fx->connect();
+    fx->pump(TPUART_CONNECTION_TIMEOUT_MS + 100);
+    TEST_ASSERT_FALSE(fx->_dll.isConnected());
+
+    for (int i = 0; i < 2000; i++)
+        fx->_interface.addByte((char)0xBC, 0);
+
+    TEST_ASSERT_EQUAL(1, answerReconnect({}));
+    TEST_ASSERT_EQUAL((int)BcuState::Connected, (int)fx->_dll.bcuState());
+}
+
+// Ein Telegramm, das vor der Antwort auf den Reset noch hereinläuft, lässt den Versuch nicht scheitern.
+static void test_reconnect_skips_traffic_before_reset_answer()
+{
+    fx->connect();
+    fx->pump(TPUART_CONNECTION_TIMEOUT_MS + 100);
+    TEST_ASSERT_FALSE(fx->_dll.isConnected());
+
+    TEST_ASSERT_EQUAL(1, answerReconnect(standardFrame()));
+    TEST_ASSERT_EQUAL((int)BcuState::Connected, (int)fx->_dll.bcuState());
+}
+
+// Riss die Verbindung mitten in einem Telegramm, hängt das nächste nicht an dessen Resten.
+static void test_reconnect_discards_partial_frame()
+{
+    fx->connect();
+
+    // Anfang eines Telegramms einlesen, aber vor der Pausenerkennung aufhören - ein Tick, der danach
+    // ausbleibt, bis der Hauptkontext den Verlust feststellt.
+    std::vector<uint8_t> frame = standardFrame();
+    fx->feed(frame.data(), 4);
+    fx->tickOnly(6);
+    fx->idle(TPUART_CONNECTION_TIMEOUT_MS + 100);
+
+    fx->pump(1);
+    TEST_ASSERT_FALSE(fx->_dll.isConnected());
+
+    TEST_ASSERT_EQUAL(1, answerReconnect({}));
+    fx->feedAndSettle(frame);
+
+    // Der Rest von vorher kommt weder als eigenes kaputtes Telegramm noch vor dem neuen an.
+    TEST_ASSERT_EQUAL(1, fx->_frames.size());
+    TEST_ASSERT_TRUE(fx->_frames[0]._valid);
+    TEST_ASSERT_EQUAL(frame.size(), fx->_frames[0]._data.size());
+    TEST_ASSERT_EQUAL(0, fx->_dll.getStatistics().getRxInvalidFrames());
+}
+
 // Ein zu langes Telegramm wird abgelehnt, nicht abgeschnitten.
 static void test_send_frame_rejects_oversized()
 {
@@ -2572,6 +2648,8 @@ static int runAllTests()
     RUN_TEST(test_connection_loss_is_counted);
     RUN_TEST(test_connect_when_bus_arrives_late);
     RUN_TEST(test_reconnect_when_bus_returns);
+    RUN_TEST(test_reconnect_discards_stale_bytes);
+    RUN_TEST(test_reconnect_skips_traffic_before_reset_answer);    RUN_TEST(test_reconnect_discards_partial_frame);
 
     RUN_TEST(test_tick_rate_is_measured);
     RUN_TEST(test_tick_gap_survives_restart);

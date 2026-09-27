@@ -350,8 +350,7 @@ bool RP2040::overflow()
 void RP2040::flush()
 {
     if (!_running) return;
-    while (available())
-        read();
+    _dmaReaderCount = dmaTransferCount();
 }
 
 } // namespace Interface

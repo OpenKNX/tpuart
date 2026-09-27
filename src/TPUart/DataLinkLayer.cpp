@@ -155,7 +155,7 @@ void DataLinkLayer::searchBaudRate()
 {
     if (_detectAwaitingResponse)
     {
-        switch (pollDetectResponse())
+        switch (pollDetectResponse(false))
         {
             case DetectResult::Pending:
                 return;
@@ -190,7 +190,7 @@ void DataLinkLayer::reconnect()
 {
     if (_detectAwaitingResponse)
     {
-        switch (pollDetectResponse())
+        switch (pollDetectResponse(true))
         {
             case DetectResult::Pending:
                 return;
@@ -207,25 +207,26 @@ void DataLinkLayer::reconnect()
     if ((int32_t)(millis() - _detectNextAttemptAt) < 0) return; // noch nicht fällig
 
     if (_interface->availableForWrite() < 1) return;
+
+    // Was ohne Verbindung aufgelaufen ist, ist veraltet - bei Busverkehr käme die Antwort sonst nie an die Reihe.
+    _interface->flush();
     if (!_interface->write((char)U_RESET_REQ)) return;
 
     _detectAwaitingResponse = true;
     _detectRequestSentAt = millis();
 }
 
-// Nur während _detectAwaitingResponse: das erste Byte außer einer führenden 0 entscheidet sofort.
-DataLinkLayer::DetectResult DataLinkLayer::pollDetectResponse()
+// Nur während _detectAwaitingResponse. Bei der Suche entscheidet das erste Byte außer einer führenden 0 sofort.
+DataLinkLayer::DetectResult DataLinkLayer::pollDetectResponse(bool knownBaudRate)
 {
     if (_interface->available())
     {
         int value = _interface->read();
-        if (value >= 0)
-        {
-            if (value == 0) return DetectResult::Pending; // führende Null - noch keine Entscheidung
-            if (value == U_RESET_IND) return DetectResult::Connected;
+        if (value == U_RESET_IND) return DetectResult::Connected;
 
-            return DetectResult::Failed; // irgendein anderes Byte statt der erwarteten Antwort
-        }
+        // Führende Nullen zählen nie. Mit bekannter Baudrate ist ein anderes Byte ein Telegramm, das vor dem Reset
+        // noch lief - die Frist läuft dann weiter.
+        if (value > 0 && !knownBaudRate) return DetectResult::Failed;
     }
 
     if ((uint32_t)(millis() - _detectRequestSentAt) >= TPUART_DETECT_RESPONSE_TIMEOUT_MS) return DetectResult::Failed;
@@ -247,6 +248,9 @@ void DataLinkLayer::connectDetected()
     _detectAwaitingResponse = false;
     _lastReceivedAt = millis(); // sonst gälte die Verbindung sofort als still
     _receiver._awaitRegisterValue = false; // nach dem Reset steht keine Registerantwort mehr aus
+
+    // Eine Sequenz von vor dem Verlust ist nicht mehr fortzusetzen - der Bytestrom beginnt hier neu.
+    _receiver.discardSequence();
 
     if (_bcuState == BcuState::Searching && _bcuType == BcuType::Ncn5120)
     {
