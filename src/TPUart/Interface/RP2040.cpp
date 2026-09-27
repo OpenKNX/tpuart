@@ -200,7 +200,7 @@ void RP2040::end()
 }
 
 // Fortlaufende Anzahl empfangener Bytes über DMA-Neustarts hinweg; nur Differenzen werden gebildet.
-uint32_t RP2040::dmaTransferCount()
+TPUART_IRAM uint32_t RP2040::dmaTransferCount()
 {
     return _dmaTransferBase + (TPUART_RP2040_TRANSFER_COUNT - dma_channel_hw_addr(_dmaChannel)->transfer_count);
 }
@@ -222,7 +222,7 @@ void RP2040::restartDma()
     dma_channel_set_write_addr(_dmaChannel, _dmaBuffer + writeIndex, true);
 }
 
-void RP2040::checkRestart()
+TPUART_IRAM void RP2040::checkRestart()
 {
     if (!_pendingRestart) return;
     _pendingRestart = false;
@@ -259,13 +259,17 @@ void __time_critical_func(RP2040::onTxInterrupt)()
     critical_section_exit(&_txSection);
 }
 
-size_t RP2040::available()
+TPUART_IRAM size_t RP2040::available()
 {
     if (!_running) return 0;
 
-    critical_section_enter_blocking(&_txSection);
-    pumpTx();
-    critical_section_exit(&_txSection);
+    // Ohne Sperre prüfbar: _txHead schreibt nur dieser Kontext - leer bleibt leer, bis er selbst schreibt.
+    if (_txTail != _txHead)
+    {
+        critical_section_enter_blocking(&_txSection);
+        pumpTx();
+        critical_section_exit(&_txSection);
+    }
 
     checkRestart();
 
@@ -350,7 +354,12 @@ bool RP2040::overflow()
 void RP2040::flush()
 {
     if (!_running) return;
-    _dmaReaderCount = dmaTransferCount();
+
+    // Hat die DMA den Leser überholt, ging etwas verloren - gemeldet wie in read(), auch wenn ohnehin verworfen wird.
+    uint32_t count = dmaTransferCount();
+    if (count - _dmaReaderCount > TPUART_RP2040_RX_BUFFER_SIZE) _ringOverflow = true;
+
+    _dmaReaderCount = count;
 }
 
 } // namespace Interface

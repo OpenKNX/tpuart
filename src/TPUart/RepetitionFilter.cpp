@@ -1,7 +1,5 @@
 #include "TPUart/RepetitionFilter.h"
 
-#include <Arduino.h>
-
 #include "TPUart/Frame.h"
 
 namespace TPUart
@@ -33,18 +31,22 @@ uint16_t RepetitionFilter::fingerprint(const Frame &frame)
 bool RepetitionFilter::check(const Frame &frame)
 {
     uint16_t source = frame.source();
+
+    // 0.0.0 kennzeichnet einen freien Platz - ein solcher Absender wird nicht gemerkt, also nie gefiltert.
+    if (source == 0) return false;
+
     uint16_t checksum = fingerprint(frame);
-    uint32_t now = millis();
+    _counter = (uint16_t)(_counter + 1);
 
     Entry *slot = nullptr;
-    Entry *oldest = &_entries[0];
+    Entry *oldest = nullptr;
     bool seen = false;
 
     for (size_t i = 0; i < TPUART_REPETITION_FILTER_COUNT; i++)
     {
         Entry &entry = _entries[i];
 
-        if (!entry._used)
+        if (entry._source == 0)
         {
             if (slot == nullptr) slot = &entry;
             continue;
@@ -57,7 +59,7 @@ bool RepetitionFilter::check(const Frame &frame)
             break;
         }
 
-        if ((uint32_t)(now - entry._timestamp) > (uint32_t)(now - oldest->_timestamp)) oldest = &entry;
+        if (oldest == nullptr || (uint16_t)(_counter - entry._seen) > (uint16_t)(_counter - oldest->_seen)) oldest = &entry;
     }
 
     // Alles belegt und der Absender noch nicht dabei: der am längsten nicht mehr gesehene Absender
@@ -67,8 +69,7 @@ bool RepetitionFilter::check(const Frame &frame)
 
     slot->_source = source;
     slot->_checksum = checksum;
-    slot->_timestamp = now;
-    slot->_used = true;
+    slot->_seen = _counter;
 
     return seen;
 }
@@ -76,14 +77,14 @@ bool RepetitionFilter::check(const Frame &frame)
 void RepetitionFilter::clear()
 {
     for (size_t i = 0; i < TPUART_REPETITION_FILTER_COUNT; i++)
-        _entries[i]._used = false;
+        _entries[i]._source = 0;
 }
 
 size_t RepetitionFilter::size() const
 {
     size_t count = 0;
     for (size_t i = 0; i < TPUART_REPETITION_FILTER_COUNT; i++)
-        if (_entries[i]._used) count++;
+        if (_entries[i]._source != 0) count++;
 
     return count;
 }

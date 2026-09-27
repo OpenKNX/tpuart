@@ -2,6 +2,8 @@
 
 #include <Arduino.h>
 
+#include "TPUart/Types.h"
+
 namespace TPUart
 {
 
@@ -52,11 +54,6 @@ void Statistics::reset()
 
 // --- Empfang -------------------------------------------------------------------------------------------
 
-void Statistics::incrementRxBytes(uint32_t increment)
-{
-    _rxBytes += increment;
-}
-
 void Statistics::incrementRxFrames(uint32_t increment)
 {
     _rxFrames += increment;
@@ -65,11 +62,6 @@ void Statistics::incrementRxFrames(uint32_t increment)
 void Statistics::incrementRxInvalidFrames(uint32_t increment)
 {
     _rxInvalidFrames += increment;
-}
-
-void Statistics::incrementRxFrameBytes(uint32_t increment)
-{
-    _rxFrameBytes += increment;
 }
 
 void Statistics::incrementRxControlBytes(uint32_t increment)
@@ -268,13 +260,13 @@ void Statistics::incrementChipTemperatureWarnings(uint32_t increment)
 
 // --- Takt ----------------------------------------------------------------------------------------------
 
-void Statistics::recordTick()
+TPUART_IRAM void Statistics::recordTick()
 {
     // Nicht ++: auf volatile seit C++20 deprecated (-Wvolatile im ESP32-Build).
     _ticks += 1;
 }
 
-void Statistics::recordTickDeferred(uint32_t deferredUs)
+TPUART_IRAM void Statistics::recordTickDeferred(uint32_t deferredUs)
 {
     _tickDeferrals += 1;
     _tickLastDeferredUs = deferredUs;
@@ -290,7 +282,7 @@ uint32_t Statistics::getTickLastDeferredUs() const
     return _tickLastDeferredUs;
 }
 
-void Statistics::updateTickDurationMaxUs(uint32_t durationUs)
+TPUART_IRAM void Statistics::updateTickDurationMaxUs(uint32_t durationUs)
 {
     if (durationUs > _tickDurationMaxUs) _tickDurationMaxUs = durationUs;
 }
@@ -308,11 +300,6 @@ void Statistics::updateCheckAcknowledgeMaxUs(uint32_t durationUs)
 uint32_t Statistics::getCheckAcknowledgeMaxUs() const
 {
     return _checkAcknowledgeMaxUs;
-}
-
-void Statistics::updateRxInterfacePeakBytes(uint32_t pending)
-{
-    if (pending > _rxInterfacePeakBytes) _rxInterfacePeakBytes = pending;
 }
 
 uint32_t Statistics::getTicks() const

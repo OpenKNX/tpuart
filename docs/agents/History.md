@@ -14,8 +14,8 @@ Ausdrücklich zurückgestellt (Entscheidung des Anwenders, nicht vergessen):
   `INVALID` markiert ist) lässt sich dort also noch nicht unterscheiden.
 - Paritäts-/Framingfehler werden nirgends sichtbar. Die DMA liest nur das untere Byte des `DR` und
   verwirft damit die Fehlerbits des PL011, und `overflow()` schaut nur auf `OE` - während `rsr = 0`
-  `PE`/`FE`/`BE` als Nebenwirkung löscht. Auf dem ESP32 ignoriert `drainEventQueue()` ebenso
-  `UART_PARITY_ERR`/`UART_FRAME_ERR`. KNX läuft mit gerader Parität, ein Paritätsfehler zeigt sich
+  `PE`/`FE`/`BE` als Nebenwirkung löscht. Auf dem ESP32 gibt es ohne Ereigniswarteschlange keinen Weg
+  an `UART_PARITY_ERR`/`UART_FRAME_ERR`. KNX läuft mit gerader Parität, ein Paritätsfehler zeigt sich
   derzeit also nur als CRC8-Fehler (~1/256 Restrisiko, dass er durchrutscht).
 - Unterstützung für erweiterte CRC16 (NCN5120 CRC-16/CCITT oder TPUART2 CRC-16/SPI) - die Schicht geht
   ausschließlich von einfacher CRC8 aus, und **das ist eine Entscheidung, keine Lücke**. Sie sichert
@@ -34,21 +34,6 @@ Ausdrücklich zurückgestellt (Entscheidung des Anwenders, nicht vergessen):
 - Das **Ergebnis** des `L_Data.con` auszuwerten. Es gibt den Sendeweg frei, aber sein MSB
   (positive/negative Bestätigung) wird nur protokolliert, nicht verarbeitet - eine negative Bestätigung
   sollte irgendwann eine Wiederholung auslösen.
-- **Kein `IRAM_ATTR` für den Tick-Pfad auf dem ESP32.** Getestet mit 85 markierten Funktionen (Timer,
-  Tick, Receiver, Transmitter, Statistik-Zähler, `ESP32`-Interface) am Router mit NCN5130, jeweils im
-  Release-Build: Max run 344µs (ack 212µs) mit IRAM gegen 353µs (ack 233µs) ohne - kein messbarer
-  Gewinn, dafür dauerhaft belegter knapper IRAM. Die Gründe: `uart_get_buffered_data_len()` liegt als
-  Treiberfunktion ohnehin im Flash, der Leerlauf-Tick liest also bei jedem Durchlauf von dort; ein
-  Pfad, der 2000-mal je Sekunde läuft, fällt nicht aus dem Flash-Cache; und während eines
-  Flash-Schreibvorgangs hält ESP-IDF den `esp_timer`-Task trotzdem an. Der Quittungs-Callback des
-  Aufrufers bliebe ohnehin im Flash.
-  Falls der Leerlauf-Tick doch schlanker werden muss, ist der Ansatz nicht IRAM, sondern den
-  Treiberaufruf zu vermeiden: `available()` fragt `uart_get_buffered_data_len()` erst nach einem
-  Daten-Event aus der Event-Queue (`xQueueReceive`, im RAM). Das ändert die Pausenerkennung und braucht
-  einen Hardwarelauf. Anlass wäre ein Deferred, das im Release-Build über Stunden auffällig bleibt.
-  **Tick-Werte nur im Release-Build vergleichen.** Die `develop`-Umgebungen erben aus OGM-Common
-  `build_type = debug` und damit `-O0`: dort lagen Max run 1203µs (ack 793µs) und Deferred bei rund
-  140 je Stunde - der vermeintliche Rückschritt der Library war ausschließlich der Build-Typ.
 
 ## Fehler, die hier schon einmal gemacht wurden
 
@@ -68,6 +53,17 @@ und erst am laufenden Bus auffiel - wer an denselben Stellen arbeitet, läuft in
   braucht.
 - `L_Poll_Data.ind` wurde als 1-Byte-Steuerbyte zerlegt, was ein Phantomtelegramm und eine fremde
   Quittung auf dem Bus erzeugen konnte.
+- **IRAM wurde einmal verworfen, weil nur der Höchstwert verglichen wurde.** Am Router brachten 85
+  markierte Funktionen bei Max run nichts (344µs gegen 353µs), und die Begründung lautete, ein Pfad,
+  der 2000-mal je Sekunde läuft, falle nicht aus dem Cache. Beides war falsch gelesen: der Höchstwert
+  hängt an Treiberaufrufen und Quittungs-Callback, die ohnehin im Flash liegen, und zwischen zwei Ticks
+  verdrängt anderer Code den Tick sehr wohl. Erst eine Messung von Mittelwert und Verteilung je Tick zeigte
+  es - 38% der Leerlauf-Ticks bei 50-100µs, mit IRAM keiner (heutige Lösung: `DataLinkLayer.md`, Punkt
+  "Leerlaufpfad liegt im RAM"). Die Lehre: für die Frage "wie teuer ist der Normalfall" ist ein Maximum
+  das falsche Maß.
+  **Und Tick-Werte nur im Release-Build vergleichen.** Die `develop`-Umgebungen erben aus OGM-Common
+  `build_type = debug` und damit `-O0`: dort lagen Max run 1203µs (ack 793µs) und Deferred bei rund
+  140 je Stunde - der vermeintliche Rückschritt der Library war ausschließlich der Build-Typ.
 - **Eine Korrektur in genau diesem Review brach den Empfang und musste ihrerseits korrigiert werden**:
   `end()` wurde von `dma_channel_abort()` auf `dma_channel_cleanup()` umgestellt, um einen
   liegengebliebenen Fertig-IRQ-Status zu löschen. `cleanup()` fasst zusätzlich das CTRL-Register des
@@ -85,16 +81,9 @@ und erst am laufenden Bus auffiel - wer an denselben Stellen arbeitet, läuft in
   quittiert; welche Ziele das Gerät als seine ansieht, muss der Aufrufer entscheiden.
 - `TPUART_FRAME_WAIT_US`: 3000 gegen die 30-Bitzeiten-Toleranz der Quittung abwägen - eine
   Entscheidung, die am echten Bus zu treffen ist.
-- RX-Puffer-Asymmetrie: RP2040 bis 2048 Byte, ESP32 512. Derselbe Stresstest verliert auf dem ESP32
-  deutlich mehr (wird dort aber als `UART_BUFFER_FULL` gemeldet).
-- Die FIFO-Frage im `RP2040`: die ursprüngliche Begründung fürs Abschalten des RX-FIFO ist nicht
-  belegt. Mit `FEN=1` wäre das Verlustfenster beim DMA-Neustart ~18ms statt ~570µs. Korrigiert wurde
-  nur der Kommentar; die Umstellung braucht eine Messung an echter Hardware, weil die Abschaltung aus
-  einer Beobachtung am laufenden Bus stammt.
-- Speicherbarrieren für die beiden SPSC-Ringe auf dem ESP32: `volatile` ordnet formal nur volatile
-  Zugriffe untereinander, ist also keine Release-Semantik. Auf dem RP2040 folgenlos (ISR desselben
-  Kerns), auf dem ESP32 mit echter Parallelität formal nicht garantiert - praktisch mit heutigem GCC
-  nicht beobachtet.
+- RX-Puffer-Asymmetrie: RP2040 standardmäßig 256 Byte (`TPUART_RP2040_RX_BUFFER_EXP`), ESP32 512
+  Treiberring plus 128 Byte FIFO. Der ESP32 meldet den Überlauf am vollen Ring, der RP2040 am überholten
+  Leser.
 - **`ArduinoSerial` ist weiterhin nur kompiliert, nie an echter Hardware gelaufen.** Es ist ein
   Kandidat für genau den Fehler, den der ESP32-Treiber hatte: ob der eingepackte Arduino-Kern
   Empfangenes stapelt, ist nicht geprüft, und die Pausenerkennung hängt daran.

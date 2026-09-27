@@ -51,7 +51,7 @@ DataLinkLayer::~DataLinkLayer()
 // Zeitkritische Seite - läuft aus dem Timer
 // ---------------------------------------------------------------------------------------------------
 
-void DataLinkLayer::tick()
+TPUART_IRAM void DataLinkLayer::tick()
 {
     if (_interface == nullptr) return; // ohne Interface gibt es nichts zu tun (siehe KOMPAT-Konstruktor)
     if (_bcuState == BcuState::Uninitialized) return; // begin() wurde noch nicht aufgerufen
@@ -86,7 +86,7 @@ void DataLinkLayer::tick()
     }
 
     _receiver.process();
-    _transmitter.process();
+    if (_transmitter.hasWork()) _transmitter.process();
 
     // Nur der volle Durchlauf, einschließlich Quittungs-Callback.
     _statistics.updateTickDurationMaxUs(micros() - tickNow);
@@ -111,8 +111,9 @@ void DataLinkLayer::begin(BcuType bcuType)
     // Auch nach end(): die Suche öffnet das geschlossene Interface wieder.
     _bcuState = BcuState::Searching;
 
-    // Die Zeit seit end() ist keine Lücke im Antrieb.
+    // Die Zeit seit end() ist keine Lücke im Antrieb - weder für die Taktmessung noch für den Wächter.
     _tickLastUs = 0;
+    _tickRateCheckedAt = 0;
 
     // Der Timer wird immer benutzt. Schlägt das Eintragen fehl, meldet checkTickRate() den fehlenden Antrieb.
     Timer::instance().add(*this);
@@ -801,7 +802,8 @@ bool DataLinkLayer::startMonitoring()
 // Einziger Weg aus dem Busmonitor; stellt nebenbei den Default-CRC-Modus her.
 bool DataLinkLayer::reset()
 {
-    // Nach einem Reset ist der Bytestrom neu - kein Bezugspunkt mehr für Wiederholungen.
+    // Nur der ausdrücklich angeforderte Reset leert den Wiederholungsfilter - ein Reset des Chips, der Wachhund
+    // und das Wiederverbinden nicht.
     _repetitionFilter.clear();
 
     return _transmitter.queueControl(U_RESET_REQ);

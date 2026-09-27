@@ -96,10 +96,12 @@ class Statistics
 
     // --- Empfang ---------------------------------------------------------------------------------------
 
-    void incrementRxBytes(uint32_t increment = 1);
+    // Je empfangenem Byte gerufen, daher inline.
+    void incrementRxBytes(uint32_t increment = 1) { _rxBytes += increment; }
+    void incrementRxFrameBytes(uint32_t increment = 1) { _rxFrameBytes += increment; }
+
     void incrementRxFrames(uint32_t increment = 1);
     void incrementRxInvalidFrames(uint32_t increment = 1);
-    void incrementRxFrameBytes(uint32_t increment = 1);
     void incrementRxControlBytes(uint32_t increment = 1);
     void incrementRxDroppedBytes(uint32_t increment = 1);
 
@@ -170,7 +172,11 @@ class Statistics
     // Ein Tickabstand hat die Busgrenze gerissen.
     void recordTickDeferred(uint32_t deferredUs);
 
-    void updateRxInterfacePeakBytes(uint32_t pending);
+    // Je empfangenem Byte gerufen, daher inline.
+    void updateRxInterfacePeakBytes(uint32_t pending)
+    {
+        if (pending > _rxInterfacePeakBytes) _rxInterfacePeakBytes = pending;
+    }
 
     // Wie oft tick() lief. Nur als Differenz zweier Stände benutzen - läuft nach ~25 Tagen um.
     uint32_t getTicks() const;

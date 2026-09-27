@@ -49,7 +49,6 @@ class RP2040 : public Abstract
 
     int _dmaChannel = -1;
     dma_channel_config _dmaConfig;
-    volatile uint8_t __attribute__((aligned(TPUART_RP2040_RX_BUFFER_SIZE))) _dmaBuffer[TPUART_RP2040_RX_BUFFER_SIZE] = {};
     volatile uint32_t _dmaReaderCount = 0;
     volatile uint32_t _dmaTransferBase = 0;
     volatile bool _pendingRestart = false;
@@ -66,6 +65,10 @@ class RP2040 : public Abstract
 
     // false, wenn die UART-Leitung fremd belegt ist - dann leert nur der Tick den Ring.
     bool _txIrqInstalled = false;
+
+    // ZULETZT: der DMA-Ringmodus verlangt die Ausrichtung auf die Ringgröße. Davor wird einmal aufgefüllt,
+    // dahinter nichts - stünde ein Feld dahinter, rundete das Objekt auf ein weiteres Vielfaches auf.
+    volatile uint8_t __attribute__((aligned(TPUART_RP2040_RX_BUFFER_SIZE))) _dmaBuffer[TPUART_RP2040_RX_BUFFER_SIZE] = {};
 
     // 0 oder 1, je nach UART.
     uint uartIndex() const { return _uart == uart1 ? 1 : 0; }
@@ -102,6 +105,10 @@ class RP2040 : public Abstract
     bool write(char value) override;
     bool overflow() override;
 };
+
+// Der Ring muss das letzte Member bleiben - sonst rundet das Objekt auf ein weiteres Vielfaches auf. Gilt ab
+// TPUART_RP2040_RX_BUFFER_EXP 7; darunter sind die übrigen Felder allein schon größer als der Ring.
+static_assert(sizeof(RP2040) <= 2 * TPUART_RP2040_RX_BUFFER_SIZE, "RP2040: _dmaBuffer muss das letzte Member bleiben");
 
 } // namespace Interface
 } // namespace TPUart

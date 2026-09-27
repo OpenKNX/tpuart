@@ -74,6 +74,13 @@ class Timer
 #elif defined(ARDUINO_ARCH_ESP32)
     esp_timer_handle_t _timer = nullptr;
     static void onTimer(void *argument);
+
+    // esp_timer_stop() wartet nicht auf einen laufenden Callback. Der Timer-Task ruft Callbacks nacheinander
+    // auf - ist ein danach eingereihter Hilfs-Callback gelaufen, ist ein laufender Tick durch. Einmal angelegt.
+    esp_timer_handle_t _barrier = nullptr;
+    volatile bool _barrierPassed = false;
+    static void onBarrier(void *argument);
+    void waitForRunningTick();
 #endif
 
     // Ruft tick() für jeden eingetragenen DataLinkLayer, in Reihenfolge der Plätze.
@@ -97,7 +104,8 @@ class Timer
     // Trägt ein und startet den Timer. false: keine Timer-Plattform, Intervall 0 oder kein Platz frei.
     bool add(DataLinkLayer &dll);
 
-    // Trägt aus. Danach läuft garantiert kein tick() mehr für diese Instanz.
+    // Trägt aus. Danach läuft garantiert kein tick() mehr für diese Instanz. Nicht aus einem Interrupt - auf dem
+    // ESP32 wartet es einen laufenden Tick ab.
     void remove(DataLinkLayer &dll);
 
     // RP2040: add() und remove() - also begin(), end() und der Destruktor - müssen vom selben Kern kommen,

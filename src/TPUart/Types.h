@@ -2,6 +2,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Was jeder Tick durchläuft, liegt im RAM: aus dem Flash kostet es Cache-Fehlgriffe, weil anderer Code den
+// Cache zwischen zwei Ticks verdrängt. Nur die Prüfung, ob es etwas zu tun gibt - die Arbeit bleibt im Flash.
+#if defined(ARDUINO_ARCH_ESP32)
+    #include <esp_attr.h>
+    #define TPUART_IRAM IRAM_ATTR
+#elif defined(ARDUINO_ARCH_RP2040)
+    #include <pico.h>
+    #define TPUART_IRAM __not_in_flash("tpuart")
+#else
+    #define TPUART_IRAM
+#endif
+
 namespace TPUart
 {
 

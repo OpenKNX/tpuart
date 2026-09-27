@@ -2,8 +2,6 @@
 #ifdef ARDUINO_ARCH_ESP32
 #include <Arduino.h>
 #include <driver/uart.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/queue.h>
 
 #include "TPUart/Interface/Abstract.h"
 #include "TPUart/Transmitter.h" // nur für TPUART_TX_INTERFACE_BUFFER - die Anforderung gehört dem Transmitter
@@ -21,13 +19,13 @@ class ESP32 : public Abstract
     int _rx, _tx;
     uart_port_t _uart;
     bool _running = false;
-    QueueHandle_t _eventQueue = nullptr;
+
+    // Überlauf ohne Event-Queue: gemeldet wird der Übergang auf "Ring voll", einmal je Episode.
+    bool _rxFull = false;
     bool _overflow = false;
 
     uint32_t _byteTimeUs = 0;    // 0 = unbekannt, dann wird nicht gebremst
     uint32_t _lineBusyUntil = 0; // geschätzter Zeitpunkt, an dem alles Übergebene draußen ist
-
-    void drainEventQueue();
 
     // Geschätzt noch unter uns steckende Bytes, aufgerundet.
     size_t outstanding() const;

@@ -8,7 +8,6 @@ namespace Interface
 
 constexpr int TPUART_ESP32_RX_BUFFER_SIZE = 512;
 constexpr int TPUART_ESP32_TX_BUFFER_SIZE = 512;
-constexpr int TPUART_ESP32_EVENT_QUEUE_SIZE = 32;
 
 ESP32::ESP32(int rx, int tx, uart_port_t uart) : _rx(rx), _tx(tx), _uart(uart) {}
 ESP32::~ESP32() { end(); }
@@ -35,12 +34,9 @@ void ESP32::begin(uint32_t baud)
     // Kern ohne jede Ausgabe - Bootloop mit TG1WDT_SYS_RESET. Dann zuerst die Pins prüfen.
     uart_set_pin(_uart, _tx, _rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
-    // Fehlschlag: _eventQueue bleibt null, _running false.
-    if (uart_driver_install(_uart, TPUART_ESP32_RX_BUFFER_SIZE, TPUART_ESP32_TX_BUFFER_SIZE, TPUART_ESP32_EVENT_QUEUE_SIZE, &_eventQueue, 0) != ESP_OK)
-    {
-        _eventQueue = nullptr;
+    // Ohne Event-Queue: sie kostete je Byte ein Ereignis und verlöre bei Stillstand gerade die Überlaufmeldung.
+    if (uart_driver_install(_uart, TPUART_ESP32_RX_BUFFER_SIZE, TPUART_ESP32_TX_BUFFER_SIZE, 0, nullptr, 0) != ESP_OK)
         return; // _running bleibt false - alle Methoden liefern damit "nichts da"
-    }
 
     // Jedes Byte sofort herausgeben - sonst stapelt der Treiber bis 120 Bytes oder 10 Symbolzeiten, und die
     // Pausenerkennung sieht erfundene Pausen.
@@ -49,6 +45,7 @@ void ESP32::begin(uint32_t baud)
 
     _byteTimeUs = baud > 0 ? (uint32_t)(11000000UL / baud) : 0;
     _lineBusyUntil = micros();
+    _rxFull = false;
     _overflow = false;
     _running = true;
 }
@@ -59,26 +56,19 @@ void ESP32::end()
     _running = false;
 
     uart_driver_delete(_uart);
-    _eventQueue = nullptr;
 }
 
-// Nur für Overflow-Ereignisse; die Daten kommen über uart_read_bytes().
-void ESP32::drainEventQueue()
-{
-    uart_event_t event;
-    while (xQueueReceive(_eventQueue, (void *)&event, 0))
-    {
-        if (event.type == UART_FIFO_OVF || event.type == UART_BUFFER_FULL) _overflow = true;
-    }
-}
-
-size_t ESP32::available()
+TPUART_IRAM size_t ESP32::available()
 {
     if (!_running) return 0;
-    drainEventQueue();
 
     size_t len = 0;
     uart_get_buffered_data_len(_uart, &len);
+
+    bool full = len >= (size_t)TPUART_ESP32_RX_BUFFER_SIZE;
+    if (full && !_rxFull) _overflow = true;
+    _rxFull = full;
+
     return len;
 }
 
@@ -125,9 +115,10 @@ bool ESP32::write(char value)
     return true;
 }
 
+// Ohne vorheriges available() - der Aufrufer hat gerade gefragt, und leer liefert uart_read_bytes() ohnehin 0.
 int ESP32::read()
 {
-    if (!available()) return -1;
+    if (!_running) return -1;
 
     uint8_t value;
     return uart_read_bytes(_uart, &value, 1, 0) == 1 ? value : -1;
@@ -136,7 +127,6 @@ int ESP32::read()
 bool ESP32::overflow()
 {
     if (!_running) return false;
-    drainEventQueue();
 
     if (_overflow)
     {

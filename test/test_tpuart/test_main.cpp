@@ -673,6 +673,89 @@ static void test_repeated_frame_is_filtered()
     TEST_ASSERT_EQUAL(1, fx->_dll.getStatistics().getRxRepetitions());
 }
 
+// Dasselbe Telegramm als Wiederholung markiert: Wiederholungsbit gelöscht, Prüfsumme neu.
+static std::vector<uint8_t> repeatedOf(std::vector<uint8_t> frame)
+{
+    frame[0] &= (uint8_t)~0x20;
+    frame.back() = checksum(std::vector<uint8_t>(frame.begin(), frame.end() - 1));
+    return frame;
+}
+
+static bool lastFrameFiltered()
+{
+    return (fx->_frames.back()._flags & TP_FRAME_FLAG_FILTERED) != 0;
+}
+
+// Als Wiederholung markiert, aber mit anderem Inhalt als das letzte Telegramm des Absenders: keine Wiederholung.
+static void test_repetition_with_other_content_is_not_filtered()
+{
+    fx->connect();
+
+    fx->feedAndSettle(standardFrame(0x1101, 0x0801));
+    fx->feedAndSettle(repeatedOf(standardFrame(0x1101, 0x0802)));
+
+    TEST_ASSERT_FALSE(lastFrameFiltered());
+}
+
+// Ist der Filter voll, fällt der Absender heraus, der am längsten nicht gesendet hat - nicht irgendeiner.
+static void test_repetition_filter_evicts_least_recently_seen()
+{
+    fx->connect();
+
+    // Ein Absender mehr als Plätze; Absender 1 sendet zuletzt noch einmal, ist also der jüngste.
+    for (uint16_t source = 1; source <= TPUART_REPETITION_FILTER_COUNT; source++)
+        fx->feedAndSettle(standardFrame(source));
+    fx->feedAndSettle(standardFrame(1, 0x0802));
+    fx->feedAndSettle(standardFrame(TPUART_REPETITION_FILTER_COUNT + 1));
+
+    TEST_ASSERT_EQUAL(TPUART_REPETITION_FILTER_COUNT, fx->_dll.getRepetitionFilter().size());
+
+    // Absender 2 war der älteste und ist verdrängt, Absender 1 ist noch da.
+    fx->feedAndSettle(repeatedOf(standardFrame(2)));
+    TEST_ASSERT_FALSE(lastFrameFiltered());
+
+    fx->feedAndSettle(repeatedOf(standardFrame(1, 0x0802)));
+    TEST_ASSERT_TRUE(lastFrameFiltered());
+}
+
+// reset() aus der Anwendung leert den Wiederholungsfilter - danach gilt das erste Telegramm als neu.
+static void test_reset_request_clears_repetition_filter()
+{
+    fx->connect();
+
+    fx->feedAndSettle(standardFrame());
+    TEST_ASSERT_TRUE(fx->_dll.reset());
+    fx->pump(5); // erst den Reset hinaus - ein Telegramm, in das er fällt, verwirft forceResync()
+    fx->feedAndSettle(repeatedOf(standardFrame()));
+
+    TEST_ASSERT_EQUAL(2, fx->_frames.size());
+    TEST_ASSERT_FALSE(lastFrameFiltered());
+}
+
+// Ein Reset des Chips leert ihn nicht - eine Wiederholung bleibt eine Wiederholung.
+static void test_reset_indication_keeps_repetition_filter()
+{
+    fx->connect();
+
+    fx->feedAndSettle(standardFrame());
+    fx->feedAndSettle(std::vector<uint8_t>{U_RESET_IND});
+    fx->feedAndSettle(repeatedOf(standardFrame()));
+
+    TEST_ASSERT_TRUE(lastFrameFiltered());
+}
+
+// Absender 0.0.0 gibt es nicht - er belegt keinen Platz und wird nie als Wiederholung gefiltert.
+static void test_sender_0_0_0_is_not_remembered()
+{
+    fx->connect();
+
+    fx->feedAndSettle(standardFrame(0x0000));
+    fx->feedAndSettle(repeatedOf(standardFrame(0x0000)));
+
+    TEST_ASSERT_FALSE(lastFrameFiltered());
+    TEST_ASSERT_EQUAL(0, fx->_dll.getRepetitionFilter().size());
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Fehlerfälle: ein angefangenes Telegramm, das nie fertig wird
 // ---------------------------------------------------------------------------------------------------
@@ -1854,6 +1937,19 @@ static void test_reconnect_skips_traffic_before_reset_answer()
     TEST_ASSERT_EQUAL((int)BcuState::Connected, (int)fx->_dll.bcuState());
 }
 
+// Auch das Wiederverbinden leert den Wiederholungsfilter nicht.
+static void test_reconnect_keeps_repetition_filter()
+{
+    fx->connect();
+    fx->feedAndSettle(standardFrame());
+
+    fx->pump(TPUART_CONNECTION_TIMEOUT_MS + 100);
+    TEST_ASSERT_EQUAL(1, answerReconnect({}));
+
+    fx->feedAndSettle(repeatedOf(standardFrame()));
+    TEST_ASSERT_TRUE(lastFrameFiltered());
+}
+
 // Riss die Verbindung mitten in einem Telegramm, hängt das nächste nicht an dessen Resten.
 static void test_reconnect_discards_partial_frame()
 {
@@ -2053,6 +2149,53 @@ static void test_deferred_tick_is_reported()
     fx->idle(TPUART_TICK_RATE_WINDOW_MS * 2 + 100);
     TEST_ASSERT_EQUAL(1, fx->_errors.size());
 }
+
+#ifdef ARDUINO
+// Mit laufendem Timer: end() kehrt zurück, und danach kommt kein Tick mehr. Auf dem ESP32 läuft dabei die
+// Sperre in stopTimer() - das enge Fenster trifft der Fall nicht, wohl aber einen Hänger. Nur auf Hardware,
+// nativ gibt es keinen Timer.
+static void test_timer_stops_ticking_on_end()
+{
+    Timer &timer = Timer::instance();
+    timer.setInterval(500);
+
+    // In Searching zählt der Tick nur - das Interface gehört dort loop(), zwei Antriebe stören sich nicht.
+    fx->_dll.begin(BcuType::Ncn5120);
+    TEST_ASSERT_TRUE(timer.running());
+
+    fx->idle(20);
+    TEST_ASSERT_TRUE(fx->_dll.getStatistics().getTicks() > 0);
+
+    fx->_dll.end();
+    TEST_ASSERT_FALSE(timer.running());
+
+    uint32_t ticks = fx->_dll.getStatistics().getTicks();
+    fx->idle(20);
+    TEST_ASSERT_EQUAL(ticks, fx->_dll.getStatistics().getTicks());
+
+    timer.setInterval(0);
+}
+#endif
+
+#ifndef ARDUINO
+// Die Pause zwischen end() und begin() ist auch für den Wächter kein Aussetzer. Nur nativ: gemeldet würde
+// erst, wenn die Pause die Ticks aus connect() um das ~27-fache überwiegt - auf der Hardware eine Minute
+// Echtzeit und mehr.
+static void test_tick_rate_watch_survives_restart()
+{
+    fx->connect();
+    fx->pump(5);
+
+    fx->_dll.end();
+    fx->idle(60000);
+
+    fx->_dll.begin(BcuType::Ncn5120);
+    fx->pump(TPUART_TICK_RATE_WINDOW_MS + 100);
+
+    for (const std::string &error : fx->_errors)
+        TEST_ASSERT_TRUE(error.find("Tick") == std::string::npos);
+}
+#endif
 
 // Läuft der Antrieb wie vorgesehen, darf der Wächter SCHWEIGEN. Ohne diesen Fall wäre ein Wächter, der
 // grundsätzlich meldet, genauso "grün" wie der richtige - und im Betrieb dann reines Rauschen.
@@ -2590,6 +2733,11 @@ static int runAllTests()
     RUN_TEST(test_rx_queue_peak_is_tracked);
     RUN_TEST(test_chip_errors_are_counted_individually);
     RUN_TEST(test_repeated_frame_is_filtered);
+    RUN_TEST(test_repetition_with_other_content_is_not_filtered);
+    RUN_TEST(test_repetition_filter_evicts_least_recently_seen);
+    RUN_TEST(test_sender_0_0_0_is_not_remembered);
+    RUN_TEST(test_reset_request_clears_repetition_filter);
+    RUN_TEST(test_reset_indication_keeps_repetition_filter);
     RUN_TEST(test_fragment_then_pause_then_valid_frame);
     RUN_TEST(test_fragment_without_pause_swallows_next_frame);
     RUN_TEST(test_fragment_with_overlong_length_still_ends_at_pause);
@@ -2649,13 +2797,17 @@ static int runAllTests()
     RUN_TEST(test_connect_when_bus_arrives_late);
     RUN_TEST(test_reconnect_when_bus_returns);
     RUN_TEST(test_reconnect_discards_stale_bytes);
-    RUN_TEST(test_reconnect_skips_traffic_before_reset_answer);    RUN_TEST(test_reconnect_discards_partial_frame);
+    RUN_TEST(test_reconnect_skips_traffic_before_reset_answer);
+    RUN_TEST(test_reconnect_keeps_repetition_filter);    RUN_TEST(test_reconnect_discards_partial_frame);
 
     RUN_TEST(test_tick_rate_is_measured);
     RUN_TEST(test_tick_gap_survives_restart);
     RUN_TEST(test_interface_backlog_is_measured);
     RUN_TEST(test_deferred_tick_is_reported);
     RUN_TEST(test_healthy_tick_is_not_reported);
+#ifndef ARDUINO
+    RUN_TEST(test_tick_rate_watch_survives_restart);
+#endif
     RUN_TEST(test_rx_queue_overflow_is_counted);
     RUN_TEST(test_interface_overflow_is_counted);
     RUN_TEST(test_tx_queue_overflow_is_counted);
@@ -2668,6 +2820,9 @@ static int runAllTests()
     RUN_TEST(test_timer_interval_is_global);
     RUN_TEST(test_process_never_ticks);
     RUN_TEST(test_timer_trigger_ticks_registered_clients);
+#ifdef ARDUINO
+    RUN_TEST(test_timer_stops_ticking_on_end);
+#endif
 
     RUN_TEST(test_power_control_is_applied_by_default_on_ncn);
     RUN_TEST(test_power_control_leaves_reserved_bit_on_ncn5120);

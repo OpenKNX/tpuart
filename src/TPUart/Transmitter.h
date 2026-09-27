@@ -99,6 +99,9 @@ class Transmitter
     // Aus tick(): höchstens eine Steuersequenz ODER ein Telegramm-Oktett.
     void process();
 
+    // false heißt: process() täte nichts. Inline, damit der Leerlauf-Tick den Transmitter nicht aufruft.
+    bool hasWork() const { return _ctrlQueueTail != _ctrlQueueHead || _state != TxState::Idle || _stagedSeq != _takenSeq; }
+
     // Aus dem Hauptkontext: reiht ein vollständiges Telegramm samt Prüfsumme ein (kopiert).
     bool pushTransmitQueue(const Frame &frame);
 

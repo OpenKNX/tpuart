@@ -23,15 +23,20 @@ class Frame;
 class RepetitionFilter
 {
   private:
+    // 6 Byte je Absender. Frei ist ein Platz mit Absender 0.0.0 - als Absenderadresse nicht vergeben, im
+    // knx-Stack der Platzhalter für "keine Adresse".
     struct Entry
     {
         uint16_t _source;
         uint16_t _checksum;
-        uint32_t _timestamp;
-        bool _used;
+        uint16_t _seen; // _counter beim letzten Telegramm - nur für die Verdrängung
     };
 
     Entry _entries[TPUART_REPETITION_FILTER_COUNT] = {};
+
+    // Zählt je check(). Läuft über; das Alter rechnet über die Differenz, erst ab 65536 Telegrammen ohne
+    // Wiederkehr erscheint ein Eintrag fälschlich jung und wird später verdrängt.
+    uint16_t _counter = 0;
 
     // CRC-16/SPI-FUJITSU ohne Prüfsumme, Wiederholungs-Bit fest gesetzt - Original und Wiederholung gleich.
     static uint16_t fingerprint(const Frame &frame);

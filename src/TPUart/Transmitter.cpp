@@ -105,6 +105,7 @@ bool Transmitter::startNextTransmission()
     }
 
     if (_stagedSeq == _takenSeq) return false;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE); // die Vorlage ist vollständig
 
     // Absicherung gegen Schreiben über den Sendepuffer hinaus.
     if (_stagedBuffer == nullptr || _stagedFrameSize == 0 || _stagedFrameSize > TPUART_BUFFER_SIZE)
@@ -117,6 +118,7 @@ bool Transmitter::startNextTransmission()
     memcpy(_buffer, _stagedBuffer, _frameSize);
 
     // Zuletzt: ab hier darf der Hauptkontext den Platz freigeben.
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     _takenSeq = _takenSeq + 1;
 
     beginTransmission();
@@ -136,6 +138,7 @@ void Transmitter::beginTransmission()
 bool Transmitter::processCtrlQueue()
 {
     if (_ctrlQueueTail == _ctrlQueueHead) return false;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE); // die Sequenz hinter dem Kopf ist vollständig
 
     uint32_t tail = _ctrlQueueTail;
     size_t length = _ctrlQueue[tail % TPUART_CTRL_QUEUE_SIZE];
@@ -156,6 +159,7 @@ bool Transmitter::processCtrlQueue()
     for (size_t i = 0; i < length; i++)
         writeByte(_ctrlQueue[tail++ % TPUART_CTRL_QUEUE_SIZE]);
 
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     _ctrlQueueTail = tail;
     _dll._statistics.incrementTxControlBytes((uint32_t)length);
 
@@ -296,6 +300,7 @@ bool Transmitter::pushTransmitQueue(const Frame &frame)
 void Transmitter::stageNextTelegram()
 {
     if (_stagedSeq != _takenSeq) return; // die Vorlage liegt noch, der Tick hat sie nicht abgeholt
+    __atomic_thread_fence(__ATOMIC_ACQUIRE); // der Tick ist mit dem Kopieren fertig
 
     if (_queue.pinned()) _queue.pop();
 
@@ -317,6 +322,7 @@ void Transmitter::stageNextTelegram()
     _stagedFrameSize = length;
     _queue.pin(); // ab jetzt bewegt den Eintrag nichts mehr, auch keine Aufnahme
 
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     _stagedSeq = _stagedSeq + 1; // ZULETZT - erst damit wird die Vorlage für den Tick sichtbar
 }
 
@@ -333,6 +339,7 @@ bool Transmitter::queueControl(const uint8_t *codes, size_t length)
 
     uint32_t needed = (uint32_t)(1 + length);
     uint32_t used = _ctrlQueueHead - _ctrlQueueTail;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE); // freigegebener Platz ist fertig gelesen
 
     if (TPUART_CTRL_QUEUE_SIZE - used < needed)
     {
@@ -349,6 +356,7 @@ bool Transmitter::queueControl(const uint8_t *codes, size_t length)
     for (size_t i = 0; i < length; i++)
         _ctrlQueue[head++ % TPUART_CTRL_QUEUE_SIZE] = codes[i];
 
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     _ctrlQueueHead = head;
     return true;
 }

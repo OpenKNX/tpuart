@@ -23,15 +23,21 @@ Receiver::Receiver(DataLinkLayer &dll) : _dll(dll) {}
 // Zeitkritische Seite - läuft aus dem Tick
 // ---------------------------------------------------------------------------------------------------
 
-void Receiver::process()
+// Nur die Prüfung - sie läuft jeden Tick und liegt deshalb im RAM (TPUART_IRAM).
+TPUART_IRAM void Receiver::process()
 {
     size_t pending = _dll._interface->available();
-    if (!pending)
+    if (pending)
     {
-        checkPause();
+        receiveByte(pending);
         return;
     }
 
+    if (_state != RxState::Idle) checkPause();
+}
+
+void Receiver::receiveByte(size_t pending)
+{
     // Rückstand im Interface; gesund sind 0-1.
     _dll._statistics.updateRxInterfacePeakBytes((uint32_t)pending);
 
@@ -427,6 +433,7 @@ bool Receiver::pushEntry(const uint8_t *data, size_t length, uint8_t flags)
 {
     uint32_t needed = TPUART_RX_QUEUE_HEADER_SIZE + length;
     uint32_t used = _queueHead - _queueTail;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE); // freigegebener Platz ist fertig gelesen
 
     if (TPUART_RX_QUEUE_SIZE - used < needed)
     {
@@ -444,7 +451,9 @@ bool Receiver::pushEntry(const uint8_t *data, size_t length, uint8_t flags)
     for (size_t i = 0; i < length; i++)
         _queue[head++ % TPUART_RX_QUEUE_SIZE] = data[i];
 
-    // Erst zuletzt sichtbar machen - sonst sähe loop() einen halben Eintrag.
+    // Erst zuletzt sichtbar machen - sonst sähe loop() einen halben Eintrag. Die Barriere hält auch den
+    // Compiler davon ab, den Eintrag hinter den Kopf zu schieben.
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     _queueHead = head;
     return true;
 }
@@ -457,6 +466,7 @@ void Receiver::processQueue()
 {
     while (_queueTail != _queueHead)
     {
+        __atomic_thread_fence(__ATOMIC_ACQUIRE); // der Eintrag hinter dem Kopf ist vollständig
         uint32_t tail = _queueTail;
 
         size_t length = _queue[tail++ % TPUART_RX_QUEUE_SIZE];
@@ -480,6 +490,7 @@ void Receiver::processQueue()
             data[i] = _queue[tail++ % TPUART_RX_QUEUE_SIZE];
 
         // Platz vor dem Callback freigeben - wie lange der Verbraucher braucht, geht den Tick nichts an.
+        __atomic_thread_fence(__ATOMIC_RELEASE);
         _queueTail = tail;
 
         if (!frame.isFrame())

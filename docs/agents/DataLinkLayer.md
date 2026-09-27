@@ -50,7 +50,7 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   der Tick kann gleich danach erneut schreiben, und ein leicht vorauseilender Zeitstempel bedeutet
   "gerade eben", nicht "vor Ewigkeiten". Jeder andere Zeitvergleich der Library bleibt innerhalb
   eines Kontexts (`_awaitSince`, `_emptySince`, `_detectRequestSentAt` im Tick;
-  `_lastStateRequestAt`, `_lastBusLoadTime`, der Wiederholungsfilter im Hauptkontext); die beiden
+  `_lastStateRequestAt`, `_lastBusLoadTime` im Hauptkontext); die beiden
   `_detectNextAttemptAt`-Prüfungen waren bereits vorzeichenbehaftet.
 
 - **`tick()` und `loop()` sind zwei bewusst getrennte Hälften, mit dem RX-Ringpuffer als
@@ -136,6 +136,15 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   Eintragsformat `[len][bytes...]`. Das ist der zweite SPSC-Ring dieser Klasse, Spiegelbild des
   RX-Rings in die Gegenrichtung: Erzeuger ist der Hauptkontext, Verbraucher ist `tick()`, der Kopf
   wird zuletzt veröffentlicht.
+  **Jede Übergabe trägt ein Barrierenpaar** - beide Ringe und die Sendevorlage: `__atomic_thread_fence`
+  mit `RELEASE` vor dem Veröffentlichen eines Zählers (Kopf, Schwanz, `_stagedSeq`, `_takenSeq`) und
+  `ACQUIRE` nach dem Lesen des gegnerischen Zählers. `volatile` allein ordnet nur volatile Zugriffe
+  untereinander - die Nutzdaten im Ring sind es nicht, der Compiler dürfte sie hinter den Zähler
+  schieben. Die Hardware allein wäre auf RP2040 (M0+ ordnet nicht um) und ESP32 (`memw` vor jedem
+  volatile-Zugriff) schon geordnet, die Barriere macht es unabhängig davon. Die Zähler bleiben
+  einfache volatile-Zuweisungen, `hasWork()` vergleicht sie ohne Barriere - es entscheidet nur, ob
+  gearbeitet wird, gelesen wird erst dahinter. Einzelne Flags (`_confirmTimeout` und Verwandte)
+  brauchen keine: an ihnen hängen keine Nutzdaten.
   **Warum eine Warteschlange und nicht Besitz über `TxState`**: Steuercodes müssen absetzbar sein,
   während ein Telegramm gesendet wird. Sie sind keine Telegrammübertragung - genau dasselbe Argument
   galt bereits für die Quittung. Der frühere Entwurf ließ `queueControl()` *verweigern*, sobald
@@ -266,13 +275,13 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   (oder 38400) zwischen Host und BCU sind mehr als das Doppelte; der Überschuss trägt unsere Sendungen
   und die Steuerbytes, er beschleunigt den Empfang nicht. Bei 100µs sind das ~13 Ticks je Byte, und
   ein Byte je Tick hat reichlich Reserve.
-- **Der Leerlaufpfad muss so kurz wie möglich bleiben**, denn bei 100µs ist er der mit Abstand am
-  häufigsten ausgeführte Code hier. Heutige Gestalt, gemessen auf dem RP2040: zwei bis drei
-  MMIO-Lesevorgänge (`micros()` für die Taktmessung, der DMA-Transferzähler in `available()`, und
-  `micros()` in `checkPause()`, solange ein Pausenfenster läuft) plus etwa ein Dutzend Vergleiche -
-  deutlich unter 100 von den ~13.300 Takten, die bei 133MHz je Tick zur Verfügung stehen, also rund
-  0,5% CPU. Die Reihenfolge der Wächter ist bewusst gewählt: `_bcuState` zuerst,
-  dann `_interface.available()`, und auf der TX-Seite `_txState == Idle` vor allem anderen. Muss das
+- **Der Leerlaufpfad muss so kurz wie möglich bleiben**, denn bei 500µs Takt ist er der mit Abstand am
+  häufigsten ausgeführte Code hier. Heutige Gestalt: zwei bis drei MMIO-Lesevorgänge (`micros()` für
+  die Taktmessung, der DMA-Transferzähler in `available()`, und `micros()` in `checkPause()`, solange
+  ein Pausenfenster läuft) plus etwa ein Dutzend Vergleiche. Gemessen je Leerlauf-Tick im Mittel 3µs
+  auf dem RP2040 und 14µs auf dem ESP32 (dort mit dem IDF-Aufruf in `available()`), also rund 0,6%
+  bzw. 3% CPU. Die Reihenfolge der Wächter ist bewusst gewählt: `_bcuState` zuerst,
+  dann `_interface.available()`, und auf der TX-Seite `hasWork()` vor dem Aufruf. Muss das
   je billiger werden, sind die zwei naheliegenden Kandidaten, den `micros()`-Aufruf in `checkPause()`
   durch einen Tickzähler zu ersetzen und dem Leerlaufpfad eine Ja/Nein-Abfrage statt der vollen
   Anzahl von `available()` zu geben.
@@ -281,6 +290,22 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   wie oft wir gerufen werden, nicht wie oft wir etwas zu tun hatten. Er kostet rund 0,1% CPU und
   bezahlt damit den einzigen Wert dieser Schicht, der sich vorher überhaupt nicht ablesen ließ. Wie
   teuer das Raten stattdessen war, steht bei `getTicks()` in `Statistics.h`.
+- **Der Leerlaufpfad liegt im RAM, die Arbeit im Flash** (`TPUART_IRAM` in `Types.h`: ESP32
+  `IRAM_ATTR`, RP2040 `__not_in_flash`). Beide Plattformen führen Code aus dem Flash über einen Cache
+  aus, und zwischen zwei Ticks verdrängt anderer Code (Netzwerkstack, Hauptloop) die Zeilen des Ticks -
+  jeder Tick holte sie dann erst aus dem Flash nach. Im RAM liegen deshalb nur die Prüfungen, ob es
+  etwas zu tun gibt: `Timer::onTimer`/`fire`, `tick()`, `Receiver::process()`, `available()` des
+  Interfaces (RP2040 samt `checkRestart()`/`dmaTransferCount()`) und die drei Tick-Zähler der
+  Statistik. Damit das reicht, ist der Pfad getrennt: `Receiver::process()` fragt nur `available()` und
+  übergibt ein Byte an `receiveByte()`, `checkPause()` läuft nur außerhalb von `Idle`, und der Tick ruft
+  `Transmitter::process()` nur, wenn `hasWork()` (inline) zutrifft. Neue Arbeit gehört in die
+  Flash-Funktionen, nicht in die Prüfungen - sonst wächst der RAM-Anteil für Code, der selten läuft.
+  Gemessen am ESP32-Testboard (Release, NCN5130): Leerlauf-Tick im Mittel 36µs ohne, 14µs mit, Ticks
+  ab 50µs von 38% auf 0,1% - für 596 Byte IRAM. Den Tick mit Byte ändert es nicht; dessen größter Posten
+  sind die IDF-Treiberaufrufe (`uart_read_bytes`/`uart_write_bytes` je ~50µs), die ohnehin im Flash
+  liegen. Alle 86 aus dem Tick erreichbaren Funktionen im IRAM halbierten auch ihn, kosteten aber
+  5.060 Byte. Auf dem RP2040 (TestApp, `-Os`, NCN5130) wirkt es genauso, nur auf niedrigerem Niveau:
+  Leerlauf-Tick 6µs statt 3µs im Mittel (Max 26µs statt 10µs), Tick mit Byte 24µs statt 16µs.
 - **Das Interface gehört `tick()` allein.** Sobald der Timer-Antrieb läuft, darf nichts von außen
   `Interface::Abstract` anfassen - das wäre ein zweiter Zugriffskontext auf dieselben Zähler und
   Hardwareregister, und `RP2040::overflow()` löscht als Nebenwirkung sogar das Overrun-Flag des UART.

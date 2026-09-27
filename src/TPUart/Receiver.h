@@ -97,6 +97,9 @@ class Receiver
     // Aus tick(): verarbeitet höchstens EIN Byte.
     void process();
 
+    // Der Teil von process(), der ein anliegendes Byte verarbeitet.
+    void receiveByte(size_t pending);
+
     // Aus loop(): leert den Ringpuffer.
     void processQueue();
 

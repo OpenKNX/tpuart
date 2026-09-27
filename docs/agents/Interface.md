@@ -85,6 +85,13 @@ Implementierungen, alle bisher ausgebaut:
   Diagnose-Env stellte genau das ein. Achtung: die Zahl, auf der diese Auslegung ursprünglich
   beruhte (~1745 Byte/s, die gesättigte 19200er Host-Strecke), ist der falsche Bezug - zitiere
   sie nicht als Anforderung.
+  **Der Ring ist das letzte Member**, und das spart Speicher: der DMA-Ringmodus verlangt die Ausrichtung
+  auf die Ringgröße, die damit für das ganze Objekt gilt. Stand er mittendrin, wurde davor aufgefüllt
+  und das Objekt danach auf ein weiteres Vielfaches aufgerundet - 768 statt 512 Byte bei 256 Byte Ring.
+  Ganz vorn wäre es genauso schlecht, dort liegt der vptr. Neue Felder gehören **vor** den Ring; eines
+  dahinter lässt die `static_assert` unter der Klasse scheitern (gültig ab `TPUART_RP2040_RX_BUFFER_EXP` 7).
+  OGM-Common legt das Interface mit `new` an; das nimmt das ausgerichtete `operator new(size, align_val_t)`
+  aus C++17 (im Build geprüft), die Ausrichtung hält also auch auf dem Heap.
   DMA ist der *einzige* Empfangspfad (kein reiner IRQ-Modus).
   **Zwei verschiedene Arten von Überlauf, und sie brauchen verschiedene Erkennung.** Ein
   Hardware-Overrun des UART (`UART_UARTRSR_OE_BITS`) heißt, dass DMA das Datenregister nicht
@@ -162,20 +169,26 @@ Implementierungen, alle bisher ausgebaut:
   (arduino-pico installiert in `SerialUART::begin()` einen exklusiven Handler auf demselben UART),
   wird die Beschleunigung stillschweigend übersprungen und `TXIM` nie gesetzt - das Interface
   verhält sich dann genau wie vorher.
-  **Eine Korrektur an der Begründung, die hier früher stand**: behauptet wurde, der RX-FIFO
-  *müsse* aus bleiben, weil die DMA-Anforderung sonst erst an der IFLS-Schwelle käme und die
-  letzten Bytes eines Frames liegen blieben. Das ist nicht belegt - das Datenblatt beschreibt
-  beide Signale (§4.2.5 S. 424: `uartrxdmasreq` ab einem Zeichen, `uartrxdmabreq` ab der
-  Wassermarke), sagt aber nirgends, welches als `DREQ_UARTx_RX` nach außen geführt ist, und das
-  SDK schweigt ebenfalls. FIFO-Betrieb mit DMA ist ausdrücklich vorgesehen; nirgends steht eine
-  Anweisung, ihn abzuschalten. Geändert wurde trotzdem nichts: die Entscheidung fürs Abschalten
-  stammt aus einer Beobachtung am laufenden Bus, und sie ohne erneute Prüfung an echter Hardware
-  umzudrehen ist das Risiko nicht wert. Der TX-Interrupt **beantwortet** diese Frage nicht, er
-  macht sie nur weniger dringend.
+  **`available()` nimmt die Sperre nur bei nicht leerem Ring** - sonst sperrte jeder Leerlauf-Tick
+  die Interrupts. Die Prüfung davor kommt ohne Sperre aus, weil `_txHead` nur der Tick schreibt, der
+  auch `available()` ruft: der ISR bewegt `_txTail` nur auf `_txHead` zu, ein gesehenes "leer" bleibt
+  also wahr, ein veraltetes "nicht leer" kostet bloß eine überflüssige Sperre.
+  **Der FIFO bleibt aus - das ist keine offene Frage.** `FEN` schaltet RX und TX gemeinsam, und
+  ein TX-FIFO bräche die Quittungsfrist (siehe unten zu `uart_init()`). Einen RX-FIFO allein gibt
+  es nicht, eine Messung dazu erübrigt sich.
 - **`ESP32`** - kein DMA. Recherchiert und bestätigt: UHCI (der einzige DMA-Weg für UART auf dem
   ESP32) hat auf dem klassischen ESP32 keine offizielle ESP-IDF-Treiberunterstützung (nur
-  C3/C6/S3/P4). Benutzt das übliche `uart_driver_install`; die Ereigniswarteschlange des Treibers
-  wird beim Pollen nicht-blockierend geleert, um FIFO-/Pufferüberläufe zu erkennen.
+  C3/C6/S3/P4). Benutzt das übliche `uart_driver_install`, aber **ohne Ereigniswarteschlange**.
+  Mit Schwelle 1 legte der Treiber-Interrupt je Byte ein `UART_DATA` hinein; hing der Tick, war sie
+  nach 32 Bytes voll, und `UART_BUFFER_FULL`/`UART_FIFO_OVF` verwarf der Treiber dann still
+  (`xQueueSendFromISR` scheitert, nur ein Log) - die Überlaufmeldung fiel genau im Ernstfall aus
+  (IDF 5.4.2, `uart.c`). Stattdessen meldet `available()` den Übergang auf einen vollen Ring
+  (`TPUART_ESP32_RX_BUFFER_SIZE`): dann legt der Treiber nichts mehr ab und schaltet den RX-Interrupt
+  aus, verloren geht, was über den Hardware-FIFO hinausgeht. Die Meldung kommt damit knapp vor dem ersten
+  Verlust, einmal je Episode. Bewusst genau bei voll (Entscheidung des Anwenders): scheitert ein Schub
+  aus mehreren Bytes schon knapp darunter, bleibt der Ring dort stehen und das bleibt ungemeldet. Ein FIFO-Überlauf bei freiem Ring
+  tritt bei Schwelle 1 nicht auf. Nebenbei entfallen je Byte drei `xQueueReceive` im Tick und ein
+  `xQueueSendFromISR` im Treiber, und `read()` fragt nicht erneut `available()`.
   `availableForWrite()` **meldete früher `uart_get_tx_buffer_free_size()` - bis zu 512 Byte**, der
   Fehler "zu groß" in Reinform: der Treiber hätte ein ganzes Telegramm an Host-Bytes geschluckt,
   und jede Quittung dahinter wäre hoffnungslos zu spät gekommen. Der Sendepuffer des Treibers

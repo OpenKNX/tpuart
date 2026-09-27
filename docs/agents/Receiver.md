@@ -146,13 +146,23 @@ Teil von `AGENTS.md`.
   `TP_FRAME_FLAG_TX` zur Hand.
   Gespeichert wird je Sender ein 16-Bit-Fingerabdruck (CRC-16/SPI-FUJITSU, mit erzwungen gesetztem
   Wiederholungsbit, damit Original und Wiederholung gleich hashen), nicht das
-  Telegramm: 50 maximal große Telegramme wären 13KB, das hier sind 400 Byte. Der Preis ist eine
-  theoretische Kollision, die 16 Bit vertretbar machen.
+  Telegramm: 50 maximal große Telegramme wären 13KB, das hier sind 300 Byte (6 je Eintrag: Absender,
+  Fingerabdruck, Alter). Der Preis ist eine theoretische Kollision, die 16 Bit vertretbar machen.
+  **Frei ist ein Platz mit Absender 0.0.0** - als Absenderadresse nicht vergeben, im knx-Stack der
+  Platzhalter für "keine Adresse" (`ip_tunnel_server.cpp`, `cemi_server.cpp`). Käme doch ein Telegramm von
+  0.0.0, wird es nicht gemerkt und damit nie gefiltert - wie ohne Filter.
+  **Geleert wird er nur von `reset()`** (Entscheidung des Anwenders): wer den Chip ausdrücklich zurücksetzt,
+  will danach das erste Telegramm als neu sehen. Ein Reset des Chips (`U_Reset.ind`), der Wachhund und das
+  Wiederverbinden leeren ihn **nicht** - die Wiederholung eines Telegramms, das davor kam, bleibt eine
+  Wiederholung. `reset()` läuft auch intern am Ende der Chip-Bestimmung beim Verbinden; dort ist der Filter
+  ohnehin noch leer.
   **Einträge verfallen nie, und das ist Absicht.** Ein Eintrag je Quelle; ein Eintrag verschwindet nur
   dadurch, dass er verdrängt wird, wenn eine *neue* Quelle auftaucht und alle
   `TPUART_REPETITION_FILTER_COUNT` (50) Plätze belegt sind - die am längsten nicht gesehene Quelle
   fällt heraus. Eine LRU-Liste also, aber ohne `std::list` + `unordered_map`: ein festes Array mit
-  linearer Suche über 50 Einträge, was im Hauptkontext nichts kostet.
+  linearer Suche über 50 Einträge, was im Hauptkontext nichts kostet. Das Alter ist keine Uhrzeit, sondern
+  ein 16-Bit-Zähler je geprüftem Telegramm; über den Überlauf rechnet die Differenz richtig, erst ein
+  Eintrag, der 65536 Telegramme lang nicht wiederkam, erscheint fälschlich jung und fällt später heraus.
   **Baue keine Zeitgrenze ein.** Sie wurde probiert (2s) und entfernt. Es gibt keine Schranke
   abzuleiten: wann die Wiederholung eintrifft, hängt davon ab, wann der Sender den Bus das nächste Mal
   frei sieht, und das können Millisekunden oder zehn Sekunden sein. Eine zu kurze Grenze lässt die

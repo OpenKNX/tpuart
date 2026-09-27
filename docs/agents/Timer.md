@@ -96,6 +96,14 @@ Teil von `AGENTS.md`.
     `uart_write_bytes()` nimmt einen Treiber-Mutex. Bewusst auch kein festgenagelter Task mit
     `delayMicroseconds()` (so machte es das frühere Diagnosewerkzeug): das kostet einen ganzen Kern,
     und auf einem echten Gerät trägt Kern 0 WLAN und Bluetooth.
+    **`esp_timer_stop()` wartet nicht auf einen laufenden Callback** (IDF 5.4.2: der Timer-Task gibt die
+    Listensperre vor dem Aufruf frei, `esp_timer_delete()` schützt nur den Speicher des Timers). Der Tick
+    läuft auf Kern 0, `remove()` kommt vom Hauptloop auf Kern 1 - ohne Absicherung liefe nach `end()` noch
+    ein Tick im gerade gelöschten UART-Treiber. `stopTimer()` reiht deshalb einen einmaligen Hilfs-Timer
+    (`_barrier`, Frist 0) ein und wartet, bis dessen Callback gelaufen ist: der Timer-Task ruft Callbacks
+    nacheinander auf, und nach dem Stop beginnt kein neuer Tick mehr. Aus dem Timer-Task selbst wird nicht
+    gewartet - dort läuft ohnehin kein Tick nebenher, und das Warten blockierte ihn. Ein Flag im Callback
+    wäre kürzer, hinge aber an der Speicherordnung zwischen den Kernen (Schreiben und Lesen über Kreuz).
   - **Sonst überall**: `Timer::supported()` ist falsch und der Timer startet nicht. Dann tickt **nichts**,
     bis der Aufrufer `Timer::trigger()` aus einem eigenen Kontext ruft - einen Rückfall gibt es nicht, siehe
     den nächsten Punkt.

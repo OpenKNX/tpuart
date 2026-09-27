@@ -49,6 +49,7 @@ constexpr uint32_t TPUART_DETECT_RESPONSE_TIMEOUT_MS = 50;
 //   loop()  - aus dem Hauptloop. Leert den Ringpuffer, ruft Callbacks, verarbeitet Steuerbytes.
 //
 // Der Leerlaufpfad von tick() ist der häufigste Code: erst reine Vergleiche, dann erst Interface-Zugriffe.
+// Er liegt im RAM (TPUART_IRAM), die eigentliche Arbeit im Flash - neue Arbeit nicht in die Prüfungen.
 class DataLinkLayer
 {
     friend class Receiver;

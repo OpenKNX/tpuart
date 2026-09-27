@@ -5,6 +5,10 @@
 #if defined(ARDUINO_ARCH_RP2040)
     #include <hardware/irq.h>
     #include <hardware/timer.h>
+#elif defined(ARDUINO_ARCH_ESP32)
+    #include <freertos/FreeRTOS.h>
+    #include <freertos/task.h>
+    #include <string.h>
 #endif
 
 namespace TPUart
@@ -25,7 +29,7 @@ bool Timer::supported()
 }
 
 // Läuft im Interrupt. Der Rückgabewert hält den Timer am Leben.
-bool Timer::onTimer(repeating_timer_t *timer)
+TPUART_IRAM bool Timer::onTimer(repeating_timer_t *timer)
 {
     Timer *self = (Timer *)timer->user_data;
     if (self != nullptr) self->fire();
@@ -90,7 +94,7 @@ bool Timer::supported()
 }
 
 // Läuft im Timer-Task, nicht im Interrupt.
-void Timer::onTimer(void *argument)
+TPUART_IRAM void Timer::onTimer(void *argument)
 {
     Timer *self = (Timer *)argument;
     if (self != nullptr) self->fire();
@@ -133,12 +137,49 @@ void Timer::stopTimer()
 {
     if (!_running) return;
 
-    // esp_timer_stop() wartet auf einen laufenden Callback - nötig, der Timer-Task läuft parallel.
     esp_timer_stop(_timer);
     _running = false;
 
+    // Der Callback läuft außerhalb der Listensperre weiter (IDF 5.4) - auf Kern 0, parallel zu uns.
+    waitForRunningTick();
+
     esp_timer_delete(_timer);
     _timer = nullptr;
+}
+
+void Timer::onBarrier(void *argument)
+{
+    Timer *self = (Timer *)argument;
+    if (self != nullptr) self->_barrierPassed = true;
+}
+
+void Timer::waitForRunningTick()
+{
+    // Im Timer-Task selbst läuft kein Tick nebenher - und das Warten blockierte ihn.
+    if (strcmp(pcTaskGetName(nullptr), "esp_timer") == 0) return;
+
+    if (_barrier == nullptr)
+    {
+        esp_timer_create_args_t args = {
+            .callback = onBarrier,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "tpuart_barrier",
+            .skip_unhandled_events = false,
+        };
+
+        if (esp_timer_create(&args, &_barrier) != ESP_OK)
+        {
+            _barrier = nullptr;
+            return;
+        }
+    }
+
+    _barrierPassed = false;
+    if (esp_timer_start_once(_barrier, 0) != ESP_OK) return;
+
+    while (!_barrierPassed)
+        vTaskDelay(1);
 }
 
 #else
@@ -158,7 +199,7 @@ void Timer::stopTimer() {}
 #endif
 
 // Aus Interrupt (RP2040) oder Timer-Task (ESP32) - ruft nur weiter.
-void Timer::fire()
+TPUART_IRAM void Timer::fire()
 {
     for (uint8_t i = 0; i < TPUART_TIMER_MAX_CLIENTS; i++)
     {
