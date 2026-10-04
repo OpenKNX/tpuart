@@ -60,7 +60,7 @@ namespace TPUart
                             // Drain the ENTIRE ring this wakeup instead of 1 byte/event.
                             // _callback() returns false ONLY when it could not take rxLock
                             // (main loop is draining) -- then stop, no busy-spin.
-                            unsigned int guard = 2048;
+                            unsigned int guard = TPUART_ESP32_DRAIN_GUARD;
                             while (_interface->available() && guard--)
                             {
                                 if (!_interface->_callback()) break; // rxLock held by main loop
@@ -97,7 +97,7 @@ namespace TPUart
             // UART-Konfiguration anwenden
             uart_param_config(_uart, &uart_config);
             uart_set_pin(_uart, _tx, _rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-            uart_driver_install(_uart, 1024, 1024, 64, &_taskQueue, 0);
+            uart_driver_install(_uart, TPUART_ESP32_RX_BUFFER_SIZE, TPUART_ESP32_TX_BUFFER_SIZE, TPUART_ESP32_EVENT_QUEUE_SIZE, &_taskQueue, 0);
             // Threshold MUST stay 1: a KNX L_ACK is a single byte that connection-oriented transport (ETS app
             // programming) needs delivered promptly; a high threshold holds it until the rx-timeout and blows
             // the per-telegram ACK window (A/B-confirmed: 80 breaks programming, 1 works). The throughput win

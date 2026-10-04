@@ -353,7 +353,7 @@ RX-liveness re-arm (`_lastReceivedTime` set on every reset(), no spurious discon
   TPUART_MAX_RXQUEUE_TIME_PER_LOOP   20       per-loop RX-frame-buffer drain budget
   TPUART_RX_FRAME_BUFFER_SIZE        6000     RX frame output ring (bytes)
   TPUART_RX_SEARCH_BUFFER_SIZE       300      parser search window (263 + slack)
-  TPUART_RP2040_BUFFER_SIZE / _EXP   2048 / 11  RP2040 DMA ring geometry -- EXPERIMENTAL, may still be re-evaluated / re-tuned
+  TPUART_RP2040_DMA_BUFFER_EXP       11       RP2040 DMA RX ring, 2^exp entries (2048) -- EXPERIMENTAL, may still be re-evaluated / re-tuned
 
   debug:
   TPUART_BCU_DEBUG              off       all      test hooks + diagnostic traces

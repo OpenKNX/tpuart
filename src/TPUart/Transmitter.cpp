@@ -192,7 +192,7 @@ namespace TPUart
             }
         }
 
-        if (millis() - time < 60000) return;
+        if (millis() - time < TPUART_TX_WATCHDOG_MS) return;
 
 #ifdef TPUART_BCU_DEBUG
         // Diagnostic dump at the moment the watchdog gives up: which lost-CON case stranded the TX?

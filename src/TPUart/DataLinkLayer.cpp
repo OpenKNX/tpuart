@@ -232,7 +232,7 @@ namespace TPUart
             if (value == U_RESET_IND) return true;
             break;
         }
-        while (!((millis() - start) >= 50));
+        while (!((millis() - start) >= TPUART_RESET_PROBE_MS));
         return false;
     }
 
@@ -607,7 +607,7 @@ namespace TPUart
 #ifdef ARDUINO_ARCH_ESP32
             taskYIELD(); // bytes go to the non-blocking HW TX FIFO; the TP wire serializes them anyway (no per-byte vTaskDelay tax)
 #endif
-            if (millis() - start > 20) break; // fairness/watchdog bound
+            if (millis() - start > TPUART_TX_PUMP_MAX_MS) break; // fairness/watchdog bound
         }
 
         processRxFrameBuffer();

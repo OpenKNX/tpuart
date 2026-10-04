@@ -5,12 +5,13 @@
 #include <hardware/uart.h>
 
 #include "TPUart/Interface/Abstract.h"
+#include "TPUart/Config.h"
 #include "TPUart/Types.h"
 
 constexpr uint32_t TPUART_RP2040_TRANSFER_COUNT = UINT32_MAX >> 1; // aus irgendeinem Grund funktioniert UINT32_MAX nicht und ich musste den wert halbieren
 // constexpr unsigned int TPUART_RP2040_TRANSFER_COUNT = 5000;
 // constexpr unsigned int TPUART_RP2040_TRANSFER_COUNT = 256;
-constexpr unsigned long TPUART_RP2040_BUFFER_EXP = 11; // 2**BufferExp -> 2048 B
+constexpr unsigned long TPUART_RP2040_BUFFER_EXP = TPUART_RP2040_DMA_BUFFER_EXP; // 2**BufferExp entries, default 2048
 // The DMA RX ring must outlast the longest noInterrupts() stall (mid-stream LittleFS flash erase) and
 // hold a full worst-case burst without wrapping. A 256 B ring overflows there -> mid-frame bytes are
 // silently jump-discarded in read() (fast-transfer >4KB corruption) and a single max extended LPDU
@@ -30,6 +31,9 @@ typedef uint8_t TpuartDmaWord;
 constexpr unsigned long TPUART_RP2040_RING_EXP = TPUART_RP2040_BUFFER_EXP;
 #endif
 constexpr unsigned long TPUART_RP2040_RING_BYTES = (1u << TPUART_RP2040_RING_EXP);
+// RING_SIZE takes 1..15 (RP2040 DS 2.5, CH0_CTRL_TRIG.RING_SIZE). With TPUART_BUSMON_INTEGRITY RING_EXP is
+// DMA_BUFFER_EXP + 1, so the knob tops out at 14 there.
+static_assert(TPUART_RP2040_RING_EXP >= 1 && TPUART_RP2040_RING_EXP <= 15, "TPUART_RP2040_DMA_BUFFER_EXP out of the DMA ring range");
 
 namespace TPUart
 {
