@@ -259,16 +259,9 @@ namespace TPUart
             _lastOffset = offset;
         }
 
-        if (last) // Last byte (Checksum) - the transmit
-        {
-            _dll._interface->write(U_L_DATA_END_REQ | position);
-        }
-        else
-        {
-            _dll._interface->write(U_L_DATA_START_REQ | position);
-        }
-
-        _dll._interface->write(_frame->data(_transmitPos));
+        // Glued: an acknowledge in between would be taken as the data octet. U_L_DATA_END_REQ precedes the checksum and starts sending.
+        const char pair[2] = {(char)((last ? U_L_DATA_END_REQ : U_L_DATA_START_REQ) | position), (char)_frame->data(_transmitPos)};
+        _dll._interface->writeGlued(pair, 2);
         if (last)
         {
             resetWatchdogTimer();

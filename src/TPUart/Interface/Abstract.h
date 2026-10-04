@@ -1,4 +1,6 @@
 #pragma once
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 
 namespace TPUart
@@ -17,6 +19,13 @@ namespace TPUart
             virtual bool available() = 0;
             virtual bool availableForWrite() = 0;
             virtual bool write(char value) = 0;
+            /** @brief Writes a block no acknowledge may split (a frame octet pair, a multi-octet request). */
+            virtual bool writeGlued(const char *data, size_t length)
+            {
+                for (size_t i = 0; i < length; i++)
+                    if (!write(data[i])) return false;
+                return true;
+            }
             virtual int read() = 0;
             virtual bool overflow() { return false; };
             /*

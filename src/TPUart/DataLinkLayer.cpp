@@ -821,13 +821,10 @@ namespace TPUart
         {
             if (_ownAddress != 0 && _chipAutoAck)
             {
-                char buffer[10];
-                sprintf(buffer, "%u.%u.%u", (_ownAddress >> 12 & 0b1111), (_ownAddress >> 8 & 0b1111), (_ownAddress & 0b11111111));
-                if (_bcuType == BCU_NCN5120) _interface->write(U_NCN5120_SET_ADDRESS_REQ);
-                if (_bcuType == BCU_TPUART2) _interface->write(U_TPUART2_SET_ADDRESS_REQ);
-                _interface->write((_ownAddress >> 8) & 0xFF);
-                _interface->write(_ownAddress & 0xFF);
-                if (_bcuType == BCU_NCN5120) _interface->write(0xFF); // Dummy Byte needed by NCN only
+                // Glued: an acknowledge inside the request would be taken as one of its octets.
+                const bool ncn = _bcuType == BCU_NCN5120;
+                const char request[4] = {(char)(ncn ? U_NCN5120_SET_ADDRESS_REQ : U_TPUART2_SET_ADDRESS_REQ), (char)((_ownAddress >> 8) & 0xFF), (char)(_ownAddress & 0xFF), (char)0xFF}; // 0xFF: dummy byte, NCN only
+                _interface->writeGlued(request, ncn ? 4 : 3);
             }
         }
 
@@ -836,15 +833,13 @@ namespace TPUart
         {
             if (_bcuType == BCU_NCN5120)
             {
-                _interface->write(U_NCN5120_SET_REPETITION_REQ);
-                _interface->write(_repetitions);
-                _interface->write(0x0); // dummy, see NCN5120 datasheet
-                _interface->write(0x0); // dummy, see NCN5120 datasheet
+                const char request[4] = {(char)U_NCN5120_SET_REPETITION_REQ, (char)_repetitions, 0x0, 0x0}; // 2 dummies, see NCN5120 datasheet
+                _interface->writeGlued(request, 4);
             }
             else if (_bcuType == BCU_TPUART2)
             {
-                _interface->write(U_TPUART2_SET_REPETITION_REQ);
-                _interface->write(_repetitions);
+                const char request[2] = {(char)U_TPUART2_SET_REPETITION_REQ, (char)_repetitions};
+                _interface->writeGlued(request, 2);
             }
         }
 
@@ -926,19 +921,12 @@ namespace TPUart
         // if (_bcuState == BCU_BUSMONITOR) return false;
         if (_bcuType != BCU_NCN5120) return false;
 
-        rxLock(true); // Prevent sending ACKs during sending multi bytes multibytes
-        _interface->write(U_INT_REG_WR_REQ_ACR0);
-        if (state)
-        {
-            printMessage("VCC2 power enabled");
-            _interface->write(ACR0_FLAG_DC2EN | ACR0_FLAG_V20VEN | ACR0_FLAG_XCLKEN | ACR0_FLAG_V20VCLIMIT);
-        }
-        else
-        {
-            printMessage("VCC2 power disabled");
-            _interface->write(ACR0_FLAG_XCLKEN | ACR0_FLAG_V20VCLIMIT);
-        }
+        // Glued, under rxLock: an acknowledge between request and value would be written to ACR0.
+        rxLock(true);
+        const char request[2] = {(char)U_INT_REG_WR_REQ_ACR0, (char)(state ? (ACR0_FLAG_DC2EN | ACR0_FLAG_V20VEN | ACR0_FLAG_XCLKEN | ACR0_FLAG_V20VCLIMIT) : (ACR0_FLAG_XCLKEN | ACR0_FLAG_V20VCLIMIT))};
+        _interface->writeGlued(request, 2);
         rxUnlock();
+        printMessage(state ? "VCC2 power enabled" : "VCC2 power disabled");
 
         requestState();
         return true;
