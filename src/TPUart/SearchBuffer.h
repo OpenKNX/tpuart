@@ -1,9 +1,7 @@
 #pragma once
 #include "TPUart/Frame.h"
 
-#ifndef TPUART_RX_SEARCH_BUFFER_SIZE
-#define TPUART_RX_SEARCH_BUFFER_SIZE 300 // 263 + 37 reserv for frame errors errors and control bytes
-#endif
+#include "TPUart/Config.h"
 
 namespace TPUart
 {

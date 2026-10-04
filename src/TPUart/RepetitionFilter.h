@@ -1,3 +1,4 @@
+#include "TPUart/Config.h"
 #include "TPUart/Frame.h"
 #include <Arduino.h>
 #include <cstdint>

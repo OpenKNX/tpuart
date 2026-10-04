@@ -1,11 +1,8 @@
 #ifdef ARDUINO_ARCH_ESP32
 #include "TPUart/Interface/ESP32.h"
 
+#include "TPUart/Config.h"
 #include "driver/uart.h"
-
-#ifndef TPUART_ESP32_TASK_STACK_SIZE
-#define TPUART_ESP32_TASK_STACK_SIZE 4096 // recursive RX parser (processSearchBuffer) + VLAs -- 2048 is too tight
-#endif
 
 namespace TPUart
 {

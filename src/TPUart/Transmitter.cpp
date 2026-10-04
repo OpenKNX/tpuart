@@ -11,11 +11,6 @@ namespace TPUart
     const size_t MAX_QUEUE_SIZE = 50;
     const unsigned short MAX_WAIT_TIME = 60000;
 
-#ifndef TP_TX_PRIO_RESERVE
-#define TP_TX_PRIO_RESERVE 6 // slots kept free of low-priority frames so a higher-priority frame (console/
-                             // management telegram) is never starved by a bulk low-priority upload burst
-#endif
-
     /**
      * @brief Constructs a new Transmitter object.
      *
@@ -139,9 +134,6 @@ namespace TPUart
 #endif
 #ifndef TX_BACKSTOP_COOLDOWN_MS
 #define TX_BACKSTOP_COOLDOWN_MS 30000 // after a fast reset, only the 60s cap may fire for this long
-#endif
-#ifndef TPUART_RX_TIMEOUT
-#define TPUART_RX_TIMEOUT 5 // mirror of Receiver.cpp (RX inter-byte / idle-bus quiet window, ms)
 #endif
 #ifndef TX_BACKSTOP_INVALID_MS
 #define TX_BACKSTOP_INVALID_MS 12000 // latched-_invalid on a quiet bus: longer window, give _invalid a chance to clear first

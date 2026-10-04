@@ -1,10 +1,6 @@
 #include "RepetitionFilter.h"
 #include <Arduino.h>
 
-#ifndef TPUART_REPETITION_TTL_MS
-#define TPUART_REPETITION_TTL_MS 3000
-#endif
-
 namespace TPUart
 {
     unsigned short RepetitionFilter::crc(Frame &frame)

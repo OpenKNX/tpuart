@@ -1,4 +1,5 @@
 #pragma once
+#include "TPUart/Config.h"
 // services Host -> Controller :
 // internal commands, device specific
 #define U_RESET_REQ 0x01
@@ -105,12 +106,6 @@
 // VDD2_OK_M to 1. Documented on all three (NCN5120/D p.52, NCN5121/D p.55, NCN5130/D p.58, Table 18).
 #define NCN_ACR1_RESET_5120 0x00
 #define NCN_ACR1_RESET_51X1 0x60
-// Init-only busy-wait budgets for the identification. Worst case 50 + 4 x 20 + 50 = 180 ms, once per
-// BCU connect, entirely before the RX pump goes live.
-#define NCN_STOP_MODE_TIMEOUT 50
-#define NCN_RESET_IND_TIMEOUT 50
-#define NCN_REG_READ_TIMEOUT 20
-#define NCN_DRAIN_GUARD 64 // bounded discard of a late reply before the next request
 // Analog Status Register 0 (ASR0, reg 0x03) bit masks: [6]V20V [5]VDD2 [4]VBUS [3]VFILT [2]XTAL [1]TW [0]TSD.
 // NCN5130/D Rev.8 p.59 Table 20/21 (Analog Status Register); bit 7 reserved.
 #define ASR0_V20V 0x40

@@ -2,18 +2,6 @@
 #include "TPUart/Receiver.h"
 #include "TPUart/DataLinkLayer.h"
 
-#ifndef TPUART_RX_TIMEOUT
-#define TPUART_RX_TIMEOUT 5
-#endif
-
-// Quiet window before a missing L_Data.con is declared lost. Not TPUART_RX_TIMEOUT, which guards an
-// intra-frame gap: the chip's own retransmission needs 30 bit times of acknowledge window plus 50 idle
-// (NACK) or 150 (BUSY) before the first retry octet, and hundreds of ms for a full 3+3 sequence.
-// The 8 s TX backstop remains the outer net.
-#ifndef TPUART_TX_CON_QUIET_MS
-#define TPUART_TX_CON_QUIET_MS 200
-#endif
-
 #ifdef OPENKNX_CON_DIAG
 // L_Data.con-generation diagnostics (counters dumped by the IP tunnel server). Gated by OPENKNX_CON_DIAG.
 uint16_t g_rxTxWaitAckn = 0, g_rxTxCompleted = 0, g_txAwaitEcho = 0, g_echoMismatch = 0, g_echoTxIdle = 0;

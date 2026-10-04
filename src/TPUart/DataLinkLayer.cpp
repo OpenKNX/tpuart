@@ -2,20 +2,6 @@
 #include "TPUart/DataLinkLayer.h"
 #include <stdarg.h>
 
-// NCN thermal-warning (TW) handling tunables. Overridable via build flags (central TPUART flag config).
-#ifndef TPUART_TW_HEARTBEAT_MS
-#define TPUART_TW_HEARTBEAT_MS 60000 // while TW stays set: at most one "still set" line this often
-#endif
-#ifndef TPUART_TW_AUTORESET_AFTER_MS
-#define TPUART_TW_AUTORESET_AFTER_MS 45000 // TPUART_NCN_TW_AUTORESET: let TW persist this long before the heal reset
-#endif
-#ifndef TPUART_TW_AUTORESET_COOLDOWN_MS
-#define TPUART_TW_AUTORESET_COOLDOWN_MS 300000 // minimum spacing between two auto-resets (cross-episode backoff)
-#endif
-#ifndef TPUART_TW_RELAPSE_MS
-#define TPUART_TW_RELAPSE_MS 8000 // TW still set this long after the reset => genuinely hot, not a latch
-#endif
-
 #ifdef OPENKNX_CON_DIAG
 uint16_t g_rxTxDropped = 0; // isTransmitted frame lost to rx-frame-buffer overflow (con diag)
 #endif
@@ -663,13 +649,6 @@ namespace TPUart
      * latched with TX blocked and the state poll suppressed. A guarded reset re-syncs and re-applies the
      * configuration. Later than the transmitter's own lost-confirm backstop, with a long cooldown.
      */
-#ifndef TPUART_DESYNC_RECOVER_MS
-#define TPUART_DESYNC_RECOVER_MS 20000 // _invalid latched this long without clearing => unrecoverable on its own
-#endif
-#ifndef TPUART_DESYNC_COOLDOWN_MS
-#define TPUART_DESYNC_COOLDOWN_MS 60000 // minimum spacing between two desync resets
-#endif
-
     void DataLinkLayer::processWatchdog()
     {
         if (_bcuState == BCU_UNINITIALIZED) return;
@@ -1030,10 +1009,6 @@ namespace TPUart
     /*
      * Show the current state of the TPUart.
      */
-#ifndef TPUART_STATE_ERR_THROTTLE_MS
-#define TPUART_STATE_ERR_THROTTLE_MS 10000 // min ms between repeated "TP Error" lines of the SAME error set
-#endif
-
     void DataLinkLayer::showStateError()
     {
         if (!_uState) return;

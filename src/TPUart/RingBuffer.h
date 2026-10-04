@@ -3,10 +3,7 @@
 #include <stdexcept>
 #include <vector>
 
-#ifndef TPUART_RX_FRAME_BUFFER_SIZE
-#define TPUART_RX_FRAME_BUFFER_SIZE 6000
-#endif
-
+#include "TPUart/Config.h"
 #define TPUART_RX_FRAME_BUFFER_SIZE1 (TPUART_RX_FRAME_BUFFER_SIZE + 1)
 
 namespace TPUart
