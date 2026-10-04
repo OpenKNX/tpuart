@@ -16,6 +16,11 @@
 #define TPUART_RX_FRAME_BUFFER_SIZE 6000
 #endif
 
+// Discarded octets kept for the hex dump of showDiscardedError(); later ones are only counted (dump shows "N+").
+#ifndef TPUART_DISCARD_LOG_SIZE
+#define TPUART_DISCARD_LOG_SIZE 256
+#endif
+
 #ifndef TPUART_RX_SEARCH_BUFFER_SIZE
 #define TPUART_RX_SEARCH_BUFFER_SIZE 300 // 263 + 37 reserv for frame errors errors and control bytes
 #endif
@@ -187,6 +192,7 @@
 static_assert(TPUART_RX_SEARCH_BUFFER_SIZE >= 264 + 2 + 1, "TPUART_RX_SEARCH_BUFFER_SIZE cannot hold a maximum frame");
 // Every entry the parser can push must fit into an empty frame ring (push needs available() > len + 4).
 static_assert(TPUART_RX_FRAME_BUFFER_SIZE >= TPUART_RX_SEARCH_BUFFER_SIZE + 4 + 1, "TPUART_RX_FRAME_BUFFER_SIZE cannot hold one maximum entry");
+static_assert(TPUART_DISCARD_LOG_SIZE > 0, "TPUART_DISCARD_LOG_SIZE must be positive");
 // processRxFrameBuffer() counts the frames in a char.
 static_assert(TPUART_MAX_RXQUEUE_TIME_PER_LOOP >= 0 && TPUART_MAX_RXQUEUE_TIME_PER_LOOP <= CHAR_MAX, "TPUART_MAX_RXQUEUE_TIME_PER_LOOP exceeds its char counter");
 static_assert(TPUART_REPETITION_FILTER_SIZE > 0, "TPUART_REPETITION_FILTER_SIZE must be positive");

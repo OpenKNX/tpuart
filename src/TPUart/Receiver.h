@@ -19,7 +19,7 @@ namespace TPUart
 
         DataLinkLayer &_dll;
         SearchBuffer _searchBuffer;
-        RingBuffer _discardedBytes;
+        RingBufferN<TPUART_DISCARD_LOG_SIZE> _discardedBytes; // hex-dump source of showDiscardedError(), first octets kept
         volatile unsigned long _lastDiscarded = 0;
 
         volatile RxState _state = RX_IDLE;

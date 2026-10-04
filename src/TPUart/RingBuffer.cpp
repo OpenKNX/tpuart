@@ -91,5 +91,8 @@ namespace TPUart
     }
 
     template class RingBufferN<TPUART_RX_FRAME_BUFFER_SIZE>;
+#if TPUART_DISCARD_LOG_SIZE != TPUART_RX_FRAME_BUFFER_SIZE
+    template class RingBufferN<TPUART_DISCARD_LOG_SIZE>;
+#endif
 
 } // namespace TPUart

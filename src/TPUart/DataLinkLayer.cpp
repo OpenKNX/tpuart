@@ -250,16 +250,18 @@ namespace TPUart
         _uState = 0;
         _uReset = false;
         _receiver.reset();
+        const unsigned int pendingDiscarded = _statistics.getRxDiscardedBytes() - (unsigned int)_lastDiscardedBytes;
         _statistics.reset();
         _rxFrameBuffer.clear();
         _rxFrameBufferEntries = 0;
         _repetitionFilter.clear();
+        // The discard log survives the reset: carry its pending count across the counter restart (wraps, see dump).
+        _lastDiscardedBytes = 0u - pendingDiscarded;
         _interface->flush();
         _bcuState = BCU_CONNECTED;
 
         _interface->write(U_RESET_REQ);
         _modeExtendedCRC = false;
-        _lastDiscardedBytes = 0;
         _receiver._invalid = false;
         // Re-arm RX liveness on EVERY reset (all build flavors), so a reset on an already-quiet bus does
         // not make the very next process() count a spurious CONNECTED->DISCONNECTED.
@@ -1156,6 +1158,8 @@ namespace TPUart
 
         std::string buffer;
         size_t size = _receiver._discardedBytes.size();
+        // Counted since the last dump (reset() carries it across the counter restart); more than kept: the log was full.
+        const bool lost = (unsigned int)(_statistics.getRxDiscardedBytes() - _lastDiscardedBytes) > size;
         while (_receiver._discardedBytes.size())
         {
             char hexBuffer[4];
@@ -1163,7 +1167,7 @@ namespace TPUart
             buffer += hexBuffer;
         }
 
-        printError(" %u Bytes are discarded! (%s )", size, buffer.c_str());
+        printError(" %u%s Bytes are discarded! (%s )", size, lost ? "+" : "", buffer.c_str());
 
         _lastDiscardedBytes = _statistics.getRxDiscardedBytes();
         _lastDiscardedMessage = millis();
