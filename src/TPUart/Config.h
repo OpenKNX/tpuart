@@ -68,6 +68,11 @@
 
 // ---- Transmit path ----
 
+// Frames the transmit queue accepts; a compile-time limit (Transmitter::pushQueue).
+#ifndef TPUART_TX_QUEUE_SIZE
+#define TPUART_TX_QUEUE_SIZE 50
+#endif
+
 #ifndef TP_TX_PRIO_RESERVE
 #define TP_TX_PRIO_RESERVE 6 // slots kept free of low-priority frames so a higher-priority frame (console/
                              // management telegram) is never starved by a bulk low-priority upload burst
@@ -185,6 +190,8 @@ static_assert(TPUART_RX_FRAME_BUFFER_SIZE >= TPUART_RX_SEARCH_BUFFER_SIZE + 4 + 
 // processRxFrameBuffer() counts the frames in a char.
 static_assert(TPUART_MAX_RXQUEUE_TIME_PER_LOOP >= 0 && TPUART_MAX_RXQUEUE_TIME_PER_LOOP <= CHAR_MAX, "TPUART_MAX_RXQUEUE_TIME_PER_LOOP exceeds its char counter");
 static_assert(TPUART_REPETITION_FILTER_SIZE > 0, "TPUART_REPETITION_FILTER_SIZE must be positive");
+// Leaves at least one slot to low-priority frames (Transmitter kQueueLimitLow).
+static_assert(TP_TX_PRIO_RESERVE >= 0 && TP_TX_PRIO_RESERVE < TPUART_TX_QUEUE_SIZE, "TP_TX_PRIO_RESERVE must leave room for low-priority frames");
 // drainInterface() counts the discarded octets in a uint8_t.
 static_assert(NCN_DRAIN_GUARD >= 1 && NCN_DRAIN_GUARD <= 255, "NCN_DRAIN_GUARD exceeds its uint8_t counter");
 // uart_driver_install() refuses smaller rings, and ESP32.cpp does not check its return.

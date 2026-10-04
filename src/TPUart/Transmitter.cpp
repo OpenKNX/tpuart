@@ -8,8 +8,9 @@ uint16_t g_txSent = 0; // frames handed to TX_TRANSMIT (con diag)
 
 namespace TPUart
 {
-    const size_t MAX_QUEUE_SIZE = 50;
-    const unsigned short MAX_WAIT_TIME = 60000;
+    // Queue limits per priority: low priority (rank 3) leaves TP_TX_PRIO_RESERVE slots to the higher ones.
+    static constexpr size_t kQueueLimit = TPUART_TX_QUEUE_SIZE;
+    static constexpr size_t kQueueLimitLow = TPUART_TX_QUEUE_SIZE - TP_TX_PRIO_RESERVE; // Config.h asserts reserve < size
 
     /**
      * @brief Constructs a new Transmitter object.
@@ -26,7 +27,6 @@ namespace TPUart
         _transmitPos = 0;
         _lastOffset = 0; // the chip resets its own offset on U_L_DataStart.req (DS p.49)
         _time = 0;
-        _maxQueueSize = MAX_QUEUE_SIZE;
     }
 
     /**
@@ -292,11 +292,7 @@ namespace TPUart
     bool Transmitter::pushQueue(Frame *frame)
     {
         const unsigned char r = frame->priorityRank();
-        // low priority (rank 3) is bounded below the cap so TP_TX_PRIO_RESERVE slots stay available for a
-        // higher-priority frame; system/urgent/normal may use the full cap.
-        const size_t limit = (r == 3)
-                                 ? (_maxQueueSize > TP_TX_PRIO_RESERVE ? _maxQueueSize - TP_TX_PRIO_RESERVE : 0)
-                                 : _maxQueueSize;
+        const size_t limit = (r == 3) ? kQueueLimitLow : kQueueLimit;
         if (_txCount >= limit) return false;
 
         _queue[r].push(frame);
@@ -453,18 +449,6 @@ namespace TPUart
     unsigned int Transmitter::droppedAcknowledges()
     {
         return _droppedAcknowledges;
-    }
-
-    /**
-     * @brief Sets the maximum size of the queue.
-     *
-     * This function sets the maximum number of elements that the queue can hold.
-     *
-     * @param size The maximum number of elements for the queue.
-     */
-    void Transmitter::setQueueSize(unsigned long size)
-    {
-        _maxQueueSize = size;
     }
 
     Frame *Transmitter::currentFrame()
