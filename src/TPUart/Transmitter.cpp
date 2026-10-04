@@ -129,17 +129,8 @@ namespace TPUart
         // isTransmitted-gated CON-rescue can't fire and only the 60s watchdog below recovers the stranded
         // TX. Cut that stall without racing a late CON: re-check under rxLock, require a genuinely quiet
         // interface, and throttle via a cooldown so a persistent fault degrades to the 60s cap.
-#ifndef TX_BACKSTOP_MS
-#define TX_BACKSTOP_MS 8000 // > worst-case legit CON latency (263B ext frame, 9600 baud, NCN 3+3 repeats)
-#endif
-#ifndef TX_BACKSTOP_COOLDOWN_MS
-#define TX_BACKSTOP_COOLDOWN_MS 30000 // after a fast reset, only the 60s cap may fire for this long
-#endif
-#ifndef TX_BACKSTOP_INVALID_MS
-#define TX_BACKSTOP_INVALID_MS 12000 // latched-_invalid on a quiet bus: longer window, give _invalid a chance to clear first
-#endif
-        if (millis() - time >= TX_BACKSTOP_MS &&
-            (_lastBackstopReset == 0 || millis() - _lastBackstopReset >= TX_BACKSTOP_COOLDOWN_MS))
+        if (millis() - time >= TPUART_TX_BACKSTOP_MS &&
+            (_lastBackstopReset == 0 || millis() - _lastBackstopReset >= TPUART_TX_BACKSTOP_COOLDOWN_MS))
         {
             bool doReset = false;
             _dll.rxLock(true);
@@ -174,8 +165,8 @@ namespace TPUart
         // transmit -> force a real reset after a longer window (gives _invalid a chance to clear first).
         // Separate `if` (not else-if) so it is evaluated even when the branch above ran-but-didn't-reset;
         // the gates are mutually exclusive (_invalid vs !_invalid) so the two can never double-fire.
-        if (millis() - time >= TX_BACKSTOP_INVALID_MS &&
-            (_lastBackstopReset == 0 || millis() - _lastBackstopReset >= TX_BACKSTOP_COOLDOWN_MS))
+        if (millis() - time >= TPUART_TX_BACKSTOP_INVALID_MS &&
+            (_lastBackstopReset == 0 || millis() - _lastBackstopReset >= TPUART_TX_BACKSTOP_COOLDOWN_MS))
         {
             bool doReset = false;
             _dll.rxLock(true);

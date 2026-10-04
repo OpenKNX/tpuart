@@ -307,9 +307,9 @@ Auto-reconnect (all platforms)
 
 Backstop       (all platforms, RP2040-safe)
    TX stranded in TX_AWAIT with the echo never matched and the bus idle: a guarded fast reset fires at
-   TX_BACKSTOP_MS = 8000 (TX_BACKSTOP_INVALID_MS = 12000 if _invalid is latched on a quiet bus) instead
+   TPUART_TX_BACKSTOP_MS = 8000 (TPUART_TX_BACKSTOP_INVALID_MS = 12000 if _invalid is latched on a quiet bus) instead
    of the 60 s watchdog. Guard: re-check under rxLock + !available() + RX quiet, re-checked after unlock
-   -> a late-but-valid CON is processed first, never dropped. Cooldown TX_BACKSTOP_COOLDOWN_MS = 30000:
+   -> a late-but-valid CON is processed first, never dropped. Cooldown TPUART_TX_BACKSTOP_COOLDOWN_MS = 30000:
    a persistent fault degrades back to the 60 s cap.
 
 Health counters (all platforms)
@@ -338,9 +338,10 @@ RX-liveness re-arm (`_lastReceivedTime` set on every reset(), no spurious discon
   tunables (#ifndef, have a default):
   TPUART_ESP32_TASK_STACK_SIZE  4096      ESP32    RX task stack (raised from 2048) -- EXPERIMENTAL, may still be re-evaluated / re-tuned
   TPUART_RX_TIMEOUT             5 ms      all      RX inter-byte / quiet-bus window
-  TX_BACKSTOP_MS                8000 ms   backstop fast-reset trigger delay
-  TX_BACKSTOP_COOLDOWN_MS       30000 ms  backstop after a fast reset only the 60 s cap fires
-  TX_BACKSTOP_INVALID_MS        12000 ms  backstop latched-_invalid reset window
+  TPUART_TX_BACKSTOP_MS         8000 ms   backstop fast-reset trigger delay
+  TPUART_TX_BACKSTOP_COOLDOWN_MS 30000 ms backstop after a fast reset only the 60 s cap fires
+  TPUART_TX_BACKSTOP_INVALID_MS 12000 ms  backstop latched-_invalid reset window
+  (TX_BACKSTOP_MS, TX_BACKSTOP_COOLDOWN_MS, TX_BACKSTOP_INVALID_MS without the prefix stop the build with #error)
   TPUART_TW_HEARTBEAT_MS        60000 ms  TW: min spacing of the "still set" heartbeat while it holds
   TPUART_TW_AUTORESET_AFTER_MS  45000 ms  TW auto-heal: let TW persist this long before the U_RESET
   TPUART_TW_AUTORESET_COOLDOWN_MS 300000  TW auto-heal: min spacing between two auto-resets (cross-episode backoff)

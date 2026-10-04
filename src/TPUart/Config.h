@@ -68,6 +68,26 @@
                              // management telegram) is never starved by a bulk low-priority upload burst
 #endif
 
+// The unprefixed names stop the build with #error instead of being ignored.
+#if defined(TX_BACKSTOP_MS)
+#error "TX_BACKSTOP_MS is renamed to TPUART_TX_BACKSTOP_MS"
+#endif
+#if defined(TX_BACKSTOP_COOLDOWN_MS)
+#error "TX_BACKSTOP_COOLDOWN_MS is renamed to TPUART_TX_BACKSTOP_COOLDOWN_MS"
+#endif
+#if defined(TX_BACKSTOP_INVALID_MS)
+#error "TX_BACKSTOP_INVALID_MS is renamed to TPUART_TX_BACKSTOP_INVALID_MS"
+#endif
+#ifndef TPUART_TX_BACKSTOP_MS
+#define TPUART_TX_BACKSTOP_MS 8000 // > worst-case legit CON latency (263B ext frame, 9600 baud, NCN 3+3 repeats)
+#endif
+#ifndef TPUART_TX_BACKSTOP_COOLDOWN_MS
+#define TPUART_TX_BACKSTOP_COOLDOWN_MS 30000 // after a fast reset, only the 60s cap may fire for this long
+#endif
+#ifndef TPUART_TX_BACKSTOP_INVALID_MS
+#define TPUART_TX_BACKSTOP_INVALID_MS 12000 // latched-_invalid on a quiet bus: longer window, give _invalid a chance to clear first
+#endif
+
 // ---- Recovery and logging ----
 
 #ifndef TPUART_DESYNC_RECOVER_MS
