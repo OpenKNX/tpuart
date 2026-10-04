@@ -4,50 +4,48 @@
 #include <vector>
 
 #include "TPUart/Config.h"
-#define TPUART_RX_FRAME_BUFFER_SIZE1 (TPUART_RX_FRAME_BUFFER_SIZE + 1)
 
 namespace TPUart
 {
 
-    class RingBuffer
+    /**
+     * @brief Byte ring of Capacity octets (one slot more is allocated to tell full from empty).
+     * Defined in RingBuffer.cpp and instantiated there for the sizes in use.
+     */
+    template <size_t Capacity>
+    class RingBufferN
     {
       public:
-        // Konstruktor: Initialisiert head und tail
-        RingBuffer();
+        RingBufferN();
 
-        // Fügt ein Zeichen in den Puffer ein.
-        // Gibt true zurück, wenn das Zeichen eingefügt wurde,
-        // false wenn der Puffer voll ist.
+        // Pushes one octet; false when full.
         bool push(char data);
 
-        // Liest ein Zeichen aus dem Puffer aus.
-        // Das gelesene Zeichen wird in 'data' gespeichert.
-        // Gibt true zurück, wenn ein Zeichen vorhanden war,
-        // false wenn der Puffer leer ist.
+        // Pops one octet into data; false when empty.
         bool pop(char &data);
         char pop();
 
-        // Überprüft, ob der Puffer leer ist.
         bool isEmpty() const;
-
-        // Überprüft, ob der Puffer voll ist.
         bool isFull() const;
 
-        // Liefert die Anzahl der freien Slots im Puffer.
+        // Free slots.
         size_t available() const;
         size_t size() const;
 
-        // Setzt den Puffer zurück (alle Daten werden verworfen).
+        // Drops all octets.
         void clear();
 
       private:
-        // Statisch allokiertes Array für die Zeichen.
-        // Mit 'volatile' deklariert, um Optimierungen zu vermeiden,
-        // falls der Puffer auch in einem Interrupt verändert wird.
-        volatile char buffer[TPUART_RX_FRAME_BUFFER_SIZE1];
+        static constexpr size_t kSlots = Capacity + 1;
 
-        // head zeigt auf die nächste freie Position, tail auf die nächste lesbare.
+        // volatile: the ring is also written from the UART interrupt or task.
+        volatile char buffer[kSlots];
+
+        // head: next free slot, tail: next readable slot.
         volatile size_t head;
         volatile size_t tail;
     };
+
+    // RX frame ring between the parser and process().
+    using RingBuffer = RingBufferN<TPUART_RX_FRAME_BUFFER_SIZE>;
 } // namespace TPUart

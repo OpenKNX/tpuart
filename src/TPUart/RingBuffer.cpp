@@ -4,18 +4,17 @@
 namespace TPUart
 {
 
-    // Konstruktor: Initialisiert head und tail
-    RingBuffer::RingBuffer() : head(0), tail(0) {}
+    template <size_t Capacity>
+    RingBufferN<Capacity>::RingBufferN() : head(0), tail(0) {}
 
-    // Fügt ein Zeichen in den Puffer ein.
-    // Prüft zunächst, ob der Puffer voll ist, indem er vergleicht,
-    // ob der nächste Index von head gleich tail ist.
-    bool RingBuffer::push(char data)
+    // Full when the slot after head is tail.
+    template <size_t Capacity>
+    bool RingBufferN<Capacity>::push(char data)
     {
-        size_t next = (head + 1) % TPUART_RX_FRAME_BUFFER_SIZE1;
+        size_t next = (head + 1) % kSlots;
         if (next == tail)
         {
-            // Puffer ist voll (nur TPUART_RX_FRAME_BUFFER_SIZE1 - 1 Elemente können gespeichert werden)
+            // Full: only kSlots - 1 elements can be stored
             return false;
         }
         buffer[head] = data;
@@ -25,9 +24,9 @@ namespace TPUart
         return true;
     }
 
-    // Liest ein Zeichen aus dem Puffer aus.
-    // Falls der Puffer leer ist (head == tail), wird false zurückgegeben.
-    bool RingBuffer::pop(char &data)
+    // Empty when head == tail.
+    template <size_t Capacity>
+    bool RingBufferN<Capacity>::pop(char &data)
     {
         if (isEmpty())
         {
@@ -35,11 +34,12 @@ namespace TPUart
         }
         data = buffer[tail];
         asm volatile("" ::: "memory");
-        tail = (tail + 1) % TPUART_RX_FRAME_BUFFER_SIZE1;
+        tail = (tail + 1) % kSlots;
         return true;
     }
 
-    char RingBuffer::pop()
+    template <size_t Capacity>
+    char RingBufferN<Capacity>::pop()
     {
         if (isEmpty())
         {
@@ -50,44 +50,46 @@ namespace TPUart
         }
         char value = buffer[tail];
         asm volatile("" ::: "memory");
-        tail = (tail + 1) % TPUART_RX_FRAME_BUFFER_SIZE1;
+        tail = (tail + 1) % kSlots;
         return value;
     }
 
-    // Der Puffer ist leer, wenn head und tail gleich sind.
-    bool RingBuffer::isEmpty() const
+    template <size_t Capacity>
+    bool RingBufferN<Capacity>::isEmpty() const
     {
         return head == tail;
     }
 
-    // Der Puffer gilt als voll, wenn der nächste Wert von head gleich tail ist.
-    bool RingBuffer::isFull() const
+    template <size_t Capacity>
+    bool RingBufferN<Capacity>::isFull() const
     {
-        return ((head + 1) % TPUART_RX_FRAME_BUFFER_SIZE1) == tail;
+        return ((head + 1) % kSlots) == tail;
     }
 
-    // Liefert die Anzahl der freien Slots im Puffer.
-    // Mit diesem Ansatz (einen Slot opfern) ist die maximale Anzahl
-    // der einfügbaren Elemente (TPUART_RX_FRAME_BUFFER_SIZE1 - 1).
-    size_t RingBuffer::available() const
+    // Free slots; one slot is sacrificed, so at most kSlots - 1 elements fit.
+    template <size_t Capacity>
+    size_t RingBufferN<Capacity>::available() const
     {
         if (head >= tail)
-            return TPUART_RX_FRAME_BUFFER_SIZE1 - (head - tail) - 1;
+            return kSlots - (head - tail) - 1;
         else
             return tail - head - 1;
     }
 
-    // Liefert die Anzahl der Elemente im Puffer.
-    // Dabei wird ein Slot geopfert, um den Zustand "voll" zu erkennen.
-    size_t RingBuffer::size() const
+    // Octets stored.
+    template <size_t Capacity>
+    size_t RingBufferN<Capacity>::size() const
     {
-        return TPUART_RX_FRAME_BUFFER_SIZE1 - available() - 1;
+        return kSlots - available() - 1;
     }
 
-    void RingBuffer::clear()
+    template <size_t Capacity>
+    void RingBufferN<Capacity>::clear()
     {
         head = 0;
         tail = 0;
     }
+
+    template class RingBufferN<TPUART_RX_FRAME_BUFFER_SIZE>;
 
 } // namespace TPUart
