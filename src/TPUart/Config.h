@@ -21,14 +21,12 @@
 #define TPUART_DISCARD_LOG_SIZE 256
 #endif
 
+// Parser buffer, in octets.
 #ifndef TPUART_RX_SEARCH_BUFFER_SIZE
-#define TPUART_RX_SEARCH_BUFFER_SIZE 300 // 263 + 37 reserv for frame errors errors and control bytes
+#define TPUART_RX_SEARCH_BUFFER_SIZE 300 // Frame::size() max 9 + 255 = 264, + 2 CRC + 1 ACK/CON, rest reserve
 #endif
 
-// (TPUART_MAX_PROCESS_TIME_PER_LOOP removed: it was never referenced anywhere, so setting it did nothing.
-//  Bounding the RX drain in process() was considered and deliberately NOT added -- it would trade a loop
-//  stall for a UART FIFO overflow, and which of the two is worse is a measurement, not a guess.
-//  TPUART_MAX_RXQUEUE_TIME_PER_LOOP below IS live, see DataLinkLayer.cpp.)
+// Frames handed to the receive callbacks per process() pass, 0 = unbounded. A frame count, not a time.
 #ifndef TPUART_MAX_RXQUEUE_TIME_PER_LOOP
 #define TPUART_MAX_RXQUEUE_TIME_PER_LOOP 20
 #endif
@@ -38,10 +36,8 @@
 #define TPUART_RX_TIMEOUT 5
 #endif
 
-// Quiet window before a missing L_Data.con is declared lost. Not TPUART_RX_TIMEOUT, which guards an
-// intra-frame gap: the chip's own retransmission needs 30 bit times of acknowledge window plus 50 idle
-// (NACK) or 150 (BUSY) before the first retry octet, and hundreds of ms for a full 3+3 sequence.
-// The 8 s TX backstop remains the outer net.
+// Quiet window before a missing L_Data.con of our own echo is declared lost, in ms. It measures the gap since the
+// last received octet; the chip repeats after at least 50 (NACK) or 150 (BUSY) bit times of bus idle (NCN5120 DS p.33).
 #ifndef TPUART_TX_CON_QUIET_MS
 #define TPUART_TX_CON_QUIET_MS 200
 #endif
@@ -78,9 +74,9 @@
 #define TPUART_TX_QUEUE_SIZE 50
 #endif
 
+// Queue slots kept free of low-priority frames (rank 3) for higher-priority ones.
 #ifndef TP_TX_PRIO_RESERVE
-#define TP_TX_PRIO_RESERVE 6 // slots kept free of low-priority frames so a higher-priority frame (console/
-                             // management telegram) is never starved by a bulk low-priority upload burst
+#define TP_TX_PRIO_RESERVE 6
 #endif
 
 // The TX pump in process() stops once it has run longer than this, in ms.
@@ -104,10 +100,10 @@
 #error "TX_BACKSTOP_INVALID_MS is renamed to TPUART_TX_BACKSTOP_INVALID_MS"
 #endif
 #ifndef TPUART_TX_BACKSTOP_MS
-#define TPUART_TX_BACKSTOP_MS 8000 // > worst-case legit CON latency (263B ext frame, 9600 baud, NCN 3+3 repeats)
+#define TPUART_TX_BACKSTOP_MS 8000 // above the worst-case CON latency (263-octet frame, 9600 baud, 3+3 repetitions)
 #endif
 #ifndef TPUART_TX_BACKSTOP_COOLDOWN_MS
-#define TPUART_TX_BACKSTOP_COOLDOWN_MS 30000 // after a fast reset, only the 60s cap may fire for this long
+#define TPUART_TX_BACKSTOP_COOLDOWN_MS 30000 // spacing after a backstop reset during which neither backstop fires (TPUART_TX_WATCHDOG_MS still does)
 #endif
 #ifndef TPUART_TX_BACKSTOP_INVALID_MS
 #define TPUART_TX_BACKSTOP_INVALID_MS 12000 // latched-_invalid on a quiet bus: longer window, give _invalid a chance to clear first
@@ -116,7 +112,7 @@
 // ---- Recovery and logging ----
 
 #ifndef TPUART_DESYNC_RECOVER_MS
-#define TPUART_DESYNC_RECOVER_MS 20000 // _invalid latched this long without clearing => unrecoverable on its own
+#define TPUART_DESYNC_RECOVER_MS 20000 // _invalid set this long while CONNECTED resets the BCU (DataLinkLayer::processWatchdog)
 #endif
 #ifndef TPUART_DESYNC_COOLDOWN_MS
 #define TPUART_DESYNC_COOLDOWN_MS 60000 // minimum spacing between two desync resets
@@ -125,7 +121,7 @@
 #define TPUART_STATE_ERR_THROTTLE_MS 10000 // min ms between repeated "TP Error" lines of the SAME error set
 #endif
 
-// NCN thermal-warning (TW) handling tunables. Overridable via build flags (central TPUART flag config).
+// NCN thermal-warning (TW) handling.
 #ifndef TPUART_TW_HEARTBEAT_MS
 #define TPUART_TW_HEARTBEAT_MS 60000 // while TW stays set: at most one "still set" line this often
 #endif
@@ -136,7 +132,7 @@
 #define TPUART_TW_AUTORESET_COOLDOWN_MS 300000 // minimum spacing between two auto-resets (cross-episode backoff)
 #endif
 #ifndef TPUART_TW_RELAPSE_MS
-#define TPUART_TW_RELAPSE_MS 8000 // TW still set this long after the reset => genuinely hot, not a latch
+#define TPUART_TW_RELAPSE_MS 8000 // TW still set this long after the reset => chip is hot, not latched
 #endif
 
 // Wait for U_Reset.ind per baud-rate probe in tryInitialize(), in ms.
@@ -144,8 +140,8 @@
 #define TPUART_RESET_PROBE_MS 50
 #endif
 
-// Init-only busy-wait budgets for the identification. Worst case 50 + 4 x 20 + 50 = 180 ms, once per
-// BCU connect, entirely before the RX pump goes live.
+// Wait budgets of the NCN identification (TPUART_BCU_REGISTER_INFO), in ms: worst case 50 + 4 x 20 + 50 = 180,
+// once per tryInitialize(), before received octets are processed.
 #ifndef NCN_STOP_MODE_TIMEOUT
 #define NCN_STOP_MODE_TIMEOUT 50
 #endif
@@ -171,7 +167,7 @@
 #define TPUART_ESP32_DRAIN_GUARD 2048
 #endif
 #ifndef TPUART_ESP32_TASK_STACK_SIZE
-#define TPUART_ESP32_TASK_STACK_SIZE 4096 // recursive RX parser (processSearchBuffer) + VLAs -- 2048 is too tight
+#define TPUART_ESP32_TASK_STACK_SIZE 4096 // bytes; the recursive RX parser (processSearchBuffer) runs on this stack
 #endif
 // ESP-IDF UART driver rings in octets and its event queue length. RX must exceed the 128-octet hardware FIFO;
 // TX is 0 (blocking writes) or also above 128.
