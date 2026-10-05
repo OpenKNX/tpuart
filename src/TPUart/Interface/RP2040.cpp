@@ -176,9 +176,7 @@ namespace TPUart
 
             const TpuartDmaWord word = _dmaBuffer[_dmaReaderCount++ % TPUART_RP2040_BUFFER_SIZE];
 #ifdef TPUART_BUSMON_INTEGRITY
-            // DR[11:8] = OE|BE|PE|FE. The NCN drives PE for a bus-side bit error (DS p.27); FE can be
-            // either. OE|BE mean this host link lost octets and say nothing about the bus, so they are
-            // counted apart -- lumping them in reported a bus fault for what was a starved UART.
+            // DR[11:8] = OE|BE|PE|FE: PE = NCN bus-side bit error (DS p.27), OE|BE = host-link loss (counted apart), FE either.
             _lastByteErrored = (word & 0x0300) != 0;
             _lastByteOverrun = (word & 0x0C00) != 0;
             _lastByteStatus = (unsigned char)((word >> 8) & 0x0F);

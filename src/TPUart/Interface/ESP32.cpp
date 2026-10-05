@@ -43,11 +43,7 @@ namespace TPUart
                             // fall through: the octets around it must still be drained
                         case UART_FIFO_OVF:
                         case UART_BUFFER_FULL:
-                            // Both reached by the fall-through above, so both must test the event. Overflow
-                            // means octets were LOST; a parity error does not. Setting it there latched
-                            // Receiver::_invalid, and processQueue() refuses to transmit while that is set --
-                            // one bus-side bit error (the NCN encodes those in the parity bit) silenced the
-                            // device until the desync watchdog recovered it.
+                            // Also reached by the fall-through: only an overflow (octets lost) sets _overflow, which latches _invalid and blocks TX.
                             if (event.type == UART_FIFO_OVF || event.type == UART_BUFFER_FULL)
                             {
                                 _byteStatus |= 0x08; // host link lost octets, the bus is unaffected
@@ -94,14 +90,12 @@ namespace TPUart
                 .source_clk = UART_SCLK_DEFAULT,
             };
 
-            // UART-Konfiguration anwenden
+            // Apply the UART configuration
             uart_param_config(_uart, &uart_config);
             uart_set_pin(_uart, _tx, _rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
             uart_driver_install(_uart, TPUART_ESP32_RX_BUFFER_SIZE, TPUART_ESP32_TX_BUFFER_SIZE, TPUART_ESP32_EVENT_QUEUE_SIZE, &_taskQueue, 0);
-            // Threshold MUST stay 1: a KNX L_ACK is a single byte that connection-oriented transport (ETS app
-            // programming) needs delivered promptly; a high threshold holds it until the rx-timeout and blows
-            // the per-telegram ACK window (A/B-confirmed: 80 breaks programming, 1 works). The throughput win
-            // comes from the drain-whole-ring loop above + the larger ring, not from coalescing wakeups.
+            // Threshold 1: a higher one holds received octets until the RX timeout, past the per-telegram acknowledge window.
+            // Throughput comes from the drain loop in runTask and the driver ring, not from coalescing wakeups.
             uart_set_rx_full_threshold(_uart, 1);
             _running = true;
 

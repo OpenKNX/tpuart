@@ -8,15 +8,12 @@
 #include "TPUart/Config.h"
 #include "TPUart/Types.h"
 
-constexpr uint32_t TPUART_RP2040_TRANSFER_COUNT = UINT32_MAX >> 1; // aus irgendeinem Grund funktioniert UINT32_MAX nicht und ich musste den wert halbieren
+constexpr uint32_t TPUART_RP2040_TRANSFER_COUNT = UINT32_MAX >> 1; // transfer count per channel start, halved because UINT32_MAX did not work; read() restarts the channel once it has run out
 // constexpr unsigned int TPUART_RP2040_TRANSFER_COUNT = 5000;
 // constexpr unsigned int TPUART_RP2040_TRANSFER_COUNT = 256;
 constexpr unsigned long TPUART_RP2040_BUFFER_EXP = TPUART_RP2040_DMA_BUFFER_EXP; // 2**BufferExp entries, default 2048
-// The DMA RX ring must outlast the longest noInterrupts() stall (mid-stream LittleFS flash erase) and
-// hold a full worst-case burst without wrapping. A 256 B ring overflows there -> mid-frame bytes are
-// silently jump-discarded in read() (fast-transfer >4KB corruption) and a single max extended LPDU
-// (264 B incl. FCS) already exceeds it -> raw-busmon long frames are lost. 2048 B gives ample headroom.
-// (Previously reverted to 8 while isolating an unrelated KNXnet/IP routing issue; that net is clean now.)
+// The DMA RX ring must outlast the longest noInterrupts() stall (LittleFS flash erase) without wrapping and hold one
+// maximum extended frame (263 octets incl. FCS); read() discards the octets of a wrapped ring.
 constexpr unsigned long TPUART_RP2040_BUFFER_SIZE = (1u << TPUART_RP2040_BUFFER_EXP); // entries
 
 // 16-bit entries carry the UART status bits DR[11:8] with the octet; DMA_SIZE_8 copies only DR[7:0]
