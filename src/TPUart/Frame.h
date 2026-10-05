@@ -12,7 +12,6 @@
 #define TP_FRAME_FLAG_TX 0b10000000
 
 // Marks a 1-byte carrier holding a standalone L2 acknowledge octet, forwarded to the busmon only.
-// (Reuses the former, unused TP_FRAME_FLAG_DATA_CON bit.)
 #define TP_FRAME_FLAG_ACK_ONLY 0b01000000
 
 // Means that the frame should be filtered by the device
@@ -240,7 +239,7 @@ namespace TPUart
         unsigned short awaitDestination()
         {
             // return isExtended() ? 6 : 5;
-            return 6; // Extended ist 6 und Standard ist 5, aber das isGroupFlag kommt 1 Byte später
+            return 6; // extended 6, standard 5, but the group flag arrives one octet later
         }
 
         unsigned short awaitSize()
@@ -354,7 +353,7 @@ namespace TPUart
             char *cemiBuffer = (char *)malloc(cemiSize());
             if (cemiBuffer == nullptr) return nullptr; // callers must check: every dereference below writes
 
-            // Das CEMI erwartet die Daten im Extended format inkl. zwei zusätzlicher Bytes am Anfang.
+            // cEMI expects the extended format with two additional leading octets
             cemiBuffer[0] = 0x29;
             cemiBuffer[1] = 0x0;
             cemiBuffer[2] = _data[0];
