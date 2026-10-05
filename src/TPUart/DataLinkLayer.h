@@ -35,7 +35,7 @@ namespace TPUart
 
       private:
         bool _initialized = false;
-        char _repetitions = 0b00110011; // 0-3 Nack (Default 3) // 5-7 Busy (Default 3)
+        char _repetitions = 0b00110011; // bits 0-2 NACK, bits 4-6 BUSY repetitions (default 3 each)
         uint16_t _ownAddress = 0;   // unsigned: a PA >= 0x8000 (areas 8-15, and the 15.15.255 default) must not read as negative
         bool _chipAutoAck = true; // false -> the chip address is withheld, so only the host acknowledges
         volatile bool _uReset = false;
@@ -56,9 +56,7 @@ namespace TPUart
         volatile size_t _rxFrameBufferEntries = 0;
         volatile BcuType _bcuType;
         // NCN boot register snapshot, taken once in tryInitialize (see identifyNcnChip).
-        uint8_t _ncnAsr0 = 0;          // ASR0 @ boot; sampled in Stop, where only the latched TSD bit is
-                                       // meaningful -- the rails are the Power-Up exit condition and may
-                                       // legitimately still read 0 at that point
+        uint8_t _ncnAsr0 = 0;          // ASR0 at boot, sampled in Stop: only the latched TSD bit is meaningful, the rail bits may still read 0
         uint8_t _ncnRevId = 0;         // RevID register: [7:5] silicon rev, [4:0] part number
         NcnChip _ncnChip = NCN_CHIP_UNKNOWN;
         bool _ncnChipInferred = false; // chip concluded from an absent RevID register, not read from it

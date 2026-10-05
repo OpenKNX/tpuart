@@ -178,11 +178,8 @@ namespace TPUart
         _lastTryInitialize = millis();
 
         uint baudrates[2] = {19200, 38400};
-        // Two passes. A reset indication alone does not prove the baud rate: reading a stream at the wrong
-        // rate hands out re-framed fragments of neighbouring octets, and one of them looking like
-        // U_RESET_IND is enough for the old single-byte test. A framing error, on the other hand, means the
-        // octet did not fit the configured rate at all -- so pass 1 accepts only a clean probe. Pass 2
-        // repeats the old, weaker rule so a board that always reports framing errors still comes up.
+        // First pass: only a probe without framing error (at a wrong baud rate a re-framed fragment can look like U_RESET_IND).
+        // Second pass: any U_RESET_IND, for a board that always reports framing errors.
         for (uint pass = 0; pass < 2; pass++)
         {
             for (uint baudrate : baudrates)
@@ -228,7 +225,7 @@ namespace TPUart
             if (value == 0) continue;  // TPUart send zeros at the beginning
             // Serial.printf("%02X", value);
 
-            // War direkt erfolgreich - Top
+            // The first non-zero octet decides: only U_RESET_IND passes the probe
             if (value == U_RESET_IND) return true;
             break;
         }
@@ -347,11 +344,8 @@ namespace TPUart
             const uint16_t bufferSize = (uint16_t)(bsLo | (bsHi << 8));
             const uint16_t frameSize = bufferSize - 4;
 
-            // Bound what was a VLA (char frameData[frameSize]): the producer (pushRxFrameBuffer) never pushes
-            // more than the rx search buffer holds, so a frameSize above it means the ring desynced or the
-            // 2-byte length header underflowed (bufferSize < 3 -> frameSize wraps to ~65533). Either way the
-            // read pointer is untrustworthy; sizing a stack array from it would overflow the stack. Drop the
-            // whole buffer and resync (same reset idiom as the init/overflow paths) instead of indexing wild.
+            // pushRxFrameBuffer() never pushes more than the search buffer: a larger frameSize (desynced ring, or bufferSize < 4
+            // wrapping) drops the whole ring instead of overrunning frameData below.
             if (frameSize > TPUART_RX_SEARCH_BUFFER_SIZE)
             {
                 _rxFrameBuffer.clear();
@@ -378,9 +372,7 @@ namespace TPUart
 
             run++;
 
-            // Our own transmissions are recorded too: without the original, a chip retransmission arrived
-            // as a foreign telegram carrying our own source address. Safe now, because the confirmation
-            // branch in the knx receive path runs BEFORE the filter gate.
+            // Own transmissions are recorded too, so a chip repetition of our frame is filtered; the knx confirmation branch runs before the filter gate.
             if (!frame.isErrored() && !frame.isAckOnly() && !frame.isTruncated() && !frame.isRaw())
             {
                 bool alreadFound;
@@ -524,9 +516,7 @@ namespace TPUart
     {
         _initialized = false;
         _bcuState = BCU_UNINITIALIZED;
-        // No delete: the interface belongs to the Platform, which hands it out through interface() and
-        // outlives this layer. The parameter is kept for the existing signature; the inverted test it
-        // used to carry never deleted anything, which is why nothing has noticed.
+        // No delete: the interface belongs to the Platform, which outlives this layer; deleteUart is unused and kept for the signature.
         (void)deleteUart;
         _interface = nullptr;
     }
@@ -561,12 +551,7 @@ namespace TPUart
 
         if (_bcuState == BCU_DISCONNECTED && millis() - _lastReconnectAttempt >= _reconnectBackoff)
         {
-            // Active reconnect: the NCN went mute/desynced. Clean the parser, flush, poke U_RESET_REQ -- all
-            // under rxLock, no UART teardown. The only way back to CONNECTED is receivedReset() on a genuine
-            // U_RESET_IND, so a wedged chip dribbling noise can't look alive. The _receiver.reset() below is
-            // what makes that reachable: while _invalid is set the parser DISCARDS control bytes, so the
-            // indication would never arrive -- clearing the desync before each poke is load-bearing, not
-            // tidiness (an earlier version of this comment claimed the indication is parsed regardless).
+            // Active reconnect under rxLock; its U_RESET_IND sets CONNECTED. _receiver.reset() clears _invalid: while set, the parser discards it.
             _lastReconnectAttempt = millis();
             printMessage("BCU reconnect: U_RESET_REQ");
             rxLock(true);
@@ -586,9 +571,7 @@ namespace TPUart
         handleReset();
         unsigned long start;
 
-        // The RX drain is deliberately unbounded: the byte rate is capped by TP1 itself, and cutting it
-        // short would leave bytes in the UART FIFO to overflow instead. (A `start = millis()` used to sit
-        // here and was overwritten below without ever being read -- the remains of an abandoned bound.)
+        // The RX drain is unbounded: TP1 caps the octet rate, and cutting it short would let the UART FIFO overflow.
         // if (!_interface->hasCallback())
         while (_interface->available())
             processReceviedByte();
@@ -828,7 +811,7 @@ namespace TPUart
             }
         }
 
-        // Abweichende Config
+        // Repetition limits other than the default 3 NACK / 3 BUSY
         if (_repetitions != 0b00110011)
         {
             if (_bcuType == BCU_NCN5120)
@@ -879,8 +862,7 @@ namespace TPUart
      * if the transmit queue is full, the return is false.
      *
      * Important! The frame is not copied, only a pointer is stored.
-     * The frame will only delete wenn the frame is send.
-     * Is the queue full, the frame must be deleted by the caller.
+     * The transmitter deletes an accepted frame; on false the caller keeps it and must delete it.
      */
     bool DataLinkLayer::pushTransmitQueue(Frame *frame)
     {
@@ -1107,7 +1089,7 @@ namespace TPUart
 
 #ifdef TPUART_NCN_TW_AUTORESET
     /*
-     * L2: if TW persists, issue ONE U_RESET (the same clean protocol reset as "bcu rst") to clear a
+     * L2: if TW persists, issue ONE U_RESET (the same protocol reset as "bcu rst") to clear a
      * possibly-latched TW. Exactly one per episode plus a long cross-episode cooldown, so a genuinely-hot
      * chip cannot cause a reset loop: if TW returns after the reset it is real heat -> we log that verdict
      * and stop resetting until it clears and re-triggers (subject to the cooldown).
@@ -1287,7 +1269,7 @@ namespace TPUart
         _resetIndCount++;
         _modeExtendedCRC = false;
         _modeAutoAcknowlage = false;
-        _receiver._invalid = false; // reset indication -> the stream restarts in sync, so clear the desync flag (the parser also clears it on the U_RESET_IND)
+        _receiver._invalid = false; // reset indication: the stream restarts in sync
         // The stale in-flight TX is abandoned in handleReset(): _uReset is consumed by process() before the
         // RX drain and the TX pump, and this runs in RX context (UART IRQ on RP2040) where the transmitter
         // must not be touched -- it is mutated unlocked by the main loop and txLock(true) would block here.
