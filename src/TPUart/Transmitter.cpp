@@ -17,9 +17,7 @@ namespace TPUart
      *
      * @param dll Reference to a DataLinkLayer object.
      *
-     * This constructor initializes the Transmitter object with the provided
-     * DataLinkLayer reference. It also sets the initial values for
-     * _awaitResponse and _time to 0.
+     * Starts in TX_IDLE with _transmitPos, _lastOffset and _time at 0.
      */
     Transmitter::Transmitter(DataLinkLayer &dll) : _dll(dll)
     {
@@ -43,11 +41,7 @@ namespace TPUart
     }
 
     /**
-     * @brief Finalizes the transmitter by setting the _awaitResponse flag to false.
-     *
-     * This function is used to indicate that the transmitter should no longer
-     * await a response. It is typically called when the transmission process
-     * is complete.
+     * @brief Ends the wait for the confirm: TX_AWAIT becomes TX_IDLE, any other state is left as it is.
      */
     void Transmitter::finalize()
     {
@@ -113,11 +107,8 @@ namespace TPUart
     }
 
     /**
-     * @brief Processes the expiration of a waiting response.
-     *
-     * This function checks if the transmitter is awaiting a response and if the
-     * waiting time has exceeded a specified timeout (60 seconds). If the response
-     * wait time has expired, reset the BCU.
+     * @brief Resets the BCU when a sent frame stays without its confirm.
+     * On a quiet bus after TPUART_TX_BACKSTOP_MS or TPUART_TX_BACKSTOP_INVALID_MS, otherwise after TPUART_TX_WATCHDOG_MS.
      */
     void Transmitter::processWatchdog()
     {
@@ -125,10 +116,8 @@ namespace TPUart
         // _last could be updated in parallel, so it must be temporarily stored
         const uint32_t time = _time;
 
-        // Backstop for the residual transient lost-CON: our frame's bus-echo was never matched, so the
-        // isTransmitted-gated CON-rescue can't fire and only the 60s watchdog below recovers the stranded
-        // TX. Cut that stall without racing a late CON: re-check under rxLock, require a genuinely quiet
-        // interface, and throttle via a cooldown so a persistent fault degrades to the 60s cap.
+        // Backstop for an echo never matched (no CON rescue can fire): reset on a quiet bus, re-checked under rxLock and
+        // spaced by TPUART_TX_BACKSTOP_COOLDOWN_MS, so a persistent fault falls back to TPUART_TX_WATCHDOG_MS.
         if (millis() - time >= TPUART_TX_BACKSTOP_MS &&
             (_lastBackstopReset == 0 || millis() - _lastBackstopReset >= TPUART_TX_BACKSTOP_COOLDOWN_MS))
         {
@@ -404,9 +393,7 @@ namespace TPUart
     /**
      * @brief Writes a parked acknowledge, or discards it once its bus window has elapsed.
      *
-     * Called from the top of the transmit pump and once per process() pass, so a park is resolved
-     * whether or not a transmission is running -- the old cache was flushed only after a transmitted
-     * byte and therefore survived, off-window, into an unrelated frame.
+     * Called from the top of the transmit pump and once per process() pass, with or without a transmission.
      */
     void Transmitter::flushAcknowledge()
     {

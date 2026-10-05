@@ -18,9 +18,9 @@ namespace TPUart
         size_t _transmitPos;
         unsigned char _lastOffset; // NCN5130 keeps the data-index offset until it is changed (DS p.42)
         volatile unsigned long _time;
-        volatile TxState _state; // H1: written by the UART task (finalize), read by the main loop -> volatile (matches Receiver::_state)
+        volatile TxState _state; // written by the RX context (UART IRQ or UART task, finalize), read by the main loop -> volatile (matches Receiver::_state)
         Frame *_frame = nullptr;
-        uint32_t _lastBackstopReset = 0; // throttles repeated backstop fast-resets (a persistent echo-loss fault degrades to the 60s cap)
+        uint32_t _lastBackstopReset = 0; // throttles repeated backstop resets (a persistent echo-loss fault falls back to TPUART_TX_WATCHDOG_MS)
 
       public:
         std::queue<Frame *> _queue[4];
