@@ -17,13 +17,8 @@ namespace TPUart
     {
         processTimeout();
 
-        // Loop-driven recovery for the lost-CON-then-quiet-bus case. The byte-driven rescues in
-        // processCompleteFrame / processSearchBufferInvalid only fire when a UART byte arrives (they
-        // hang off pushSearchBuffer). But if our own TX echo is parked in RX_FRAME_WAIT_ACKN, its
-        // trailing L_DATA_CON is lost, and the bus then goes quiet (idle bus, or the terminal frame
-        // of a forwarding burst), no further byte arrives to pump the parser and only the 60s watchdog
-        // would act -> "Reset BCU". So on the loop tick -- where the watchdog also lives -- force the
-        // SAME completion the burst case uses, but ONLY for our own proven echo (structural gate).
+        // Own echo in RX_FRAME_WAIT_ACKN whose CON is lost on a quiet bus: no octet drives the parser, so the loop forces
+        // the completion after TPUART_TX_CON_QUIET_MS, which releases the Transmitter (processCompleteFrame).
         if (_state == RX_FRAME_WAIT_ACKN
             && millis() - _lastReceivedTime >= TPUART_TX_CON_QUIET_MS
             && _searchBuffer.frame().isTransmitted()
@@ -66,25 +61,18 @@ namespace TPUart
     }
 
     /*
-     * Hier wird geprüft ob der SearchBuffer mit einem Timeout-Marker (Positionsangabe) hat.
-     * Gibt es einen solche Marker, wird geprüft, ob mehr Bytes erwartet werden als der Marker (Positionsangabe) erlaubt.
-     * Sollte das der Fall sein, wird das erste Zeichen verworfen und Marker um ein verschoben (processSearchBufferInvalid).
-     * Das wird solange wiederholt bis entweder der Marker nicht mehr vorhanden (0) ist oder die Anzahl der erwarteten Bytes kleiner ist als die Anzahl der Bytes im Buffer.
-     * Dadurch wird sicher gestellt, dass ein möglicherweise weiteres Frame im SearchBuffer nicht verloren geht.
+     * @brief Handles fewer octets than awaited before the timeout marker, once the interface is empty.
+     * Completes a frame awaiting its acknowledge and keeps a complete RX_IDLE control sequence;
+     * otherwise discards up to the next frame-looking octet and sets _invalid.
      */
     void Receiver::processSearchBufferTimeout()
     {
         if (!_searchBuffer.timeout()) return;
         if (_searchBuffer.timeout() >= _awaitBytes) return;
-        // Bytes still waiting means the marker cannot stand for a quiet bus, whoever set it: let the
-        // interface run empty and have the length and the checksum decide instead of a time estimate.
-        // Without this a host blockage swept a complete telegram and latched _invalid behind it.
+        // Octets still queued: the gap may be a host stall, not bus silence; length and checksum decide instead.
         if (_dll._interface->available()) return;
 
-        // A two-octet chip indication that asked for its companion is not a desynchronised frame, and the
-        // companion may arrive later than the intra-frame timeout. The marker is then older than the
-        // octets it would sweep: outside a frame only U_SYSTEM_STAT_IND raises _awaitBytes, so this cannot
-        // reach the frame resynchronisation. Measured on hardware: 29 ms between 4B and its data octet.
+        // A control sequence (U_SYSTEM_STAT_IND, L_POLL_DATA_IND) complete in RX_IDLE: a gap inside it is no desync.
         if (_state == RX_IDLE && _awaitBytes > 1 && _searchBuffer.position() >= _awaitBytes) return;
 
         if(_state == RX_FRAME_WAIT_ACKN)
@@ -112,19 +100,18 @@ namespace TPUart
     }
 
     /*
-     * Diese Funktion prüft ob im SearchBuffer Daten vorhanden sind aber keine neuen Daten im Empfangspuffer des Interaces.
-     * Wenn das der Fall ist, wird die aktuell Position im SearchBuffer markiert.
+     * @brief Sets the timeout marker at the current position once the interface is empty and nothing arrived for TPUART_RX_TIMEOUT ms.
      */
     void Receiver::processTimeout()
     {
-        // Vorprüfung: Damit nicht unnötig ein lock geholt wird (Sortiert nach Rechenaufwand)
+        // Pre-check without the lock, cheapest test first
         if (_searchBuffer.timeout() == _searchBuffer.position()) return;
         if (_dll._interface->available()) return;
         if (millis() - _lastReceivedTime < TPUART_RX_TIMEOUT) return;
 
         _dll.rxLock(true);
         size_t timeout = 0;
-        // Wiederholung der Vorprüfung
+        // Same check under the lock
         if (_searchBuffer.timeout() != _searchBuffer.position() && !_dll._interface->available() && millis() - _lastReceivedTime >= TPUART_RX_TIMEOUT)
         {
             timeout = _searchBuffer.position();
@@ -138,7 +125,7 @@ namespace TPUart
     }
 
     /*
-     * Liest die Daten aus dem Interface aus, packt es in den SearchBuffer und startet die Verarbeitung.
+     * @brief Reads one octet from the interface into the search buffer and processes it.
      */
     bool Receiver::processReceviedByte()
     {
@@ -154,9 +141,7 @@ namespace TPUart
         if (value != -1)
         {
             const unsigned long now = millis();
-            // Measure the gap that preceded this byte. _lastReceivedTime is a READ time, so this is only a bus
-            // gap while the interface runs empty - with bytes still buffered it is the host's own blockage
-            // (a 4 KB flash erase runs with interrupts off), and marking that discarded a complete telegram.
+            // _lastReceivedTime is a read time: the gap is a bus gap only with the interface empty, else a host stall (no marker).
             const bool gap = _searchBuffer.position() && !_searchBuffer.timeout()
                              && (now - _lastReceivedTime) >= TPUART_RX_TIMEOUT;
             if (gap && !_dll._interface->available())
@@ -185,9 +170,8 @@ namespace TPUart
     }
 
     /*
-     * Wird bei jedem neuen Byte aufgerufen falls ein Frame noch auf ein Acknowledge wartet.
-     * Sollte ein L_DATA_CON oder L_ACKN_IND empfangen werden, wird das Frame als bestätigt markiert.
-     * Anschließend wird das Frame abgeschlossen und in den FrameBuffer geschrieben (auch wenn kein Ack gekommen ist).
+     * @brief Called per new octet while a frame awaits its acknowledge; an L_DATA_CON or L_ACKN_IND sets its acknowledge state.
+     * The frame is then completed and written to the frame buffer, with or without an acknowledge.
      */
     void Receiver::processSearchBufferAcknowledge()
     {
@@ -223,17 +207,8 @@ namespace TPUart
 #ifdef OPENKNX_CON_DIAG
             if (_searchBuffer.frame().isTransmitted()) g_rxTxCompleted++;
 #endif
-            // ESP32 read-time-vs-arrival-time misparse can lose the trailing L_DATA_CON of our OWN
-            // transmitted frame's bus-echo (here: a timeout-forced completion from processSearchBuffer-
-            // Timeout, or an unrecognized acknowledge byte in processSearchBufferAcknowledge), stranding
-            // the Transmitter in TX_AWAIT until the 60s watchdog ("Reset BCU"). The echo was already
-            // matched on control+dest+source (processSearchBufferFrame -> setTransmitted), so the frame
-            // physically went out -> release the Transmitter now. Structural gate (isTransmitted, not a
-            // byte value) -> a foreign 0x0B/0x8B byte cannot fake a confirm. finalize() self-gates on
-            // TX_AWAIT, so this is an idempotent no-op on the normal CON path (already finalized at line 118).
-            // NOTE: no printError here -- this runs in the high-prio UART task (deep in the recursive
-            // parse path); logging from there overflowed the task stack. The rescue is silent; its
-            // effect is the absence of "Reset BCU". (EDIT 3 in process() logs from the main loop.)
+            // Own echo (matched on control, destination, source) completed while the Transmitter still awaits its CON: release it.
+            // No printError: can run in the UART IRQ or the UART task.
             if (_searchBuffer.frame().isTransmitted() && _dll.getTransmitter().awaitResponse())
             {
                 _dll._statistics.incrementBcuConRescues(); // only genuine rescues (awaitResponse still set)
@@ -245,7 +220,7 @@ namespace TPUart
 #endif
             unsigned short size = _searchBuffer.frame().size();
             if (!_dll.isMonitoring() && _dll._modeExtendedCRC) size += 2;
-            if (acknowledge) size++; // Es hängt noch ein ACKN oder DATA_CON dran
+            if (acknowledge) size++; // an ACKN or DATA_CON follows
             const bool ackOnLine = _searchBuffer.frame().isAck(); // read before resetFlags() clears it
             _dll.pushRxFrameBuffer(_searchBuffer.frame());
             _searchBuffer.frame().resetFlags();
@@ -273,7 +248,7 @@ namespace TPUart
             _state = RX_IDLE;
             _byteErrorInFrame = false;
 
-            // Wenn der buffer leer ist, kann auch das invalid flag zurückgesetzt werden
+            // An empty buffer also clears the invalid flag
             //_dll.printError("FV! %u %u %u", _dll._interface->available(), _searchBuffer.position(), _awaitBytes);
             if (!_dll._interface->available())
             {
@@ -296,9 +271,7 @@ namespace TPUart
 
         if (!sufficientlyBytes()) return;
 
-        // No control byte is interpreted while _invalid is latched: any value can sit at position 0,
-        // and a CRC low byte of 0x03 was taken for U_RESET_IND -- which drops the whole transmit queue.
-        // In sync, processControlBytes() handles it; a stuck desync is bounded by the desync watchdog.
+        // While _invalid is set, octet 0 can be any value (a CRC octet 0x03 reads as U_RESET_IND), so control octets are not interpreted.
 
         processSearchBufferAcknowledge();
         if (_searchBuffer.empty()) return;
@@ -317,11 +290,7 @@ namespace TPUart
 
     void Receiver::processSearchBufferInvalid(int x)
     {
-        // Same own-echo CON rescue for the discard-sweep exits (CRC-invalid echo at line ~298,
-        // non-WAIT_ACKN timeout at line ~38, _invalid burst at line ~179): isTransmitted() is still
-        // valid here because resetFlags() runs at the end of this function, so release the Transmitter
-        // before its trailing CON is swept into _discardedBytes. Structural gate -> nothing can be faked.
-        // NOTE: no printError here either -- UART-task context, see processCompleteFrame above.
+        // Releases the Transmitter for an own echo before the sweep; no printError: can run in the UART IRQ or UART task.
         if (_searchBuffer.frame().isTransmitted() && _dll.getTransmitter().awaitResponse())
         {
             _dll._statistics.incrementBcuConRescues(); // only genuine rescues (awaitResponse still set)
@@ -360,7 +329,7 @@ namespace TPUart
 
             if (!sufficientlyBytes()) return;
 
-            // Adresse - SET ACKn
+            // Destination in: match our own echo, then decide the acknowledge
             // _dll.printMessage("    DST ADDRESS %s", frame.humanDestination().c_str());
             if (_dll.getTransmitter().awaitResponse())
             {
@@ -431,7 +400,7 @@ namespace TPUart
 #ifdef OPENKNX_CON_DIAG
                     if (frame.isTransmitted()) g_rxTxWaitAckn++;
 #endif
-                    _awaitBytes = _awaitBytes + 1; // warte auf noch ein byte welches hoffentlich ein ACKN oder DATA_CON ist
+                    _awaitBytes = _awaitBytes + 1; // await one more octet, expected ACKN or DATA_CON
                     _state = RX_FRAME_WAIT_ACKN;
                     return;
                 }
@@ -547,7 +516,7 @@ namespace TPUart
 
             if ((uint8_t)(~chk) != (uint8_t)_searchBuffer.get(6))
             {
-                // Not a poll header -- behave exactly as before for an unexpected byte.
+                // Not a poll header: discarded like any unexpected control octet
                 _lastDiscarded = millis();
                 asm volatile("" ::: "memory");
                 _discardedBytes.push((char)value);
@@ -563,7 +532,7 @@ namespace TPUart
                     return;
                 }
 #ifdef TPUART_BUSMON_INTEGRITY
-                // A real bus event -- without this it never appeared in the capture.
+                // Busmon: forward the poll telegram as a raw carrier.
                 if (_dll.isMonitoring())
                 {
                     Frame &frame = _searchBuffer.frame();
