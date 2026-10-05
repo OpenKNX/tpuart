@@ -32,10 +32,8 @@ namespace TPUart
         std::unordered_map<uint16_t, RepetitionFilterEntry> _entries;
 #else
         static constexpr std::size_t MAX_SIZE = TPUART_REPETITION_FILTER_SIZE;
-        // 03_02_02 2.4.2 p.39 suppresses only a repetition of the directly preceding frame, so an entry ages
-        // out: without a bound, a repetition whose original this device missed was dropped forever whenever
-        // that source's last frame carried the same payload -- the normal state of a cyclic sensor. The
-        // worst-case legitimate repetition burst of a maximum extended frame is about 2.6 s.
+        // 03_02_02 2.4.2 p.39 suppresses only a repetition of the directly preceding frame, so an entry ages out after
+        // TPUART_REPETITION_TTL_MS; the longest repetition burst of a maximum extended frame is about 2.6 s.
         struct CacheEntry
         {
             uint16_t source;
