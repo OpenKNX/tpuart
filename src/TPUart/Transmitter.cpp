@@ -416,6 +416,14 @@ namespace TPUart
 
         if (_dll.txLock())
         {
+#ifdef OPENKNX_DUALCORE
+            // loop1 flushes too: the other context may have written and cleared this park since the read above.
+            if (_pendingAcknowledge != parked)
+            {
+                _dll.txUnlock();
+                return;
+            }
+#endif
             _dll._interface->write(pending);
             if (_pendingAcknowledge == parked) _pendingAcknowledge = 0; // a newer park stays for the next pass
             _dll.txUnlock();
