@@ -42,17 +42,10 @@
 #define TPUART_TX_CON_QUIET_MS 200
 #endif
 
-// How long a parked acknowledge stays writable, past which it would land on the NEXT frame.
-// 03_02_02 at 9600 baud = 104.167us per bit time. awaitDestination() is 6, so the decision falls once
-// octet 5 is in = bus time 13*5+11 = 76; the acknowledge must start at 13N-2+15 = 13N+13 (2.2.7 p.32),
-// leaving 13N-63 bit times. The bound is the shortest standard frame, LG=0 -> N=8 (a T_Connect to a
-// tunnel address, which the chip does not auto-acknowledge): 41 bit times = 4271us, minus the 11-bit
-// host-UART character that carried octet 5 (573us at the 19200 strap) = 3698us. 3000 keeps margin for
-// chip forwarding and loop jitter and covers requestState() (2 bytes, ~1.1ms). It deliberately does NOT
-// cover applyConfiguration() (up to ~10 bytes, ~5.7ms) -- an acknowledge parked during that init/reset
-// path is discarded rather than sent late onto the following frame.
+// Ack age limit in us from the ack decision, assumed right after octet 6; at 2432, 120 us below 2552 are decision-latency
+// reserve. No age check after write() on ESP32 or ArduinoSerial.
 #ifndef TPUART_ACK_WINDOW_US
-#define TPUART_ACK_WINDOW_US 3000
+#define TPUART_ACK_WINDOW_US 2432
 #endif
 
 // ---- Repetition filter ----
@@ -194,6 +187,9 @@ static_assert(TPUART_MAX_RXQUEUE_TIME_PER_LOOP >= 0 && TPUART_MAX_RXQUEUE_TIME_P
 static_assert(TPUART_REPETITION_FILTER_SIZE > 0, "TPUART_REPETITION_FILTER_SIZE must be positive");
 // Leaves at least one slot to low-priority frames (Transmitter kQueueLimitLow).
 static_assert(TP_TX_PRIO_RESERVE >= 0 && TP_TX_PRIO_RESERVE < TPUART_TX_QUEUE_SIZE, "TP_TX_PRIO_RESERVE must leave room for low-priority frames");
+// Outside 64..2552 the parked path cannot hold the window: below 64 every parked ack drops. 2552 = 3698 (KNX ack
+// start per 03_02_02, the NCN DS gives no U_Ackn.req deadline: LG-0 frame, 41 bit times - 1 RX char) - 2 RP2040 TX chars.
+static_assert(TPUART_ACK_WINDOW_US >= 64 && TPUART_ACK_WINDOW_US <= 2552, "TPUART_ACK_WINDOW_US must be in 64..2552");
 // drainInterface() counts the discarded octets in a uint8_t.
 static_assert(NCN_DRAIN_GUARD >= 1 && NCN_DRAIN_GUARD <= 255, "NCN_DRAIN_GUARD exceeds its uint8_t counter");
 // uart_driver_install() refuses smaller rings, and ESP32.cpp does not check its return.

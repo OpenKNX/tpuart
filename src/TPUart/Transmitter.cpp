@@ -368,12 +368,8 @@ namespace TPUart
     }
 
     /**
-     * @brief Sends an acknowledge message.
-     *
-     * This function sends an acknowledge message of the specified type. If the transmitter lock is
-     * taken, the acknowledge is parked and flushAcknowledge() writes it as soon as the lock frees.
-     * It is discarded once TPUART_ACK_WINDOW_US has elapsed -- past that the chip would apply it to
-     * whatever frame it is receiving then, acknowledging a foreign telegram and suppressing its repetition.
+     * @brief Sends an acknowledge: under txLock, else parked.
+     * flushAcknowledge() tests a parked one's age before the write; one overwritten by a newer park first is not written.
      *
      * @param acknowledge The type of acknowledge message to send.
      */
@@ -412,7 +408,7 @@ namespace TPUart
         // 24 bits of 64us ticks cover 1073s, so a long main-loop stall cannot alias a stale park back
         // into the window; the arithmetic stays correct across the micros() wrap.
         const unsigned long age = (((micros() >> 6) & 0x00FFFFFFul) - (parked >> 8)) & 0x00FFFFFFul;
-        if (age > (TPUART_ACK_WINDOW_US >> 6))
+        if (age >= (TPUART_ACK_WINDOW_US >> 6))
         {
             if (_pendingAcknowledge == parked) { _pendingAcknowledge = 0; _droppedAcknowledges += 1; }
             return;
