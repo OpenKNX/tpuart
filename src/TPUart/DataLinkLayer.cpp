@@ -242,6 +242,7 @@ namespace TPUart
         // RP2040 and ESP32 -- calling it inside the hold would hang the device. It also keeps the
         // dropped-frame notification, which calls up into the stack, off the RX path.
         _transmitter.reset();
+        _interface->txClear(); // the U_RESET_REQ below must not wait behind the dropped frame
 
         rxLock(true);
         _uState = 0;
@@ -532,11 +533,11 @@ namespace TPUart
         return _receiver.processReceviedByte();
     }
 
-    void DataLinkLayer::processTransmitByte()
+    bool DataLinkLayer::processTransmitByte()
     {
-        if (_bcuState == BCU_UNINITIALIZED) return;
+        if (_bcuState == BCU_UNINITIALIZED) return false;
 
-        _transmitter.processTransmitByte();
+        return _transmitter.processTransmitByte();
     }
 
     void DataLinkLayer::process()
@@ -588,7 +589,7 @@ namespace TPUart
             // The chip reported a reset since this pass began: its transmit buffer is gone, so the
             // remaining bytes would go out as a partial LPDU. handleReset() discards the frame next pass.
             if (_uReset) break;
-            processTransmitByte();
+            if (!processTransmitByte()) break; // no frame octet written this call: continue next pass
 #ifdef ARDUINO_ARCH_ESP32
             taskYIELD(); // bytes go to the non-blocking HW TX FIFO; the TP wire serializes them anyway (no per-byte vTaskDelay tax)
 #endif
@@ -1270,9 +1271,8 @@ namespace TPUart
         _modeExtendedCRC = false;
         _modeAutoAcknowlage = false;
         _receiver._invalid = false; // reset indication: the stream restarts in sync
-        // The stale in-flight TX is abandoned in handleReset(): _uReset is consumed by process() before the
-        // RX drain and the TX pump, and this runs in RX context (UART IRQ on RP2040) where the transmitter
-        // must not be touched -- it is mutated unlocked by the main loop and txLock(true) would block here.
+        // Can run in RX context: handleReset() resets the transmitter later; txClear() drops queued TX octets now (no-op without an async TX ring).
+        _interface->txClear();
         setBCUState(BCU_CONNECTED);
     }
 

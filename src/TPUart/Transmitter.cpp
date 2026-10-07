@@ -213,19 +213,20 @@ namespace TPUart
      * Here, a U_L_DATA_OFFSET_REQ + position (3 bits) must be prefixed. Thus, 9 bits are available for the position.
      */
 
-    void Transmitter::processTransmitByte()
+    bool Transmitter::processTransmitByte()
     {
         // Before the state check: a parked acknowledge must go out even while TX is idle.
         flushAcknowledge();
 
-        if (_state != TX_TRANSMIT) return;
+        if (_state != TX_TRANSMIT) return false;
         // if (!_awaitResponse) return;
-        if (!_dll.txLock()) return;
+        if (_dll._interface->txFree() < 3) return false; // offset + pair; a queued interface drains in the background
+        if (!_dll.txLock()) return false;
         // Double check
         if (_state != TX_TRANSMIT)
         {
             _dll.txUnlock(); // a second caller (OPENKNX_DUALCORE loop1) must not leak the lock here
-            return;
+            return false;
         }
 
         const unsigned short size = _frame->size();
@@ -259,6 +260,7 @@ namespace TPUart
 
         _transmitPos++;
         _dll.txUnlock();
+        return true;
     }
 
     /**
@@ -368,13 +370,14 @@ namespace TPUart
     }
 
     /**
-     * @brief Sends an acknowledge: under txLock, else parked.
+     * @brief Sends an acknowledge: through writeUrgent() where the interface supports it, else under txLock, else parked.
      * flushAcknowledge() tests a parked one's age before the write; one overwritten by a newer park first is not written.
      *
      * @param acknowledge The type of acknowledge message to send.
      */
     void Transmitter::sendAcknowledge(AcknowledgeType acknowledge)
     {
+        if (_dll._interface->writeUrgent(U_ACK_REQ | acknowledge)) return; // the interface puts it ahead of queued octets
         if (_dll.txLock())
         {
             _dll._interface->write(U_ACK_REQ | acknowledge);
@@ -432,7 +435,7 @@ namespace TPUart
 
     unsigned int Transmitter::droppedAcknowledges()
     {
-        return _droppedAcknowledges;
+        return _droppedAcknowledges + (_dll._interface != nullptr ? _dll._interface->droppedUrgent() : 0); // _interface is null before begin()
     }
 
     Frame *Transmitter::currentFrame()

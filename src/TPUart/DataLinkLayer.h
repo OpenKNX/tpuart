@@ -187,7 +187,7 @@ namespace TPUart
         void registerDroppedFrame(std::function<void(Frame &)> callback);
 
         bool processReceviedByte();
-        void processTransmitByte();
+        bool processTransmitByte();
 
         void setRepetitions(uint8_t nack, uint8_t busy);
         void requestState();

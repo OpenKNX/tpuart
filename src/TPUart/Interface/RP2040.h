@@ -57,6 +57,22 @@ namespace TPUart
 
             std::function<bool(void)> _callback;
 
+            // Transmit ring: filled by the main loop, drained by the UART IRQ on the same core (off under OPENKNX_DUALCORE).
+            static constexpr uint16_t kTxRingMask = TPUART_RP2040_TX_RING_SIZE - 1;
+            static constexpr uint16_t kTxGlued = 0x100; // entry flag: the next entry follows without an acknowledge in between
+            volatile uint16_t _txRing[TPUART_RP2040_TX_RING_SIZE] = {};
+            volatile uint16_t _txHead = 0;  // next free entry: main loop, moved back by txClear()
+            volatile uint16_t _txTail = 0;  // next entry to send: serviceTx() only
+            volatile uint8_t _txUrgent = 0; // acknowledge for the next octet boundary, 0 = none
+            volatile uint32_t _txUrgentAt = 0;          // time_us_32() of _txUrgent
+            volatile unsigned int _txUrgentDropped = 0; // acknowledges dropped by age
+            volatile bool _txGlued = false; // the octet sent last is glued to the next entry
+            bool _txAsync = false;          // DMA RX: FIFOs off, the UART IRQ sends
+
+            bool txPush(const char *data, size_t length);
+            void kickTx();
+            void serviceTx();
+
           public:
             RP2040(pin_size_t rx, pin_size_t tx, uart_inst_t *uart, bool irq = false, bool dma = false);
             ~RP2040();
@@ -67,6 +83,11 @@ namespace TPUart
             bool available() override;
             bool availableForWrite() override;
             bool write(char value) override;
+            bool writeGlued(const char *data, size_t length) override;
+            bool writeUrgent(char value) override;
+            size_t txFree() override;
+            void txClear() override;
+            unsigned int droppedUrgent() override;
             int read() override;
             bool overflow() override;
             bool lastByteErrored() override;

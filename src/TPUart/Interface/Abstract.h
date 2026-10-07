@@ -26,6 +26,14 @@ namespace TPUart
                     if (!write(data[i])) return false;
                 return true;
             }
+            /** @brief Sends an acknowledge ahead of queued octets; false = not supported, the caller writes it itself. */
+            virtual bool writeUrgent(char) { return false; }
+            /** @brief Octets writable without waiting; SIZE_MAX for an interface whose write() waits itself. */
+            virtual size_t txFree() { return SIZE_MAX; }
+            /** @brief Drops queued, unsent octets. */
+            virtual void txClear() {}
+            /** @brief Acknowledges writeUrgent() dropped because their window elapsed. */
+            virtual unsigned int droppedUrgent() { return 0; }
             virtual int read() = 0;
             virtual bool overflow() { return false; };
             /*

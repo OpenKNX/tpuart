@@ -39,7 +39,7 @@ namespace TPUart
         void sendAcknowledge(AcknowledgeType acknowledge = ACK_None);
         void flushAcknowledge();
 
-        void processTransmitByte();
+        bool processTransmitByte();
         Frame *currentFrame();
         bool isTransmitting();
         bool awaitResponse();

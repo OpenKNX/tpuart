@@ -43,7 +43,7 @@
 #endif
 
 // Ack age limit in us from the ack decision, assumed right after octet 6; at 2432, 120 us below 2552 are decision-latency
-// reserve. No age check after write() on ESP32 or ArduinoSerial.
+// reserve. No age check after write() on ESP32, ArduinoSerial, or RP2040 without the TX ring (OPENKNX_DUALCORE or no DMA).
 #ifndef TPUART_ACK_WINDOW_US
 #define TPUART_ACK_WINDOW_US 2432
 #endif
@@ -155,6 +155,11 @@
 #define TPUART_RP2040_DMA_BUFFER_EXP 11
 #endif
 
+// RP2040 transmit ring the UART IRQ drains one octet at a time (DMA RX only, FIFOs off), in octets; a power of two.
+#ifndef TPUART_RP2040_TX_RING_SIZE
+#define TPUART_RP2040_TX_RING_SIZE 256
+#endif
+
 // Octets the ESP32 UART task parses at most per UART event.
 #ifndef TPUART_ESP32_DRAIN_GUARD
 #define TPUART_ESP32_DRAIN_GUARD 2048
@@ -182,12 +187,14 @@ static_assert(TPUART_RX_SEARCH_BUFFER_SIZE >= 264 + 2 + 1, "TPUART_RX_SEARCH_BUF
 // Every entry the parser can push must fit into an empty frame ring (push needs available() > len + 4).
 static_assert(TPUART_RX_FRAME_BUFFER_SIZE >= TPUART_RX_SEARCH_BUFFER_SIZE + 4 + 1, "TPUART_RX_FRAME_BUFFER_SIZE cannot hold one maximum entry");
 static_assert(TPUART_DISCARD_LOG_SIZE > 0, "TPUART_DISCARD_LOG_SIZE must be positive");
+// Index mask and uint16_t indices; one free slot tells full from empty, and the largest glued block is 4 octets.
+static_assert(TPUART_RP2040_TX_RING_SIZE >= 8 && TPUART_RP2040_TX_RING_SIZE <= 32768 && (TPUART_RP2040_TX_RING_SIZE & (TPUART_RP2040_TX_RING_SIZE - 1)) == 0, "TPUART_RP2040_TX_RING_SIZE must be a power of two in 8..32768");
 // processRxFrameBuffer() counts the frames in a char.
 static_assert(TPUART_MAX_RXQUEUE_TIME_PER_LOOP >= 0 && TPUART_MAX_RXQUEUE_TIME_PER_LOOP <= CHAR_MAX, "TPUART_MAX_RXQUEUE_TIME_PER_LOOP exceeds its char counter");
 static_assert(TPUART_REPETITION_FILTER_SIZE > 0, "TPUART_REPETITION_FILTER_SIZE must be positive");
 // Leaves at least one slot to low-priority frames (Transmitter kQueueLimitLow).
 static_assert(TP_TX_PRIO_RESERVE >= 0 && TP_TX_PRIO_RESERVE < TPUART_TX_QUEUE_SIZE, "TP_TX_PRIO_RESERVE must leave room for low-priority frames");
-// Outside 64..2552 the parked path cannot hold the window: below 64 every parked ack drops. 2552 = 3698 (KNX ack
+// Outside 64..2552 the parked or RP2040 path cannot hold the window: below 64 every parked ack drops. 2552 = 3698 (KNX ack
 // start per 03_02_02, the NCN DS gives no U_Ackn.req deadline: LG-0 frame, 41 bit times - 1 RX char) - 2 RP2040 TX chars.
 static_assert(TPUART_ACK_WINDOW_US >= 64 && TPUART_ACK_WINDOW_US <= 2552, "TPUART_ACK_WINDOW_US must be in 64..2552");
 // drainInterface() counts the discarded octets in a uint8_t.
