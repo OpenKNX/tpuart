@@ -42,6 +42,12 @@
 #define TPUART_TX_CON_QUIET_MS 200
 #endif
 
+// busOperational() reports the bus down when the Nth 1 Hz state probe goes out with the N-1 before it unanswered
+// (default 3: about 2-3 s after the last octet from the chip). Counted per probe sent, so a main-loop stall is not silence.
+#ifndef TPUART_BUS_SILENT_PROBES
+#define TPUART_BUS_SILENT_PROBES 3
+#endif
+
 // Ack age limit in us from the ack decision, assumed right after octet 6; at 2432, 120 us below 2552 are decision-latency
 // reserve. No age check after write() on ESP32, ArduinoSerial, or RP2040 without the TX ring (OPENKNX_DUALCORE or no DMA).
 #ifndef TPUART_ACK_WINDOW_US
@@ -187,6 +193,8 @@ static_assert(TPUART_RX_SEARCH_BUFFER_SIZE >= 264 + 2 + 1, "TPUART_RX_SEARCH_BUF
 // Every entry the parser can push must fit into an empty frame ring (push needs available() > len + 4).
 static_assert(TPUART_RX_FRAME_BUFFER_SIZE >= TPUART_RX_SEARCH_BUFFER_SIZE + 4 + 1, "TPUART_RX_FRAME_BUFFER_SIZE cannot hold one maximum entry");
 static_assert(TPUART_DISCARD_LOG_SIZE > 0, "TPUART_DISCARD_LOG_SIZE must be positive");
+// The count is 1 between each probe and its answer; 3 tolerates one lost answer.
+static_assert(TPUART_BUS_SILENT_PROBES >= 3 && TPUART_BUS_SILENT_PROBES < 255, "TPUART_BUS_SILENT_PROBES must be in 3..254");
 // Index mask and uint16_t indices; one free slot tells full from empty, and the largest glued block is 4 octets.
 static_assert(TPUART_RP2040_TX_RING_SIZE >= 8 && TPUART_RP2040_TX_RING_SIZE <= 32768 && (TPUART_RP2040_TX_RING_SIZE & (TPUART_RP2040_TX_RING_SIZE - 1)) == 0, "TPUART_RP2040_TX_RING_SIZE must be a power of two in 8..32768");
 // processRxFrameBuffer() counts the frames in a char.

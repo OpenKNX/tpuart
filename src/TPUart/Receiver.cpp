@@ -148,6 +148,7 @@ namespace TPUart
                 _searchBuffer.timeout(_searchBuffer.position());
 
             _lastReceivedTime = now;
+            _unansweredProbes = 0;
 #ifdef TPUART_BUSMON_INTEGRITY
             if (_dll._interface->lastByteErrored()) _byteErrorInFrame = true;
             // Counted, not acted on: the four causes need separate numbers or a starved host link and a

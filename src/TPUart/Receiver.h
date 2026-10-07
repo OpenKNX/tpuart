@@ -28,6 +28,7 @@ namespace TPUart
 
         volatile size_t _awaitBytes = 1;
         volatile unsigned long _lastReceivedTime = 0;
+        volatile uint8_t _unansweredProbes = 0; // U_STATE_REQ written since the last octet read from the chip
 
         void processSearchBufferFrame();
         void processSearchBufferInvalid(int x);

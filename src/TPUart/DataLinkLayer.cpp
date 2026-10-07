@@ -774,6 +774,9 @@ namespace TPUart
         // printMessage("requestState");
 
         txLock(true);
+        // Counted before the write, so the answer cannot clear the count ahead of its own probe.
+        const uint8_t n = _receiver._unansweredProbes;
+        if (n < 255) _receiver._unansweredProbes = n + 1;
         _interface->write(U_STATE_REQ);
         if (_bcuType == BCU_NCN5120) _interface->write(U_SYSTEM_STATE_REQ);
         txUnlock();
@@ -1194,6 +1197,7 @@ namespace TPUart
             }
 
             _receiver._lastReceivedTime = millis();
+            _receiver._unansweredProbes = 0; // reached only on a chip answer (init handshake, U_RESET_IND)
         }
         else if (state == BCU_DISCONNECTED)
         {
@@ -1240,6 +1244,7 @@ namespace TPUart
     {
         if (_bcuState == BCU_BUSMONITOR) return true; // busmon: chip passive, but the bus itself is fine
         if (_bcuState != BCU_CONNECTED) return false; // uninitialised / disconnected: chip mute (link or bus power gone)
+        if (_receiver._unansweredProbes >= TPUART_BUS_SILENT_PROBES) return false; // chip silent: a bus-powered chip loses supply with the bus
         if (!_systemState.seen()) return true;        // no VBUS telemetry (non-NCN, or before the first reply) -> trust the link
         return _systemState.vbus();                   // NCN: report the real KNX bus-voltage state
     }
