@@ -233,7 +233,7 @@ with `U_RESET_IND`.
    1  (re)initialize if UNINITIALIZED
    2  reconnect branch      active U_RESET_REQ poke while DISCONNECTED
    3  busy-mode auto-off (700 ms)
-   4  keep-alive: U_STATE_REQ every 1000 ms  (skipped while _invalid)
+   4  keep-alive: U_STATE_REQ every 1000 ms  (U_SystemStat.req skipped while _invalid)
    5  handleReset(): applyConfiguration() + requestState() after a U_RESET_IND
    6  RX drain:   while available() processReceviedByte()
    7  Receiver::process()          loop-driven CON-rescue + RX timeout
@@ -303,7 +303,7 @@ Sticky offset  (all platforms; only affects frames > 64 octets)
 Auto-reconnect (all platforms)
    On a mute/desynced NCN the driver actively pokes U_RESET_REQ (backoff 1 s -> 30 s) until it answers;
    the U_RESET_IND reply is parsed UNCONDITIONALLY, even while _invalid (the only path back to CONNECTED
-   on a desynced NCN). Disconnect gate: > 5 s no byte AND > 30 s no valid frame.
+   on a desynced NCN). Disconnect gate: > 30 s no valid frame AND (> 5 s no byte OR the receiver desynced).
 
 Backstop       (all platforms, RP2040-safe)
    TX stranded in TX_AWAIT with the echo never matched and the bus idle: a guarded fast reset fires at

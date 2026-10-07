@@ -616,10 +616,9 @@ namespace TPUart
         const unsigned long lastValid = _lastValidRx;
         asm volatile("" ::: "memory"); // ensures that the last value is not updated again by the parallel task or interrupt after the query of millis()
         const unsigned long current = millis();
-        // Disconnect only when BOTH are stale: no byte at all for 5s (bus dead) AND no valid protocol RX for
-        // 30s (chip not answering the 1Hz state probe). A busy-but-healthy burst keeps the 5s timer fresh, so
-        // it can't cause a spurious mid-burst disconnect + parser flush.
-        if (_bcuState == BCU_CONNECTED && current - last > 5000UL && current - lastValid > 30000UL)
+        // Disconnect after 30 s without valid protocol RX if the chip is silent (no octet for 5 s) or the receiver is desynced:
+        // a desynced receiver discards the probe answers, which refresh last but never lastValid.
+        if (_bcuState == BCU_CONNECTED && current - lastValid > 30000UL && (current - last > 5000UL || _receiver._invalid))
         {
             // printMessage("Time: %li - %li = %li", current, _receiver._lastReceivedTime, current - last);
             setBCUState(BCU_DISCONNECTED);
@@ -629,11 +628,8 @@ namespace TPUart
     }
 
     /*
-     * @brief Bounds how long a desynced receiver is tolerated.
-     *
-     * _invalid only clears on a completed frame, so a chip that silently reset or spews noise stays
-     * latched with TX blocked and the state poll suppressed. A guarded reset re-syncs and re-applies the
-     * configuration. Later than the transmitter's own lost-confirm backstop, with a long cooldown.
+     * @brief Resets the BCU after TPUART_DESYNC_RECOVER_MS of _invalid while CONNECTED, at most once per TPUART_DESYNC_COOLDOWN_MS.
+     * The disconnect in process() also recovers a desynced receiver after 30 s without valid RX, also inside the cooldown.
      */
     void DataLinkLayer::processWatchdog()
     {
@@ -671,7 +667,6 @@ namespace TPUart
 
     void DataLinkLayer::processRequestState()
     {
-        if (_receiver._invalid) return;
         if ((millis() - _requestStateTimer < 1000)) return;
 
         requestState();
@@ -778,7 +773,8 @@ namespace TPUart
         const uint8_t n = _receiver._unansweredProbes;
         if (n < 255) _receiver._unansweredProbes = n + 1;
         _interface->write(U_STATE_REQ);
-        if (_bcuType == BCU_NCN5120) _interface->write(U_SYSTEM_STATE_REQ);
+        // Desynced: the one-octet U_STATE_IND never parses as a frame head, the system state's value octet can.
+        if (_bcuType == BCU_NCN5120 && !_receiver._invalid) _interface->write(U_SYSTEM_STATE_REQ);
         txUnlock();
     }
 
@@ -1197,6 +1193,7 @@ namespace TPUart
             }
 
             _receiver._lastReceivedTime = millis();
+            _lastValidRx = millis(); // the disconnect gate in process() must not count the time before the connect
             _receiver._unansweredProbes = 0; // reached only on a chip answer (init handshake, U_RESET_IND)
         }
         else if (state == BCU_DISCONNECTED)

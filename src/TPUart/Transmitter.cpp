@@ -146,14 +146,7 @@ namespace TPUart
             }
         }
 
-        // Latched-_invalid sub-case: after a bus-error storm the
-        // receiver latches _invalid; on a QUIET bus its clear-condition never triggers, so _invalid stays
-        // set -> the branch above (gated !_invalid) is blocked, the isTransmitted CON-rescue can't fire
-        // and even the 1Hz keep-alive probe is suppressed while _invalid. Only the 60s
-        // watchdog recovers. A latched _invalid that won't drain on a quiet bus IS the proof of a dead
-        // transmit -> force a real reset after a longer window (gives _invalid a chance to clear first).
-        // Separate `if` (not else-if) so it is evaluated even when the branch above ran-but-didn't-reset;
-        // the gates are mutually exclusive (_invalid vs !_invalid) so the two can never double-fire.
+        // Latched _invalid on a quiet bus, which the branch above excludes; the longer window lets _invalid clear first.
         if (millis() - time >= TPUART_TX_BACKSTOP_INVALID_MS &&
             (_lastBackstopReset == 0 || millis() - _lastBackstopReset >= TPUART_TX_BACKSTOP_COOLDOWN_MS))
         {
