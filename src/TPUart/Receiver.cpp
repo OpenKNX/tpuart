@@ -355,6 +355,9 @@ namespace TPUart
             if (!_dll.isMonitoring())
             {
                 AcknowledgeType acknowledge = frame.isTransmitted() ? ACK_None : _dll.checkAcknowledge(frame.destination(), frame.isGroupAddress());
+                // A repetition is acknowledged instead of answered BUSY again; if its original was received, the repetition filter marks it filtered.
+                if (acknowledge == ACK_Busy && frame.isRepeated())
+                    acknowledge = ACK_Addressed;
                 if (acknowledge != ACK_None)
                 {
                     _dll.getTransmitter().sendAcknowledge(acknowledge);
