@@ -46,6 +46,15 @@ namespace TPUart
         return true;
     }
 
+    /** @brief Removes the octet at index; the octets behind it move up by one. */
+    void SearchBuffer::remove(const size_t index)
+    {
+        if (index >= _position) return;
+        if (_position - index > 1) memmove(_buffer + index, _buffer + index + 1, _position - index - 1);
+        _position = _position - 1;
+        if (_timeout > index) _timeout = _timeout - 1;
+    }
+
     const char *SearchBuffer::get()
     {
         return _buffer;

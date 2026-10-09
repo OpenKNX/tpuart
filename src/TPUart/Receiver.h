@@ -50,6 +50,7 @@ namespace TPUart
         // Set when any octet of the frame currently being assembled arrived flagged by the chip; applied
         // to the frame when it is handed up, cleared with it.
         volatile bool _byteErrorInFrame = false;
+        bool _sysStatValuePending = false; // a U_SystemStat.ind arrived in RX_FRAME_WAIT_ACKN, its value octet is next
         bool test = false;
         Receiver(DataLinkLayer &dll);
 

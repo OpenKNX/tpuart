@@ -248,6 +248,7 @@ namespace TPUart
         if (last)
         {
             resetWatchdogTimer();
+            _attemptEnded = false;
             _state = TX_AWAIT;
         }
 

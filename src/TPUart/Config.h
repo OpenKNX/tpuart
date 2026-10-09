@@ -42,6 +42,13 @@
 #define TPUART_TX_CON_QUIET_MS 200
 #endif
 
+// Quiet window, in ms, after which a frame whose attempt a frame start ended is confirmed negatively when no octet arrived since.
+// The next attempt starts 15 + 11 + 150 + 11 = 187 bit times (19.5 ms) after a BUSY, about 87 (9.1 ms) after a NACK, a corrupted ACK or no ACK
+// (NCN5120 DS p.33); the DS gives no maximum, hence the 25 ms floor in the static_assert below.
+#ifndef TPUART_TX_ATTEMPT_QUIET_MS
+#define TPUART_TX_ATTEMPT_QUIET_MS 50
+#endif
+
 // busOperational() reports the bus down when the Nth 1 Hz state probe goes out with the N-1 before it unanswered
 // (default 3: about 2-3 s after the last octet from the chip). Counted per probe sent, so a main-loop stall is not silence.
 #ifndef TPUART_BUS_SILENT_PROBES
@@ -193,6 +200,7 @@ static_assert(TPUART_RX_SEARCH_BUFFER_SIZE >= 264 + 2 + 1, "TPUART_RX_SEARCH_BUF
 // Every entry the parser can push must fit into an empty frame ring (push needs available() > len + 4).
 static_assert(TPUART_RX_FRAME_BUFFER_SIZE >= TPUART_RX_SEARCH_BUFFER_SIZE + 4 + 1, "TPUART_RX_FRAME_BUFFER_SIZE cannot hold one maximum entry");
 static_assert(TPUART_DISCARD_LOG_SIZE > 0, "TPUART_DISCARD_LOG_SIZE must be positive");
+static_assert(TPUART_TX_CON_QUIET_MS >= 25 && TPUART_TX_ATTEMPT_QUIET_MS >= 25, "a quiet window must exceed the gap before the next attempt (about 20 ms)");
 // The count is 1 between each probe and its answer; 3 tolerates one lost answer.
 static_assert(TPUART_BUS_SILENT_PROBES >= 3 && TPUART_BUS_SILENT_PROBES < 255, "TPUART_BUS_SILENT_PROBES must be in 3..254");
 // Index mask and uint16_t indices; one free slot tells full from empty, and the largest glued block is 4 octets.

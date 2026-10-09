@@ -121,7 +121,8 @@ Frame boundaries are found by **length**, not by a delimiter.
         │  CRC ok
         ▼
 ┌──────────────────────┐
-│ RX_FRAME_WAIT_ACKN   │  wait 1 tail byte = CON (0x0B) / L_ACKN
+│ RX_FRAME_WAIT_ACKN   │  wait 1 tail byte = CON (0x0B) / L_ACKN; a U_State.ind (NCN: U_SystemStat.ind) is absorbed
+│                      │  NCN: a frame start after our own echo ends only this attempt
 └───────┬──────────────┘
         │  CON byte in
         ▼
@@ -261,6 +262,8 @@ with `U_RESET_IND`.
   --------------------------------  -------------------------------    -----------
   CON matched normally              finalize()                         immediate
   echo PROVEN, CON lost/misparsed   CON-rescue finalize()              RX-quiet
+  attempt ended by a frame start,   negative confirm, finalize()       50 ms without an octet
+    then CON lost
   echo NEVER matched (bus error)    guarded fast reset, else watchdog  8 s / 12 s / 60 s
   NCN mute / desynced               active U_RESET_REQ poke            1 s .. 30 s
 ```
@@ -323,7 +326,8 @@ Health counters (all platforms)
    `bcu` report; persist across reset() (cleared only on reboot).
 
 CON-rescue     (all platforms)
-   Releases TX when our echo was proven but the CON was lost (3 sites).
+   Releases TX when our echo was proven but the CON was lost (3 sites), or when a frame start ended our attempt and
+   no octet followed for TPUART_TX_ATTEMPT_QUIET_MS (4th site: the frame goes up as a negative confirm).
 
 BCU debug      (opt-in: TPUART_BCU_DEBUG)
    forceDisconnect() console hook ("bcu dis"), CONr trace, watchdog give-up dump.

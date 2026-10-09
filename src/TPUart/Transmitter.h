@@ -20,6 +20,7 @@ namespace TPUart
         volatile unsigned long _time;
         volatile TxState _state; // written by the RX context (UART IRQ or UART task, finalize), read by the main loop -> volatile (matches Receiver::_state)
         Frame *_frame = nullptr;
+        volatile bool _attemptEnded = false; // a frame start followed the echo of the frame in TX_AWAIT; RX context sets, TX_AWAIT entry clears
         uint32_t _lastBackstopReset = 0; // throttles repeated backstop resets (a persistent echo-loss fault falls back to TPUART_TX_WATCHDOG_MS)
 
       public:
@@ -43,6 +44,8 @@ namespace TPUart
         Frame *currentFrame();
         bool isTransmitting();
         bool awaitResponse();
+        void markAttemptEnded() { _attemptEnded = true; }
+        bool attemptEnded() { return _attemptEnded; }
         unsigned int droppedAcknowledges();
         void processQueue();
         void resetWatchdogTimer();

@@ -43,6 +43,26 @@ namespace TPUart
             }
             _dll.rxUnlock();
         }
+        // Attempt ended by a frame start, then no octet for TPUART_TX_ATTEMPT_QUIET_MS: the own frame goes up as an unacknowledged echo, a negative confirm.
+        if (_dll.getTransmitter().attemptEnded()
+            && _state == RX_IDLE
+            && millis() - _lastReceivedTime >= TPUART_TX_ATTEMPT_QUIET_MS
+            && _dll.getTransmitter().awaitResponse())
+        {
+            _dll.rxLock(true);
+            if (_state == RX_IDLE
+                && _dll.getTransmitter().awaitResponse()
+                && !_dll._interface->available()
+                && millis() - _lastReceivedTime >= TPUART_TX_ATTEMPT_QUIET_MS)
+            {
+                Frame *frame = _dll.getTransmitter().currentFrame();
+                frame->setTransmitted();
+                _dll.pushRxFrameBuffer(*frame);
+                _dll._statistics.incrementBcuConRescues();
+                _dll.getTransmitter().finalize();
+            }
+            _dll.rxUnlock();
+        }
         if (_state == RX_FRAME_WAIT_ACKN
             && _dll.isMonitoring()
             && millis() - _lastReceivedTime >= TPUART_RX_TIMEOUT)
@@ -62,7 +82,7 @@ namespace TPUart
 
     /*
      * @brief Handles fewer octets than awaited before the timeout marker, once the interface is empty.
-     * Completes a frame awaiting its acknowledge and keeps a complete RX_IDLE control sequence;
+     * Completes a frame whose acknowledge octet is missing and keeps a complete RX_IDLE control sequence;
      * otherwise discards up to the next frame-looking octet and sets _invalid.
      */
     void Receiver::processSearchBufferTimeout()
@@ -77,6 +97,9 @@ namespace TPUart
 
         if(_state == RX_FRAME_WAIT_ACKN)
         {
+                // The awaited octet is there: processSearchBufferAcknowledge() judges it, so a late CON stays the CON.
+                if (_searchBuffer.position() >= _awaitBytes) return;
+                _sysStatValuePending = false; // its value octet did not come
                 _state = RX_FRAME_COMPLETE;
                 processCompleteFrame();
                 return;
@@ -173,13 +196,23 @@ namespace TPUart
 
     /*
      * @brief Called per new octet while a frame awaits its acknowledge; an L_DATA_CON or L_ACKN_IND sets its acknowledge state.
-     * The frame is then completed and written to the frame buffer, with or without an acknowledge.
+     * A U_State.ind (NCN: U_SystemStat.ind) is absorbed; on the NCN a frame start after our echo ends only this attempt; any other octet completes the frame.
      */
     void Receiver::processSearchBufferAcknowledge()
     {
         if (_state != RX_FRAME_WAIT_ACKN) return;
 
-        const char value = _searchBuffer.get(_awaitBytes - 1);
+        const size_t at = _awaitBytes - 1;
+        const char value = _searchBuffer.get(at);
+
+        if (_sysStatValuePending) // checked first: the value octet can take any form, also that of a CON
+        {
+            _sysStatValuePending = false;
+            _dll._systemState.update(value);
+            _searchBuffer.remove(at);
+            _searchBuffer.timeout(0);
+            return;
+        }
 
         bool acknowledge = false;
         if ((value & L_DATA_CON_MASK) == L_DATA_CON)
@@ -197,6 +230,39 @@ namespace TPUart
             const bool isNack = !(value & L_ACKN_NACK_MASK);
             _searchBuffer.frame().setAcknowledge(isBusy, isNack);
             acknowledge = true;
+        }
+        // Probe answer between echo and CON (DS Table 13: U_State.ind ends 111, 0xFF unknown; U_SystemStat.ind 0x4B + value); timeout(0) clears its gap marker.
+        else if ((value & U_STATE_MASK) == U_STATE_IND && (uint8_t)value != 0xFF)
+        {
+            _dll.receivedState(value);
+            _searchBuffer.remove(at);
+            _searchBuffer.timeout(0);
+            return;
+        }
+        else if (value == U_SYSTEM_STAT_IND && _dll._bcuType == BCU_NCN5120)
+        {
+            _sysStatValuePending = true;
+            _searchBuffer.remove(at);
+            _searchBuffer.timeout(0);
+            return;
+        }
+        // NCN sends no CON between attempts (DS p.33): a frame start after our echo (our repetition or a foreign frame) ends only this attempt.
+        else if (((value & L_DATA_MASK) == L_DATA_STANDARD_IND || (value & L_DATA_MASK) == L_DATA_EXTENDED_IND) &&
+                 _searchBuffer.frame().isTransmitted() && _dll._bcuType == BCU_NCN5120)
+        {
+            if ((uint8_t)value == ((uint8_t)_searchBuffer.get(0) & ~0x20))
+            {
+                const unsigned short frameSize = _searchBuffer.frame().size();
+                _dll._statistics.incrementRxRepetitions();
+                _dll._statistics.incrementRxFrameBits((int)(13u * (unsigned int)frameSize - 2u + 50u)); // attempt without ACK
+            }
+            _dll.getTransmitter().markAttemptEnded();
+            _searchBuffer.frame().resetFlags();
+            _searchBuffer.move(at);
+            _awaitBytes = 1;
+            _state = RX_IDLE;
+            _byteErrorInFrame = false;
+            return;
         }
 
         processCompleteFrame(acknowledge);
@@ -463,6 +529,7 @@ namespace TPUart
         _searchBuffer.clear();
         _state = RX_IDLE;
         _awaitBytes = 1;
+        _sysStatValuePending = false;
         _invalid = false;
     }
 
