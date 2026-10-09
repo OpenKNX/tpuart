@@ -1269,7 +1269,7 @@ namespace TPUart
         _uReset = true;
         // Counted, not timestamped: two indications inside one millisecond would share a stamp, and a
         // counter is wrap-safe for the only question anyone asks of it ("did a new one arrive?").
-        _resetIndCount++;
+        _resetIndCount = _resetIndCount + 1;
         _modeExtendedCRC = false;
         _modeAutoAcknowlage = false;
         _receiver._invalid = false; // reset indication: the stream restarts in sync
