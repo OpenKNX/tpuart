@@ -21,6 +21,9 @@ namespace TPUart
         SearchBuffer _searchBuffer;
         RingBufferN<TPUART_DISCARD_LOG_SIZE> _discardedBytes; // hex-dump source of showDiscardedError(), first octets kept
         volatile unsigned long _lastDiscarded = 0;
+        // Busmon: received-octet index (Statistics::getRxReceivedBytes()) and length of the last errored frame forwarded.
+        unsigned int _errForwardedStart = 0;
+        unsigned int _errForwardedLen = 0;
 
         volatile RxState _state = RX_IDLE;
         // volatile bool _uReset = false;
@@ -39,6 +42,7 @@ namespace TPUart
 
         bool sufficientlyBytes();
         bool pushSearchBuffer(const char value);
+        bool forwardErroredOnce(unsigned short len);
         void processControlBytes();
 
       public:

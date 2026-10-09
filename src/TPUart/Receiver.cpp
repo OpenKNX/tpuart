@@ -87,7 +87,8 @@ namespace TPUart
         // a lost frame piece sets the Lost flag; the FCS is the monitor application's job). Length from
         // the timeout marker, never size() -- that is the promised length, not what actually arrived.
         if (_dll.isMonitoring() && _searchBuffer.timeout() > 0 &&
-            (_state == RX_FRAME || _state == RX_FRAME_DESTINATION || _state == RX_FRAME_SIZE))
+            (_state == RX_FRAME || _state == RX_FRAME_DESTINATION || _state == RX_FRAME_SIZE) &&
+            forwardErroredOnce((unsigned short)_searchBuffer.timeout()))
         {
             Frame &frame = _searchBuffer.frame();
             frame.addFlags(TP_FRAME_FLAG_TRUNCATED);
@@ -417,7 +418,7 @@ namespace TPUart
                 // Raw busmon: forward the FCS-failed frame exactly as captured (incl. FCS) tagged as
                 // errored, then discard it. Monitor-gated -> no change off-monitor. The errored frame is
                 // never delivered up to the link layer (knx processRxFrame returns after the busmon push).
-                if (_dll.isMonitoring())
+                if (_dll.isMonitoring() && forwardErroredOnce(frame.size()))
                 {
                     frame.addFlags(TP_FRAME_FLAG_FCS_ERROR);
                     _dll.pushRxFrameBuffer(frame);
@@ -442,8 +443,23 @@ namespace TPUart
         return true;
     }
 
+    /**
+     * @brief Busmon: false for an errored frame starting inside the errored frame forwarded last, else records it.
+     * Its span is the claimed length, or for a cut frame the octets that arrived (len). Known loss: a real errored
+     * frame behind a frame-like noise octet or behind a corrupted control or length octet.
+     */
+    bool Receiver::forwardErroredOnce(unsigned short len)
+    {
+        const unsigned int start = _dll._statistics.getRxReceivedBytes() - (unsigned int)_searchBuffer.position();
+        if (start - _errForwardedStart < _errForwardedLen) return false; // modulo 2^32, like the octet count
+        _errForwardedStart = start;
+        _errForwardedLen = len;
+        return true;
+    }
+
     void Receiver::reset()
     {
+        _errForwardedLen = 0; // forget the last errored frame; the octet count restarts only in DataLinkLayer::reset()
         _searchBuffer.clear();
         _state = RX_IDLE;
         _awaitBytes = 1;

@@ -220,6 +220,12 @@ States: `BCU_UNINITIALIZED`, `BCU_CONNECTED`, `BCU_DISCONNECTED`, `BCU_BUSMONITO
   CONNECTED -> BUSMONITOR        startMonitoring(): write U_BUSMON_REQ    (one-way)
 ```
 
+**Busmonitor errored frames**: an FCS-failed (or, with `TPUART_BUSMON_INTEGRITY`, cut) frame is forwarded; an
+errored frame that starts inside the errored frame forwarded before it (its claimed length, or for a cut frame the
+octets that arrived) is not (the resync would otherwise forward every frame-like octet of it). A candidate in it whose
+FCS checks is still forwarded. Known loss: a real errored frame behind a frame-like noise octet or behind a
+predecessor whose control or length octet was corrupted.
+
 **`reset()` ("Reset BCU")**: transmitter reset, clear uState / receiver / frame-buffer /
 rep-filter, flush UART, state -> CONNECTED, write `U_RESET_REQ`, re-arm RX liveness. Health
 counters are **not** wiped. `applyConfiguration()` runs afterwards, once the NCN answers
