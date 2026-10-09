@@ -311,8 +311,8 @@ Sticky offset  (all platforms; only affects frames > 64 octets)
 
 Auto-reconnect (all platforms)
    On a mute/desynced NCN the driver actively pokes U_RESET_REQ (backoff 1 s -> 30 s) until it answers;
-   the U_RESET_IND reply is parsed UNCONDITIONALLY, even while _invalid (the only path back to CONNECTED
-   on a desynced NCN). Disconnect gate: > 30 s no valid frame AND (> 5 s no byte OR the receiver desynced).
+   each poke first resets the parser, clearing _invalid, so the U_RESET_IND reply is parsed (the only path
+   back to CONNECTED). Disconnect gate: > 30 s no valid frame AND (> 5 s no byte OR the receiver desynced).
 
 Backstop       (all platforms, RP2040-safe)
    TX stranded in TX_AWAIT with the echo never matched and the bus idle: a guarded fast reset fires at
@@ -346,24 +346,46 @@ RX-liveness re-arm (`_lastReceivedTime` set on every reset(), no spurious discon
   TPUART_NCN_TW_AUTORESET       off       all      NCN thermal-warning auto-heal (L2): when TW persists, issue ONE guarded U_RESET (like `bcu rst`) to clear a latched TW, then back off if it returns (genuinely hot). NOTE: L1 edge-logging of TW is ALWAYS on regardless of this flag -- the old 1/s "TP Error: Temperature-Warning" flood becomes one line on set, an optional heartbeat, one on clear.
 
   tunables (#ifndef, have a default):
-  TPUART_ESP32_TASK_STACK_SIZE  4096      ESP32    RX task stack (raised from 2048) -- EXPERIMENTAL, may still be re-evaluated / re-tuned
+  TPUART_ESP32_TASK_STACK_SIZE  4096      ESP32    RX task stack -- EXPERIMENTAL, may still be re-evaluated / re-tuned
   TPUART_RX_TIMEOUT             5 ms      all      RX inter-byte / quiet-bus window
   TPUART_TX_BACKSTOP_MS         8000 ms   backstop fast-reset trigger delay
-  TPUART_TX_BACKSTOP_COOLDOWN_MS 30000 ms backstop after a fast reset only the 60 s cap fires
+  TPUART_TX_BACKSTOP_COOLDOWN_MS 30000 ms backstop after a fast reset only TPUART_TX_WATCHDOG_MS fires
   TPUART_TX_BACKSTOP_INVALID_MS 12000 ms  backstop latched-_invalid reset window
   (TX_BACKSTOP_MS, TX_BACKSTOP_COOLDOWN_MS, TX_BACKSTOP_INVALID_MS without the prefix stop the build with #error)
   TPUART_TW_HEARTBEAT_MS        60000 ms  TW: min spacing of the "still set" heartbeat while it holds
   TPUART_TW_AUTORESET_AFTER_MS  45000 ms  TW auto-heal: let TW persist this long before the U_RESET
   TPUART_TW_AUTORESET_COOLDOWN_MS 300000  TW auto-heal: min spacing between two auto-resets (cross-episode backoff)
   TPUART_TW_RELAPSE_MS          8000 ms   TW still set this long after the reset => genuinely-hot verdict
+  TPUART_TX_CON_QUIET_MS        200 ms    all      quiet gap after which a lost CON of our own echo is completed from the loop
+  TPUART_TX_ATTEMPT_QUIET_MS    50 ms     all      gap without any octet after which our frame, its attempt ended by a frame start, is confirmed negatively
+  TPUART_BUS_SILENT_PROBES      3         all      busOperational() reports the bus down once this many state probes are sent with no octet since (3..254)
+  TPUART_ACK_WINDOW_US          2432 us   all      age limit of a host acknowledge from its decision; older ones are dropped (parked path, RP2040 TX ring)
+  TPUART_REPETITION_TTL_MS      3000 ms   all      age after which a remembered frame no longer filters its repetition
+  TPUART_REPETITION_FILTER_SIZE 50        all      sources the repetition filter remembers (LRU store, not with TPUART_REPETITION_SIMPLE)
+  TPUART_TX_QUEUE_SIZE          50        all      transmit queue capacity, in frames
+  TP_TX_PRIO_RESERVE            6         all      queue slots low-priority frames leave free for higher priorities (< TPUART_TX_QUEUE_SIZE)
+  TPUART_TX_PUMP_MAX_MS         20 ms     all      the TX pump in process() stops once it has run longer than this
+  TPUART_TX_WATCHDOG_MS         60000 ms  all      a sent frame without confirm this long resets the BCU
+  TPUART_DESYNC_RECOVER_MS      20000 ms  all      receiver desync (_invalid) this long while CONNECTED resets the BCU
+  TPUART_DESYNC_COOLDOWN_MS     60000 ms  all      min spacing between two desync resets
+  TPUART_STATE_ERR_THROTTLE_MS  10000 ms  all      min spacing of repeated "TP Error" lines of the same error set
+  TPUART_RESET_PROBE_MS         50 ms     all      wait for U_Reset.ind per baud-rate probe at init
+  NCN_STOP_MODE_TIMEOUT         50 ms     NCN      chip identification (TPUART_BCU_REGISTER_INFO): wait for U_StopMode.ind
+  NCN_RESET_IND_TIMEOUT         50 ms     NCN      chip identification: wait for the closing U_Reset.ind
+  NCN_REG_READ_TIMEOUT          20 ms     NCN      chip identification: wait per register read
+  NCN_DRAIN_GUARD               64        NCN      chip identification: max octets discarded before each register read (1..255)
+  TPUART_RP2040_TX_RING_SIZE    256       RP2040   TX ring the UART IRQ drains (IRQ + DMA RX, not OPENKNX_DUALCORE); power of two, 8..32768
+  TPUART_ESP32_DRAIN_GUARD      2048      ESP32    max octets the UART task parses per UART event
+  TPUART_ESP32_RX_BUFFER_SIZE   1024      ESP32    IDF UART driver RX ring, in octets (> 128)
+  TPUART_ESP32_TX_BUFFER_SIZE   1024      ESP32    IDF UART driver TX ring, in octets (0 or > 128)
+  TPUART_ESP32_EVENT_QUEUE_SIZE 64        ESP32    IDF UART event queue length
 
   other switches / tunables:
-  TPUART_REPETITION_SIMPLE           off      rep-filter store: 1 entry/source map (default: bounded LRU list+map, MAX_SIZE 50)
-  TPUART_MAX_PROCESS_TIME_PER_LOOP   30       per-loop process budget
+  TPUART_REPETITION_SIMPLE           off      rep-filter store: 1 entry/source map (default: bounded LRU list+map of TPUART_REPETITION_FILTER_SIZE sources)
   TPUART_MAX_RXQUEUE_TIME_PER_LOOP   20       per-loop RX-frame-buffer drain budget
   TPUART_RX_FRAME_BUFFER_SIZE        6000     RX frame output ring (bytes)
   TPUART_DISCARD_LOG_SIZE            256      discarded octets kept for the "Bytes are discarded" hex dump (first ones; "N+" = more were dropped)
-  TPUART_RX_SEARCH_BUFFER_SIZE       300      parser search window (263 + slack)
+  TPUART_RX_SEARCH_BUFFER_SIZE       300      parser search window (largest load 264 + 2 CRC + 1 ACK/CON, rest reserve)
   TPUART_RP2040_DMA_BUFFER_EXP       11       RP2040 DMA RX ring, 2^exp entries (2048) -- EXPERIMENTAL, may still be re-evaluated / re-tuned
 
   debug:
