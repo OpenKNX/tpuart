@@ -2,10 +2,6 @@
 #include "TPUart/Transmitter.h"
 #include "TPUart/DataLinkLayer.h"
 
-#ifdef OPENKNX_CON_DIAG
-uint16_t g_txSent = 0; // frames handed to TX_TRANSMIT (con diag)
-#endif
-
 namespace TPUart
 {
     // Queue limits per priority: low priority (rank 3) leaves TP_TX_PRIO_RESERVE slots to the higher ones.
@@ -100,9 +96,6 @@ namespace TPUart
         }
 
         asm volatile("" ::: "memory");
-#ifdef OPENKNX_CON_DIAG
-        g_txSent++;
-#endif
         _state = TX_TRANSMIT;
     }
 
