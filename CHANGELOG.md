@@ -1,18 +1,30 @@
 # Changes
 
 
-## unreleased
+## ec/1.4.0-beta.1: 2026-10-11
 
 Receive-path work, centred on the idle gap that decides where a telegram ends, plus the repetition
 filter and two signedness defects. The gap fixes are pinned by `HT-1.21` and `HT-1.22` of the host
 stack harness in OAM-IP-Interface, each proven red without its guard, and confirmed on hardware
 (RP2350 and NCN5130 against a NeoPixel device).
 
+A second batch adds an interrupt-driven transmitter on RP2040, keeps a host acknowledge inside the time the
+shortest frame leaves, keeps the confirm wait across probe answers and repetitions, reports a silent chip as a
+bus fault, and collects the build knobs in `src/TPUart/Config.h`. The confirm fix is measured on hardware with bursts
+of 1000 routing indications from IP to TP: before it, 0 to 4 frames per burst neither reached the bus nor were
+reported as lost (12 in 8 bursts); on the final code, none in 2 bursts.
+
 **Receive path**
 * Fix: the idle gap is measured at the byte that follows it. `processTimeout()` runs from the loop, after the drain has already pushed the whole UART buffer through the parser, so a pause between two telegrams inside one drain was invisible and the telegram that arrived after it was appended to a parked torso instead of starting a frame
 * Fix: the gap marker is set only while the interface runs empty. `_lastReceivedTime` is a READ time, so a blocked host looked exactly like a bus that went quiet -- a 4 kB flash erase runs with interrupts off while the octets keep arriving, and a complete telegram was swept. Measured on an RP2350: a 27 ms gap with the telegram complete in the buffer, three destroyed in one download. The sweep latches `_invalid`, which then eats valid control bytes until a whole frame gets through again
 * Fix: a marker is not swept while octets are still waiting. Two detectors set it and only the loop-driven one consulted the interface; a marker that predates buffered octets cannot stand for a quiet bus, whoever set it. The length octet and the check octet decide now instead of a time estimate
-* Fix: a chip indication whose companion octet arrives late survives. `U_SYSTEM_STAT_IND` asks for a second octet, which on hardware followed 29 ms later; the marker was then older than the octets it swept and the chip's status answer was torn apart. Outside a frame only this indication raises `_awaitBytes`, so frame resynchronisation is untouched
+* Fix: a chip indication whose companion octet arrives late survives. `U_SYSTEM_STAT_IND` asks for a second octet, which on hardware followed 29 ms later; the marker was then older than the octets it swept and the chip's status answer was torn apart. Outside a frame only this indication and the poll telegram (`L_POLL_DATA_IND`) raise `_awaitBytes`, so frame resynchronisation is untouched
+* Fix: the wait for the confirmation of our own frame survives a probe answer. The 1 Hz `U_State.ind` (or `U_SystemStat.ind` with its value octet) arriving between the echo and the `L_Data.con` completed the frame without a confirmation, the transmitter was released early, the next frame's `U_L_DataStart.req` reached the NCN while it was still sending, and the NCN answered with a protocol error and dropped that frame. The answer is now evaluated and taken out of the buffer, and the wait goes on
+* Fix: on the NCN a frame start after our echo ends only that attempt. The chip sends no `L_Data.con` between its repetitions (NCN5120 DS p.33), so our own repetition, or a foreign frame in the pause between two attempts, released the transmitter early as well; a repetition is now counted as one and matched as the echo again, a foreign frame is parsed, and the confirmation that follows the last attempt ends the wait
+* Fix: when a frame start ended our attempt and no octet at all follows for `TPUART_TX_ATTEMPT_QUIET_MS` (new, 50 ms), the frame is handed up as an unacknowledged echo, so knx confirms it negatively once and the transmitter is released without a BCU reset, so no queued frame is dropped. Before, the transmitter waited for the 8 s backstop, which reset the BCU and dropped the queue; that path remains when foreign frames keep the bus busier than the window (frames of n octets less than 50 ms + (n - 1) x 13 bit times apart, several senders add up). `TPUART_TX_CON_QUIET_MS` and `TPUART_TX_ATTEMPT_QUIET_MS` must be at least 25 ms. Known limits: a rescue push can delay disconnect detection by up to 30 s once per frame; a frame waiting for its confirmation when busmonitor mode starts can show up as a pushed copy about 50 ms later, and the wait can also survive into busmonitor mode; a frame confirmed negatively can have been acknowledged on the bus when only its confirmation was lost; after a foreign frame between two attempts the repetition count and the bus-load bits miss our attempt; two older paths still release the transmitter without a confirm to knx, an own echo with a CRC error and a confirmation outside the wait; with `OPENKNX_DUALCORE` (off in every product) the second rescue can confirm a frame the second core has just started, because the flag is not re-checked under the receive lock
+* Fix: a confirmation octet that is already in the buffer when the gap marker is handled is judged as a confirmation instead of the frame being swept as unconfirmed. As a side effect, for busmonitor frames and our own echo the awaited octet after a gap longer than `TPUART_RX_TIMEOUT` is judged as well: an acknowledge-like octet now counts as that frame's acknowledge, a `U_State.ind` (NCN: also a `U_SystemStat.ind`) is absorbed and on the NCN a frame start behind our echo ends the attempt
+* Fix: in busmonitor mode an errored frame is forwarded once; the resynchronisation forwarded every frame-like octet inside it as another errored frame
+* Change: the "Bytes are discarded" dump keeps its own 256 octets (`TPUART_DISCARD_LOG_SIZE`) instead of a second 6001-octet ring, 5744 octets less RAM. More than 256 octets discarded between two dumps are cut to the first 256 and the count shows "N+", also across a reset; the old ring printed up to 6000
 
 **Repetition filter**
 * Fix: an entry ages out. 03_02_02 2.4.2 p.39 suppresses the repetition of the directly preceding frame; with no bound, a repetition whose original this device missed was dropped forever whenever that source's last frame carried the same payload -- which is the normal state of a cyclic sensor. `TPUART_REPETITION_TTL_MS` defaults to 3000 ms, above the roughly 2.6 s a legitimate repetition burst of a maximum extended frame takes
@@ -22,6 +34,22 @@ stack harness in OAM-IP-Interface, each proven red without its guard, and confir
 
 **Transmit path**
 * Fix: a transmission is waited out before its confirmation is declared lost. The rescue used `TPUART_RX_TIMEOUT`, which guards an intra-frame gap at 5 ms, while the chip's own retransmission needs 30 bit times of acknowledge window plus 50 idle on NACK or 150 on BUSY before the first retry octet, and hundreds of ms for a full sequence -- so a transmission still in progress was reported as failed. `TPUART_TX_CON_QUIET_MS` defaults to 200 ms; the 8 s transmit backstop stays the outer net
+* Fix: a parked acknowledge is written only below 2432 us after the decision instead of up to 3007 us; the age test counts 64 us ticks, so it is dropped between 2369 and 2432 us. The acknowledge waits behind the octet on the wire and needs its own character, 2 x 572.9 us at 19200 baud, so 3000 us let it reach the chip up to 4153 us after the decision, past the 3698 us the shortest frame leaves (03_02_02 2.2.7). A static_assert keeps `TPUART_ACK_WINDOW_US` in 64..2552
+* Fix: with `OPENKNX_DUALCORE` a parked acknowledge is written once; both cores flush it, and the second one wrote it again after the first had cleared it
+* Feature: on RP2040 and RP2350 with the UART interrupt and DMA receive and without `OPENKNX_DUALCORE`, the UART interrupt sends from a 256-octet ring (`TPUART_RP2040_TX_RING_SIZE`), so the main loop no longer waits per octet. An acknowledge goes out at the next octet boundary ahead of queued octets, or is dropped once older than `TPUART_ACK_WINDOW_US`, and `droppedAcknowledges()` counts it
+* Change: multi-octet requests (the frame octet pairs, set address, set repetition and the ACR0 write) are written as one block, which the RP2040 interrupt transmitter keeps together, so an acknowledge it sends ahead of queued octets waits for the end of the block; on the other interfaces `txLock` already kept acknowledges out of them
+* Change: on every platform a TX pump pass ends when `txLock` is taken, instead of re-polling for up to `TPUART_TX_PUMP_MAX_MS`; the frame continues in the next pass
+* Fix: `ArduinoSerial::write()` returns true for a written octet; it returned the negation, which a block write would have taken as a failure after the first octet
+* Feature: a repetition of a frame this device answered BUSY is acknowledged, so the sender does not run through all its BUSY repetitions and give up. Only the knx router answers BUSY, for a frame bound for IP while a `ROUTING_BUSY` pause runs; a repetition whose original was not received is acknowledged during the pause as well
+
+**Bus state**
+* Fix: `busOperational()` reports the bus down once the third 1 Hz state probe goes out with the two before it unanswered (`TPUART_BUS_SILENT_PROBES`), about 2 to 3 s after the last octet. A bus-powered NCN loses its supply with the bus and sends nothing, and the last VBUS state was kept until the 30 s disconnect
+* Fix: the state probe keeps running while the receiver is desynced, so the silence count rises there as well; `U_SYSTEM_STATE_REQ` stays off then, because its value octet can parse as a frame head. Since the probe answers refresh the octet timer, the disconnect after 30 s without valid receive data now also fires while the receiver is desynced
+
+**Configuration**
+* Change: the build knobs live in `src/TPUart/Config.h`, each overridable with `-D`. The remaining fixed limits are knobs with unchanged defaults: `TPUART_RESET_PROBE_MS`, `TPUART_TX_PUMP_MAX_MS`, `TPUART_TX_WATCHDOG_MS`, `TPUART_REPETITION_FILTER_SIZE`, `TPUART_ESP32_DRAIN_GUARD`, `TPUART_ESP32_RX_BUFFER_SIZE`, `TPUART_ESP32_TX_BUFFER_SIZE`, `TPUART_ESP32_EVENT_QUEUE_SIZE` and `TPUART_RP2040_DMA_BUFFER_EXP`; static_asserts reject values the code cannot hold
+* Change: the backstop knobs are `TPUART_TX_BACKSTOP_MS`, `TPUART_TX_BACKSTOP_COOLDOWN_MS` and `TPUART_TX_BACKSTOP_INVALID_MS`; a build that still sets an old name stops with `#error`
+* Change: the transmit queue limit is the build constant `TPUART_TX_QUEUE_SIZE`; `Transmitter::setQueueSize()`, which nothing called, is removed
 
 **Addressing**
 * Fix: the own individual address is held unsigned. `_ownAddress` and `setOwnAddress()` were `short`, so an address at or above 0x8000 -- areas 8 to 15, and the 15.15.255 default -- was negative, and the test for a positive value excluded exactly those addresses from the chip acknowledge path
@@ -29,6 +57,9 @@ stack harness in OAM-IP-Interface, each proven red without its guard, and confir
 **Housekeeping**
 * Fix: the interface pointer is no longer pretended to be deleted. The condition tested it for null before deleting, so nothing was ever deleted; the interface belongs to the Platform, which hands it out and outlives this layer. The parameter stays for the signature and the member is cleared
 * Change: a dead store at the top of the RX drain is removed, together with `TPUART_MAX_PROCESS_TIME_PER_LOOP`, which nothing referenced -- `TPUART_MAX_RXQUEUE_TIME_PER_LOOP` is the live one. Why the drain stays unbounded is recorded in place: cutting it short trades a loop stall for a UART FIFO overflow
+* Change: the comments are in English, and wrong ones are corrected: the repetition-count bit layout, the frame-size wrap, the largest extended frame (263 octets), the interface owner and the poll telegram as a second multi-octet control sequence; the README lists every knob of Config.h
+* Change: the `U_Reset.ind` count is incremented without `++` on a volatile, which C++20 deprecates
+* Change: the `OPENKNX_CON_DIAG` confirmation counters are removed; the knx tunnel server, their only reader, no longer declares them
 
 
 ## ec/1.3.0-beta.1: 2026-09-03
