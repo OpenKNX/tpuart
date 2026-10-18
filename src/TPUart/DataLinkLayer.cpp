@@ -1215,8 +1215,8 @@ namespace TPUart
         txLock(true);
         _interface->write(U_BUSMON_REQ);
         txUnlock();
-        _modeExtendedCRC = false;
         setBCUState(BCU_BUSMONITOR);
+        _modeExtendedCRC = false; // after the state: a U_Configure.ind racing in from RX is ignored from here on
         return true;
     }
 
@@ -1275,6 +1275,9 @@ namespace TPUart
     {
         _lastValidRx = millis();
         // printMessage("U_CONFIGURE_IND %02X", value);
+        // Busmon carries raw bus octets; a CRC octet of the frame in flight at U_Busmon.req can read as
+        // U_Configure.ind. The chip ignores requests in busmon and the exit reset re-applies the config.
+        if (_bcuState == BCU_BUSMONITOR) return;
         _modeAutoAcknowlage = config & AUTO_ACKNOWLEDGE;
         _modeExtendedCRC = config & CRC_CCITT;
     }
