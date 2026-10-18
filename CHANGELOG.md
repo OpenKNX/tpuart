@@ -1,6 +1,16 @@
 # Changes
 
 
+## ec/1.4.0-beta.2: 2026-10-18
+
+One busmonitor fix on top of the previous beta.
+
+**Busmonitor**
+* Fix: a configuration indication is ignored while the chip monitors the bus. At `U_Busmon.req` the chip still delivers the frame in flight in normal format with its two CRC octets; a CRC octet such as `0x79` was read as `U_Configure.ind` with the CRC bit and switched the receiver to CRC frames, so every following busmonitor frame waited for two octets that never come and was swept until the session ended. Measured on an NCN5130: 220-235 of about 840 octets discarded and the Lost bit on nearly every indication in affected sessions; with the fix, 0 of 24 sessions affected. Pinned by `HT-1.23` of the host stack harness in OAM-IP-Interface, red without the guard
+* Fix: `startMonitoring()` sets the busmonitor state before it clears the CRC flag, so an indication parsed between the two cannot leave the flag set
+* Known limit: the same window can deliver a `0x03`, which reads as `U_Reset.ind`, returns the state to connected and ends the busmonitor session; a real chip reset sends the same octet, so it is not ignored
+
+
 ## ec/1.4.0-beta.1: 2026-10-11
 
 Receive-path work, centred on the idle gap that decides where a telegram ends, plus the repetition
