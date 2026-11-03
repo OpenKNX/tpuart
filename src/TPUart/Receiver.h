@@ -47,6 +47,7 @@ namespace TPUart
 
       public:
         volatile bool _invalid = false;
+        volatile bool _busmonEntry = false; // monitor just started: a 0x03 is no chip reset until a pause with nothing buffered
         // Set when any octet of the frame currently being assembled arrived flagged by the chip; applied
         // to the frame when it is handed up, cleared with it.
         volatile bool _byteErrorInFrame = false;

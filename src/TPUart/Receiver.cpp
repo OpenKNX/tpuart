@@ -70,6 +70,8 @@ namespace TPUart
             {
                 if (!_searchBuffer.timeout()) _searchBuffer.timeout(_searchBuffer.position());
                 processSearchBufferTimeout();
+                // The entry telegram's CRC octets stay behind the forced completion; nothing parses them, and they would hold the flag.
+                if (_busmonEntry && _state == RX_IDLE) _searchBuffer.clear();
             }
             _dll.rxUnlock();
         }
@@ -123,6 +125,9 @@ namespace TPUart
      */
     void Receiver::processTimeout()
     {
+        if (_busmonEntry && _searchBuffer.empty() && !_dll._interface->available() && millis() - _lastReceivedTime >= TPUART_RX_TIMEOUT)
+            _busmonEntry = false; // the telegram that ran during the entry is over
+
         // Pre-check without the lock, cheapest test first
         if (_searchBuffer.timeout() == _searchBuffer.position()) return;
         if (_dll._interface->available()) return;
@@ -535,7 +540,9 @@ namespace TPUart
 
         if (value == U_RESET_IND)
         {
-            _dll.receivedReset();
+            // Entering a monitor, the telegram on the wire still arrives in normal format with its CRC octets.
+            if (!_busmonEntry || !_dll.isMonitoring())
+                _dll.receivedReset();
         }
         else if (value == 0xFF || value == 0xFE || value == 0xFD || value == 0xFC)
         {

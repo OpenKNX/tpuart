@@ -1226,6 +1226,9 @@ namespace TPUart
         if (_bcuState == BCU_BUSMONITOR) return true;
         if (!busOperational()) return false; // nobody notices a chip or bus loss inside a monitor session
 
+        // Set before the request: the octets of a telegram on the wire end up behind it.
+        _receiver._busmonEntry = true;
+        _receiver._lastReceivedTime = millis(); // the first octet of a telegram may not have been read yet
         txLock(true);
         _interface->write(U_BUSMON_REQ);
         txUnlock();
