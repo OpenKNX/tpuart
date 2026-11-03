@@ -42,6 +42,7 @@ namespace TPUart
         volatile char _uState = 0;
         volatile bool _modeAutoAcknowlage = false;
         volatile bool _modeExtendedCRC = false;
+        bool _flushTransmitter = false; // set by startMonitoring(), done by the next process()
 
         unsigned long _busyMode = 0;
         unsigned long _requestStateTimer = 0;

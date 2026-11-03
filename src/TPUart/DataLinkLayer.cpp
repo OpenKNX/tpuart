@@ -543,6 +543,20 @@ namespace TPUart
 
         if (_bcuState == BCU_UNINITIALIZED) return;
 
+        if (_flushTransmitter)
+        {
+            _flushTransmitter = false;
+            // Nothing may stay in flight: its watchdog would reset the chip and so end the monitor session.
+            if (_bcuState == BCU_BUSMONITOR)
+            {
+                // An echo already matched would otherwise bring a second confirmation behind the negative one of the flush.
+                rxLock(true);
+                _receiver._searchBuffer.frame().resetFlags();
+                rxUnlock();
+                _transmitter.reset();
+            }
+        }
+
         if (_bcuState == BCU_DISCONNECTED && millis() - _lastReconnectAttempt >= _reconnectBackoff)
         {
             // Active reconnect under rxLock; its U_RESET_IND sets CONNECTED. _receiver.reset() clears _invalid: while set, the parser discards it.
@@ -1217,6 +1231,7 @@ namespace TPUart
         txUnlock();
         setBCUState(BCU_BUSMONITOR);
         _modeExtendedCRC = false; // after the state: a U_Configure.ind racing in from RX is ignored from here on
+        _flushTransmitter = true; // the next process(): callers sit inside tunnel or console handling
         return true;
     }
 
