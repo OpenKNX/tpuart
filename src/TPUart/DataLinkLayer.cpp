@@ -1209,8 +1209,8 @@ namespace TPUart
 
     bool DataLinkLayer::startMonitoring()
     {
-        if (_bcuState == BCU_UNINITIALIZED) return false;
         if (_bcuState == BCU_BUSMONITOR) return true;
+        if (!busOperational()) return false; // nobody notices a chip or bus loss inside a monitor session
 
         txLock(true);
         _interface->write(U_BUSMON_REQ);
