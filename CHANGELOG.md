@@ -1,6 +1,15 @@
 # Changes
 
 
+## ec/1.4.0-beta.3: 2026-11-03
+
+Three busmonitor entry fixes on top of the previous beta.
+
+**Busmonitor**
+* Fix: `startMonitoring()` refuses without an operational bus. It only checked for an uninitialized chip, so a disconnected chip or a bus without voltage accepted a monitor whose end nobody could notice
+* Fix: the transmitter is emptied in the first `process()` after the entry. A frame in flight kept its watchdog running, which reset the chip and ended the session
+* Fix: a `0x03` is ignored from the entry until the first pause with nothing buffered. It is a CRC octet of the telegram on the wire. This closes the known limit of the previous beta, except that a real chip reset inside this window of at most 5 ms on a quiet bus is not seen; the reset at the end of the session clears it
+
 ## ec/1.4.0-beta.2: 2026-10-18
 
 One busmonitor fix on top of the previous beta.
