@@ -3,12 +3,13 @@
 
 ## ec/1.4.0-beta.3: 2026-11-03
 
-Three busmonitor entry fixes on top of the previous beta.
+Busmonitor entry and exit fixes on top of the previous beta.
 
 **Busmonitor**
 * Fix: `startMonitoring()` refuses without an operational bus. It only checked for an uninitialized chip, so a disconnected chip or a bus without voltage accepted a monitor whose end nobody could notice
 * Fix: the transmitter is emptied in the first `process()` after the entry. A frame in flight kept its watchdog running, which reset the chip and ended the session
-* Fix: a `0x03` is ignored from the entry until the first pause with nothing buffered. It is a CRC octet of the telegram on the wire. This closes the known limit of the previous beta, except that a real chip reset inside this window of at most 5 ms on a quiet bus is not seen; the reset at the end of the session clears it
+* Fix: the rest of the telegram on the wire at the monitor entry is no chip indication and no discard. A `0x03` in it, a CRC octet, ended the session, and its octets set the Lost flag in the first `L_Busmon.ind` of about 20 % of the entries under load. The window ends at a pause with nothing buffered, not before `TPUART_BUSMON_ENTRY_MIN_MS` (50 ms), and at `TPUART_BUSMON_EDGE_MAX_MS` (360 ms) at the latest. This closes the known limit of the previous beta. Known limit: inside the window good telegrams parse, but a telegram with a wrong check octet or a cut telegram is neither forwarded nor counted, and a real chip reset is not seen; the reset at the end of the session clears it
+* Fix: the rest of the telegram on the wire at the monitor exit is dropped until a pause, 360 ms at the latest; a `0x03` in that span reports the chip reset when it ends, a data octet `0x03` included. The rest counted false receive and transmit errors and swallowed the reset indication, and a data octet `0x03` could leave the driver without CRC mode. A further reset before the indication opens the same window. No frame goes out while it is open. Known limit: if the loop catches no pause for 360 ms, the window ends inside a telegram; the driver can then stay without CRC mode and send little until the next reset or about 20 s without traffic
 
 ## ec/1.4.0-beta.2: 2026-10-18
 
