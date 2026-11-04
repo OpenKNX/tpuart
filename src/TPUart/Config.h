@@ -36,6 +36,16 @@
 #define TPUART_RX_TIMEOUT 5
 #endif
 
+// Latest end of a monitor entry or exit window, in ms: the longest telegram (263 octets) takes 356 ms.
+#ifndef TPUART_BUSMON_EDGE_MAX_MS
+#define TPUART_BUSMON_EDGE_MAX_MS 360
+#endif
+
+// Earliest end of a monitor entry window at a pause, in ms: the value octet of a U_SystemStat.ind was measured 29 ms behind its first.
+#ifndef TPUART_BUSMON_ENTRY_MIN_MS
+#define TPUART_BUSMON_ENTRY_MIN_MS 50
+#endif
+
 // Quiet window before a missing L_Data.con of our own echo is declared lost, in ms. It measures the gap since the
 // last received octet; the chip repeats after at least 50 (NACK) or 150 (BUSY) bit times of bus idle (NCN5120 DS p.33).
 #ifndef TPUART_TX_CON_QUIET_MS

@@ -64,6 +64,7 @@ namespace TPUart
         if (_state != TX_IDLE) return;
         if (_dll.isMonitoring()) return;
         if (_dll._receiver._invalid) return;
+        if (_dll._receiver._busmonExit) return; // the chip is resetting: a frame on its way would be cut or confirmed negatively
         if (_txCount == 0) return;
 
         if (_frame != nullptr)

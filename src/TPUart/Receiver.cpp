@@ -106,7 +106,7 @@ namespace TPUart
         // Cut short on the bus: forward what arrived before the sweep discards it (03_06_03 4.1.5.8.1,
         // a lost frame piece sets the Lost flag; the FCS is the monitor application's job). Length from
         // the timeout marker, never size() -- that is the promised length, not what actually arrived.
-        if (_dll.isMonitoring() && _searchBuffer.timeout() > 0 &&
+        if (_dll.isMonitoring() && !_busmonEntry && _searchBuffer.timeout() > 0 &&
             (_state == RX_FRAME || _state == RX_FRAME_DESTINATION || _state == RX_FRAME_SIZE) &&
             forwardErroredOnce((unsigned short)_searchBuffer.timeout()))
         {
@@ -121,12 +121,41 @@ namespace TPUart
     }
 
     /*
+     * @brief Ends the monitor entry or exit window at a pause with nothing buffered, entry not before its minimum, or at the time limit.
+     */
+    void Receiver::processBusmonEdge()
+    {
+        _dll.rxLock(true);
+        const unsigned long now = millis();
+        const unsigned long age = now - _busmonEdgeStart;
+        const bool pause = !_dll._interface->available() && now - _lastReceivedTime >= TPUART_RX_TIMEOUT;
+        // A telegram has no gap this long, so what the entry left buffered is no telegram; only a complete frame waits for its acknowledge.
+        if (pause && _busmonEntry && _state != RX_FRAME_WAIT_ACKN && !_searchBuffer.empty())
+        {
+            _searchBuffer.clear();
+            _state = RX_IDLE;
+            _awaitBytes = 1;
+            _byteErrorInFrame = false;
+        }
+        const bool settled = pause && _searchBuffer.empty() && (_busmonExit || age >= TPUART_BUSMON_ENTRY_MIN_MS);
+        if (settled || age >= TPUART_BUSMON_EDGE_MAX_MS)
+        {
+            const bool resetInd = _busmonExit && _busmonExitReset; // a 0x03 in the window reports the chip reset
+            if (_busmonExit) _byteErrorInFrame = false; // dropped octets belong to no frame
+            _busmonEntry = false;
+            _busmonExit = false;
+            _busmonExitReset = false;
+            if (resetInd) _dll.receivedReset();
+        }
+        _dll.rxUnlock();
+    }
+
+    /*
      * @brief Sets the timeout marker at the current position once the interface is empty and nothing arrived for TPUART_RX_TIMEOUT ms.
      */
     void Receiver::processTimeout()
     {
-        if (_busmonEntry && _searchBuffer.empty() && !_dll._interface->available() && millis() - _lastReceivedTime >= TPUART_RX_TIMEOUT)
-            _busmonEntry = false; // the telegram that ran during the entry is over
+        if (_busmonEntry || _busmonExit) processBusmonEdge();
 
         // Pre-check without the lock, cheapest test first
         if (_searchBuffer.timeout() == _searchBuffer.position()) return;
@@ -208,7 +237,7 @@ namespace TPUart
         if (_sysStatValuePending) // checked first: the value octet can take any form, also that of a CON
         {
             _sysStatValuePending = false;
-            _dll._systemState.update(value);
+            if (!_busmonEntry) _dll._systemState.update(value);
             _searchBuffer.remove(at);
             _searchBuffer.timeout(0);
             return;
@@ -234,7 +263,7 @@ namespace TPUart
         // Probe answer between echo and CON (DS Table 13: U_State.ind ends 111, 0xFF unknown; U_SystemStat.ind 0x4B + value); timeout(0) clears its gap marker.
         else if ((value & U_STATE_MASK) == U_STATE_IND && (uint8_t)value != 0xFF)
         {
-            _dll.receivedState(value);
+            if (!_busmonEntry) _dll.receivedState(value);
             _searchBuffer.remove(at);
             _searchBuffer.timeout(0);
             return;
@@ -332,6 +361,16 @@ namespace TPUart
     void Receiver::processSearchBuffer()
     {
         if (_searchBuffer.empty()) return;
+
+        // The rest of the telegram on the wire reads as indications, and a data octet 0x03 as the reset indication.
+        if (_busmonExit)
+        {
+            if ((uint8_t)_searchBuffer.get(0) == U_RESET_IND) _busmonExitReset = true;
+            _searchBuffer.move(1);
+            processSearchBuffer();
+            return;
+        }
+
         processSearchBufferTimeout();
 
         if (!sufficientlyBytes()) return;
@@ -366,11 +405,14 @@ namespace TPUart
         {
             char value = _searchBuffer.get(0);
             //_dll.printError("IVB1: %02X  - H:%u I:%u P:%u T:%u A:%u", value, x, _invalid, _searchBuffer.position(), _searchBuffer.timeout(), (uint)_awaitBytes);
-            _lastDiscarded = millis();
-            asm volatile("" ::: "memory");
-            _discardedBytes.push(value);
             _searchBuffer.move(1);
-            _dll._statistics.incrementRxDiscardedBytes();
+            if (!(_busmonEntry && _dll.isMonitoring()))
+            {
+                _lastDiscarded = millis();
+                asm volatile("" ::: "memory");
+                _discardedBytes.push(value);
+                _dll._statistics.incrementRxDiscardedBytes();
+            }
 
             if (_searchBuffer.frame().isFrame()) break;
         }
@@ -468,7 +510,7 @@ namespace TPUart
                 // Raw busmon: forward the FCS-failed frame exactly as captured (incl. FCS) tagged as
                 // errored, then discard it. Monitor-gated -> no change off-monitor. The errored frame is
                 // never delivered up to the link layer (knx processRxFrame returns after the busmon push).
-                if (_dll.isMonitoring() && forwardErroredOnce(frame.size()))
+                if (_dll.isMonitoring() && !_busmonEntry && forwardErroredOnce(frame.size()))
                 {
                     frame.addFlags(TP_FRAME_FLAG_FCS_ERROR);
                     _dll.pushRxFrameBuffer(frame);
@@ -538,11 +580,13 @@ namespace TPUart
         uint8_t count = 1;
         // _dll.printMessage("processControlBytes %02X", value);
 
-        if (value == U_RESET_IND)
+        // Entering a monitor, the telegram on the wire still arrives in normal format with its CRC octets.
+        if (_busmonEntry && _dll.isMonitoring())
         {
-            // Entering a monitor, the telegram on the wire still arrives in normal format with its CRC octets.
-            if (!_busmonEntry || !_dll.isMonitoring())
-                _dll.receivedReset();
+        }
+        else if (value == U_RESET_IND)
+        {
+            _dll.receivedReset();
         }
         else if (value == 0xFF || value == 0xFE || value == 0xFD || value == 0xFC)
         {

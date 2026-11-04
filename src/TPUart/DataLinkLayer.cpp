@@ -244,6 +244,13 @@ namespace TPUart
         _uState = 0;
         _uReset = false;
         _receiver.reset();
+        if (_bcuState == BCU_BUSMONITOR || _receiver._busmonExitUnconfirmed)
+        {
+            _receiver._busmonExit = true;
+            _receiver._busmonExitUnconfirmed = true;
+            _receiver._busmonExitReset = false;
+            _receiver._busmonEdgeStart = millis();
+        }
         const unsigned int pendingDiscarded = _statistics.getRxDiscardedBytes() - (unsigned int)_lastDiscardedBytes;
         _statistics.reset();
         _rxFrameBuffer.clear();
@@ -1228,6 +1235,10 @@ namespace TPUart
 
         // Set before the request: the octets of a telegram on the wire end up behind it.
         _receiver._busmonEntry = true;
+        _receiver._busmonExit = false;
+        _receiver._busmonExitUnconfirmed = false;
+        _receiver._busmonExitReset = false;
+        _receiver._busmonEdgeStart = millis();
         _receiver._lastReceivedTime = millis(); // the first octet of a telegram may not have been read yet
         txLock(true);
         _interface->write(U_BUSMON_REQ);
@@ -1278,6 +1289,7 @@ namespace TPUart
         _lastValidRx = millis();
         _reconnectBackoff = 1000; // a real reconnect succeeded -> reset the poke backoff to fast
         _uReset = true;
+        _receiver._busmonExitUnconfirmed = false;
         // Counted, not timestamped: two indications inside one millisecond would share a stamp, and a
         // counter is wrap-safe for the only question anyone asks of it ("did a new one arrive?").
         _resetIndCount = _resetIndCount + 1;

@@ -44,10 +44,15 @@ namespace TPUart
         bool pushSearchBuffer(const char value);
         bool forwardErroredOnce(unsigned short len);
         void processControlBytes();
+        void processBusmonEdge();
 
       public:
         volatile bool _invalid = false;
-        volatile bool _busmonEntry = false; // monitor just started: a 0x03 is no chip reset until a pause with nothing buffered
+        volatile bool _busmonEntry = false; // monitor just started: the octets of the telegram on the wire are no indications and no loss until the window ends
+        volatile bool _busmonExit = false; // monitor reset requested: octets are dropped and TX waits until the window ends
+        volatile bool _busmonExitReset = false; // a 0x03 arrived in that window: its end reports the chip reset
+        volatile bool _busmonExitUnconfirmed = false; // no reset reported since the monitor reset: any further reset opens the window again
+        volatile unsigned long _busmonEdgeStart = 0; // start of the window, for its time limits
         // Set when any octet of the frame currently being assembled arrived flagged by the chip; applied
         // to the frame when it is handed up, cleared with it.
         volatile bool _byteErrorInFrame = false;
