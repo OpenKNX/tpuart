@@ -1,151 +1,119 @@
 #include "TPUart/SystemState.h"
 
-#define SYSTEM_STATE_V20V 0x80
-#define SYSTEM_STATE_VDD2 0x40
-#define SYSTEM_STATE_VBUS 0x20
-#define SYSTEM_STATE_VFILT 0x10
-#define SYSTEM_STATE_XTAL 0x08
-#define SYSTEM_STATE_TW 0x04
-#define SYSTEM_STATE_MODE 0x03
-#define SYSTEM_STATE_MODE_NORMAL 0x33
-#define SYSTEM_STATE_MODE_STOP 0x02
-#define SYSTEM_STATE_MODE_SYNC 0x01
-#define SYSTEM_STATE_MODE_POWERUP 0x00
-
 namespace TPUart
 {
-    /*
-     * update current state
-     */
-    void SystemState::update(char state)
-    {
-        if (_state != state) _dirty = true;
 
-        _state = state;
-    }
+void SystemState::update(uint8_t state)
+{
+    if (!_valid || _state != state) _dirty = true;
 
-    /*
-     * V20V linear voltage regulator is within normal operating range
-     */
-    bool SystemState::v20v()
-    {
-        return _state & SYSTEM_STATE_V20V;
-    }
+    _state = state;
+    _valid = true;
+}
 
-    /*
-     * DC2 regulator is within normal operating range
-     */
-    bool SystemState::vdd2()
-    {
-        return _state & SYSTEM_STATE_VDD2;
-    }
+bool SystemState::isValid() const
+{
+    return _valid;
+}
 
-    /*
-     * KNX bus voltage is within normal operating range
-     */
-    bool SystemState::vbus()
-    {
-        return _state & SYSTEM_STATE_VBUS;
-    }
+uint8_t SystemState::raw() const
+{
+    return _state;
+}
 
-    /*
-     * voltage on tank capacitor is within normal operating range State Service
-     */
-    bool SystemState::vfilt()
-    {
-        return _state & SYSTEM_STATE_VFILT;
-    }
+bool SystemState::dirty()
+{
+    bool dirty = _dirty;
+    _dirty = false;
+    return dirty;
+}
 
-    /*
-     * crystal oscillator frequency is within normal operating range
-     */
-    bool SystemState::xtal()
-    {
-        return _state & SYSTEM_STATE_XTAL;
-    }
+bool SystemState::v20v() const
+{
+    return (_state & SYSTEM_STAT_V20V) != 0;
+}
 
-    /*
-     * crystal oscillator frequency is within normal operating range
-     */
-    bool SystemState::thermalWarning()
-    {
-        return _state & SYSTEM_STATE_TW;
-    }
+bool SystemState::vdd2() const
+{
+    return (_state & SYSTEM_STAT_VDD2) != 0;
+}
 
-    /*
-     * Operation mode
-     *
-     * 0b00000000 PowerUP
-     * 0b00000001 Sync
-     * 0b00000010 Stop
-     * 0b00000011 Normal
-     */
-    char SystemState::mode()
-    {
-        return _state & SYSTEM_STATE_MODE;
-    }
+bool SystemState::vbus() const
+{
+    return (_state & SYSTEM_STAT_VBUS) != 0;
+}
 
-    /*
-     * Deliver the current operation mode as string
-     */
-    const char *SystemState::modeString()
-    {
-        switch (mode())
-        {
-            case 0x03:
-                return "Normal";
-            case 0x02:
-                return "Stop";
-            case 0x01:
-                return "Sync";
-            default:
-                return "Power-UP";
-        }
-    }
+bool SystemState::vfilt() const
+{
+    return (_state & SYSTEM_STAT_VFILT) != 0;
+}
 
-    std::string SystemState::print()
-    {
-        std::string message = "SystemState: ";
-        message += modeString();
-        message += " (";
-        if (v20v()) message += " V20V";
-        if (vdd2()) message += " VDD2";
-        if (vbus()) message += " VBUS";
-        if (vfilt()) message += " VFILT";
-        if (xtal()) message += " XTAL";
-        if (thermalWarning()) message += " TW";
-        message += " )";
-        return message;
-    }
+bool SystemState::xtal() const
+{
+    return (_state & SYSTEM_STAT_XTAL) != 0;
+}
 
-    /*
-     * Operation mode: Normal
-     */
-    bool SystemState::normalMode()
-    {
-        return mode() == SYSTEM_STATE_MODE_NORMAL;
-    }
+bool SystemState::thermalWarning() const
+{
+    return (_state & SYSTEM_STAT_TW) != 0;
+}
 
-    bool SystemState::stopMode()
-    {
-        return mode() == SYSTEM_STATE_MODE_STOP;
-    }
+uint8_t SystemState::mode() const
+{
+    return _state & SYSTEM_STAT_MODE_MASK;
+}
 
-    bool SystemState::syncMode()
-    {
-        return mode() == SYSTEM_STATE_MODE_SYNC;
-    }
+bool SystemState::normalMode() const
+{
+    return mode() == SYSTEM_STAT_MODE_NORMAL;
+}
 
-    bool SystemState::powerupMode()
-    {
-        return mode() == SYSTEM_STATE_MODE_POWERUP;
-    }
+bool SystemState::stopMode() const
+{
+    return mode() == SYSTEM_STAT_MODE_STOP;
+}
 
-    bool SystemState::dirty()
+bool SystemState::syncMode() const
+{
+    return mode() == SYSTEM_STAT_MODE_SYNC;
+}
+
+bool SystemState::powerupMode() const
+{
+    return mode() == SYSTEM_STAT_MODE_POWERUP;
+}
+
+const char *SystemState::modeString() const
+{
+    switch (mode())
     {
-        bool dirty = _dirty;
-        _dirty = false;
-        return dirty;
+        case SYSTEM_STAT_MODE_NORMAL:
+            return "Normal";
+        case SYSTEM_STAT_MODE_STOP:
+            return "Stop";
+        case SYSTEM_STAT_MODE_SYNC:
+            return "Sync";
+        default:
+            return "Power-UP";
     }
+}
+
+std::string SystemState::print() const
+{
+    if (!_valid) return "SystemState: unbekannt (noch keine Antwort der BCU)";
+
+    std::string message = "SystemState: ";
+    message += modeString();
+    message += " (";
+    if (v20v()) message += " V20V";
+    if (vdd2()) message += " VDD2";
+    if (vbus()) message += " VBUS";
+    if (vfilt()) message += " VFILT";
+    if (xtal()) message += " XTAL";
+    if (thermalWarning()) message += " TW";
+    message += " )";
+
+    return message;
+}
 
 } // namespace TPUart
