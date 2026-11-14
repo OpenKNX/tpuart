@@ -11,9 +11,10 @@
 constexpr uint32_t TPUART_RP2040_TRANSFER_COUNT = UINT32_MAX >> 1; // transfer count per channel start, halved because UINT32_MAX did not work; read() restarts the channel once it has run out
 // constexpr unsigned int TPUART_RP2040_TRANSFER_COUNT = 5000;
 // constexpr unsigned int TPUART_RP2040_TRANSFER_COUNT = 256;
-constexpr unsigned long TPUART_RP2040_BUFFER_EXP = TPUART_RP2040_DMA_BUFFER_EXP; // 2**BufferExp entries, default 2048
-// The DMA RX ring must outlast the longest noInterrupts() stall (LittleFS flash erase) without wrapping and hold one
-// maximum extended frame (263 octets incl. FCS); read() discards the octets of a wrapped ring.
+constexpr unsigned long TPUART_RP2040_BUFFER_EXP = TPUART_RP2040_DMA_BUFFER_EXP; // 2**BufferExp entries, default 1024
+// The DMA RX ring must outlast the longest span nobody reads it -- a chain of flash sector writes in one loop pass,
+// the UART IRQ takes at most 2 octets in between -- and hold one maximum extended frame (263 octets incl. FCS);
+// read() discards the octets of a wrapped ring.
 constexpr unsigned long TPUART_RP2040_BUFFER_SIZE = (1u << TPUART_RP2040_BUFFER_EXP); // entries
 
 // 16-bit entries carry the UART status bits DR[11:8] with the octet; DMA_SIZE_8 copies only DR[7:0]

@@ -12,8 +12,9 @@
 
 // Frame ring between the RX parser and process(), in octets; one entry is the frame plus 4 (2 size, 2 flags).
 // Filled by the parser from process(), and from the UART IRQ on RP2040 or the UART task on ESP32.
+// 2048 holds 2.7 s of a bus fully loaded with the shortest telegrams while process() does not run (busmon folds the ACK in).
 #ifndef TPUART_RX_FRAME_BUFFER_SIZE
-#define TPUART_RX_FRAME_BUFFER_SIZE 6000
+#define TPUART_RX_FRAME_BUFFER_SIZE 2048
 #endif
 
 // Discarded octets kept for the hex dump of showDiscardedError(); later ones are only counted (dump shows "N+").
@@ -173,9 +174,9 @@
 
 // ---- Interfaces ----
 
-// RP2040 DMA RX ring: 2^exp entries (see Interface/RP2040.h).
+// RP2040 DMA RX ring: 2^exp entries (see Interface/RP2040.h); 1024 holds about 1.4 s of a fully loaded bus.
 #ifndef TPUART_RP2040_DMA_BUFFER_EXP
-#define TPUART_RP2040_DMA_BUFFER_EXP 11
+#define TPUART_RP2040_DMA_BUFFER_EXP 10
 #endif
 
 // RP2040 transmit ring the UART IRQ drains one octet at a time (DMA RX only, FIFOs off), in octets; a power of two.
@@ -193,7 +194,7 @@
 // ESP-IDF UART driver rings in octets and its event queue length. RX must exceed the 128-octet hardware FIFO;
 // TX is 0 (blocking writes) or also above 128.
 #ifndef TPUART_ESP32_RX_BUFFER_SIZE
-#define TPUART_ESP32_RX_BUFFER_SIZE 1024
+#define TPUART_ESP32_RX_BUFFER_SIZE 512
 #endif
 #ifndef TPUART_ESP32_TX_BUFFER_SIZE
 #define TPUART_ESP32_TX_BUFFER_SIZE 1024

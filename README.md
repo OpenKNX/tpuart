@@ -293,8 +293,8 @@ Perf/stability behaviours built into the driver (opt-in ones are marked):
 ```
 RX drain       (ESP32)
    The RX task drains the whole IDF UART ring per wakeup (guard 2048), then taskYIELD. Driver ring
-   1024 B; rx_full_threshold 1 (a lone L_ACK byte is delivered at once -- a high threshold would hold
-   it until the rx-timeout and break ETS app-download).
+   512 B (TPUART_ESP32_RX_BUFFER_SIZE); rx_full_threshold 1 (a lone L_ACK byte is delivered at once --
+   a high threshold would hold it until the rx-timeout and break ETS app-download).
 
 TX fast        (ESP32 pump)
    Byte pump uses taskYIELD; bytes go to the HW TX FIFO. The next queued frame is armed in the same
@@ -376,17 +376,17 @@ RX-liveness re-arm (`_lastReceivedTime` set on every reset(), no spurious discon
   NCN_DRAIN_GUARD               64        NCN      chip identification: max octets discarded before each register read (1..255)
   TPUART_RP2040_TX_RING_SIZE    256       RP2040   TX ring the UART IRQ drains (IRQ + DMA RX, not OPENKNX_DUALCORE); power of two, 8..32768
   TPUART_ESP32_DRAIN_GUARD      2048      ESP32    max octets the UART task parses per UART event
-  TPUART_ESP32_RX_BUFFER_SIZE   1024      ESP32    IDF UART driver RX ring, in octets (> 128)
+  TPUART_ESP32_RX_BUFFER_SIZE   512       ESP32    IDF UART driver RX ring, in octets (> 128)
   TPUART_ESP32_TX_BUFFER_SIZE   1024      ESP32    IDF UART driver TX ring, in octets (0 or > 128)
   TPUART_ESP32_EVENT_QUEUE_SIZE 64        ESP32    IDF UART event queue length
 
   other switches / tunables:
   TPUART_REPETITION_SIMPLE           off      rep-filter store: 1 entry/source map (default: bounded LRU array of TPUART_REPETITION_FILTER_SIZE sources)
   TPUART_MAX_RXQUEUE_TIME_PER_LOOP   20       per-loop RX-frame-buffer drain budget
-  TPUART_RX_FRAME_BUFFER_SIZE        6000     RX frame output ring (bytes)
+  TPUART_RX_FRAME_BUFFER_SIZE        2048     RX frame output ring (bytes)
   TPUART_DISCARD_LOG_SIZE            256      discarded octets kept for the "Bytes are discarded" hex dump (first ones; "N+" = more were dropped)
   TPUART_RX_SEARCH_BUFFER_SIZE       300      parser search window (largest load 264 + 2 CRC + 1 ACK/CON, rest reserve)
-  TPUART_RP2040_DMA_BUFFER_EXP       11       RP2040 DMA RX ring, 2^exp entries (2048) -- EXPERIMENTAL, may still be re-evaluated / re-tuned
+  TPUART_RP2040_DMA_BUFFER_EXP       10       RP2040 DMA RX ring, 2^exp entries (1024) -- EXPERIMENTAL, may still be re-evaluated / re-tuned
 
   debug:
   TPUART_BCU_DEBUG              off       all      test hooks + diagnostic traces
