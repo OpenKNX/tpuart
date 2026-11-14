@@ -381,7 +381,7 @@ RX-liveness re-arm (`_lastReceivedTime` set on every reset(), no spurious discon
   TPUART_ESP32_EVENT_QUEUE_SIZE 64        ESP32    IDF UART event queue length
 
   other switches / tunables:
-  TPUART_REPETITION_SIMPLE           off      rep-filter store: 1 entry/source map (default: bounded LRU list+map of TPUART_REPETITION_FILTER_SIZE sources)
+  TPUART_REPETITION_SIMPLE           off      rep-filter store: 1 entry/source map (default: bounded LRU array of TPUART_REPETITION_FILTER_SIZE sources)
   TPUART_MAX_RXQUEUE_TIME_PER_LOOP   20       per-loop RX-frame-buffer drain budget
   TPUART_RX_FRAME_BUFFER_SIZE        6000     RX frame output ring (bytes)
   TPUART_DISCARD_LOG_SIZE            256      discarded octets kept for the "Bytes are discarded" hex dump (first ones; "N+" = more were dropped)

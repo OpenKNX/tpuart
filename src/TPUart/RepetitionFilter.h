@@ -2,7 +2,6 @@
 #include "TPUart/Frame.h"
 #include <Arduino.h>
 #include <cstdint>
-#include <list>
 #include <unordered_map>
 
 // #define TPUART_REPETITION_SIMPLE
@@ -24,8 +23,6 @@ namespace TPUart
 
       private:
         unsigned short crc(Frame &frame);
-        unsigned long _avg = 0;
-        unsigned long _avgCnt = 0;
 
 #ifdef TPUART_REPETITION_SIMPLE
         // fast lookup: Source -> Checksum
@@ -40,8 +37,9 @@ namespace TPUart
             uint16_t checksum;
             unsigned long timestamp;
         };
-        std::list<CacheEntry> _entries;
-        std::unordered_map<uint16_t, std::list<CacheEntry>::iterator> _map;
+        // Fixed store without heap, ordered by last access: [0] is the most recent, [_used - 1] the least recent.
+        CacheEntry _entries[MAX_SIZE];
+        std::size_t _used = 0;
 #endif
     };
 } // namespace TPUart

@@ -1,5 +1,6 @@
 #include "RepetitionFilter.h"
 #include <Arduino.h>
+#include <cstring>
 
 namespace TPUart
 {
@@ -27,56 +28,35 @@ namespace TPUart
 
     bool RepetitionFilter::check(Frame &frame)
     {
-        const unsigned short source = frame.source();
-        const unsigned short checksum = crc(frame);
-
-        const unsigned long start = micros();
+        const uint16_t source = frame.source();
+        const uint16_t checksum = crc(frame);
         const unsigned long now = millis();
-        auto it = _map.find(source);
-        if (it != _map.end())
-        {
-            unsigned short ref = it->second->checksum;
-            const bool fresh = (now - it->second->timestamp) <= TPUART_REPETITION_TTL_MS;
-            // Known source: move its entry to the front with the new checksum
-            _entries.erase(it->second);
-            _entries.push_front({source, checksum, now});
-            _map[source] = _entries.begin();
 
-            if (ref == checksum && fresh) return true;
-        }
+        std::size_t i = 0;
+        while (i < _used && _entries[i].source != source) ++i;
+
+        bool repetition = false;
+        if (i < _used)
+            repetition = _entries[i].checksum == checksum && (now - _entries[i].timestamp) <= TPUART_REPETITION_TTL_MS; // known source
+        else if (_used < MAX_SIZE)
+            ++_used; // new source, free slot: entry i (== old _used) is taken by the shift below
         else
-        {
-            // New source
-            if (_entries.size() == MAX_SIZE)
-            {
-                // Full: drop the oldest entry (back)
-                auto lastIt = --(_entries.end());
-                uint16_t oldKey = lastIt->source;
-                _map.erase(oldKey);
-                _entries.pop_back();
-            }
-            _entries.push_front({source, checksum, now});
-            _map[source] = _entries.begin();
-        }
+            i = MAX_SIZE - 1; // new source, store full: the least recent entry is overwritten
 
-        unsigned long duration = micros() - start;
-        _avg += duration;
-        _avgCnt++;
-
-        // Serial.printf("duration %lu\n", duration);
-        // Serial.printf("duration AVG %lu\n", _avg / _avgCnt);
-        return false;
+        // Shift [0, i) one slot back and put the source in front, as the list did with erase + push_front.
+        memmove(&_entries[1], &_entries[0], i * sizeof(CacheEntry));
+        _entries[0] = {source, checksum, now};
+        return repetition;
     }
 
     void RepetitionFilter::clear()
     {
-        _entries.clear();
-        _map.clear();
+        _used = 0;
     }
 
     std::size_t RepetitionFilter::size()
     {
-        return _entries.size();
+        return _used;
     }
 
 } // namespace TPUart
