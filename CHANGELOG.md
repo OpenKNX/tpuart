@@ -3,7 +3,14 @@
 
 ## ec/1.4.0-beta.3: 2026-11-03
 
-Busmonitor entry and exit fixes on top of the previous beta.
+Busmonitor entry and exit fixes on top of the previous beta, and less RAM. Measured free heap: +7.3 to +8.0 KiB on ESP32 (largest block +8.0 KiB), +11.8 to +12.0 KiB on RP2350, flat over 50 min of load; about 40 octets of it per source the old repetition filter had seen.
+
+**Memory**
+* Change: the RX frame ring is 2048 octets instead of 6000 (`TPUART_RX_FRAME_BUFFER_SIZE`). On a bus fully loaded with the shortest telegrams it holds 2.7 s while `process()` does not run, also in busmonitor mode, where a frame-trailing acknowledge is folded into the frame entry. A disturbed bus fills it faster: in busmonitor mode a stray octet that reads as an acknowledge takes an entry of 5 octets, 0.55 s at the full octet rate
+* Change: the RP2040 DMA RX ring has 1024 entries instead of 2048 (`TPUART_RP2040_DMA_BUFFER_EXP` 10), about 1.4 s of a fully loaded bus that nobody reads, for example while flash sectors are erased and written one after the other with interrupts off. At typical flash timing a module save (2 sectors written, 2 erased) leaves about 76 octets in it and the commit of the knx data after a download (up to 8 sectors erased and written) about 304; at datasheet maximum timing that commit overflows it, as it overflowed 2048. The interface object is aligned to the ring and its size rounds up to that alignment, so it shrinks from 6144 to 3072 octets, and with `TPUART_BUSMON_INTEGRITY` (16-bit entries) from 12288 to 6144
+* Change: the ESP32 IDF UART RX ring is 512 octets instead of 1024 (`TPUART_ESP32_RX_BUFFER_SIZE`)
+* Change: the repetition filter keeps its `TPUART_REPETITION_FILTER_SIZE` sources in a fixed array ordered by last access instead of a `std::list` plus `std::unordered_map`. It no longer allocates on the heap, also not the list node it freed and allocated again for every frame of a known source. TTL, eviction of the least recently seen source and the checksum per source are unchanged; pinned by `HU-14.1` to `HU-14.3` of the host stack harness in OAM-IP-Interface, each red against a filter with that one rule broken, and green against the previous list and map
+* Change: the transmit queue is one pool of `TPUART_TX_QUEUE_SIZE` nodes with one FIFO per priority instead of four `std::queue`, whose deques allocated a 512-octet block and a 32-octet map each at construction; the queue structure (FIFO per priority, reuse of every node) is pinned by `HU-14.4`
 
 **Busmonitor**
 * Fix: `startMonitoring()` refuses without an operational bus. It only checked for an uninitialized chip, so a disconnected chip or a bus without voltage accepted a monitor whose end nobody could notice
