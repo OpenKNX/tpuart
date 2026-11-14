@@ -85,7 +85,7 @@
 
 // ---- Transmit path ----
 
-// Frames the transmit queue accepts; a compile-time limit (Transmitter::pushQueue).
+// Frames the transmit queue accepts; a compile-time limit (Transmitter::pushQueue), below 255 (TxQueue 8-bit links).
 #ifndef TPUART_TX_QUEUE_SIZE
 #define TPUART_TX_QUEUE_SIZE 50
 #endif

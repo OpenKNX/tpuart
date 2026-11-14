@@ -362,7 +362,7 @@ RX-liveness re-arm (`_lastReceivedTime` set on every reset(), no spurious discon
   TPUART_ACK_WINDOW_US          2432 us   all      age limit of a host acknowledge from its decision; older ones are dropped (parked path, RP2040 TX ring)
   TPUART_REPETITION_TTL_MS      3000 ms   all      age after which a remembered frame no longer filters its repetition
   TPUART_REPETITION_FILTER_SIZE 50        all      sources the repetition filter remembers (LRU store, not with TPUART_REPETITION_SIMPLE)
-  TPUART_TX_QUEUE_SIZE          50        all      transmit queue capacity, in frames
+  TPUART_TX_QUEUE_SIZE          50        all      transmit queue capacity, in frames (< 255, 8-bit queue links)
   TP_TX_PRIO_RESERVE            6         all      queue slots low-priority frames leave free for higher priorities (< TPUART_TX_QUEUE_SIZE)
   TPUART_TX_PUMP_MAX_MS         20 ms     all      the TX pump in process() stops once it has run longer than this
   TPUART_TX_WATCHDOG_MS         60000 ms  all      a sent frame without confirm this long resets the BCU

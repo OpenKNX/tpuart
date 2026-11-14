@@ -77,14 +77,14 @@ namespace TPUart
 
         // pick the highest-priority non-empty bucket; _txCount>0 should guarantee one exists in [0..3]
         unsigned char r = 0;
-        while (r < 4 && _queue[r].empty()) ++r;
-        if (r == 4) // all buckets empty: stale count, never front() an empty deque
+        while (r < 4 && _queue.empty(r)) ++r;
+        if (r == 4) // all buckets empty: stale count, never front() an empty FIFO
         {
             _txCount = 0;
             return;
         }
-        _frame = _queue[r].front();
-        _queue[r].pop();
+        _frame = _queue.front(r);
+        _queue.pop(r);
         _txCount -= 1;
         _dll._statistics.incrementTxFrames();
 
@@ -267,7 +267,7 @@ namespace TPUart
         const size_t limit = (r == 3) ? kQueueLimitLow : kQueueLimit;
         if (_txCount >= limit) return false;
 
-        _queue[r].push(frame);
+        _queue.push(r, frame);
         _txCount += 1;
         return true;
     }
@@ -343,10 +343,10 @@ namespace TPUart
             frame = nullptr;
             _dll.txLock(true);
             for (unsigned char r = 0; r < 4 && frame == nullptr; ++r)
-                if (!_queue[r].empty())
+                if (!_queue.empty(r))
                 {
-                    frame = _queue[r].front();
-                    _queue[r].pop();
+                    frame = _queue.front(r);
+                    _queue.pop(r);
                     _txCount -= 1;
                 }
             _dll.txUnlock();
