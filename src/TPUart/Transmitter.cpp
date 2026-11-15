@@ -267,7 +267,7 @@ namespace TPUart
         const size_t limit = (r == 3) ? kQueueLimitLow : kQueueLimit;
         if (_txCount >= limit) return false;
 
-        _queue.push(r, frame);
+        if (!_queue.push(r, frame)) return false;
         _txCount += 1;
         return true;
     }

@@ -36,9 +36,11 @@ namespace TPUart
             _next[node] = _free;
             _free = node;
         }
-        void push(uint8_t rank, Frame *frame)
+        /** @brief Appends frame to the FIFO of rank; false (nothing changed) when the pool has no free node. */
+        bool push(uint8_t rank, Frame *frame)
         {
             const uint8_t node = _free;
+            if (node == kNone) return false; // pushQueue's count guarantees a free node; this guards the arrays if the two ever diverge
             _free = _next[node];
             _frame[node] = frame;
             _next[node] = kNone;
@@ -47,6 +49,7 @@ namespace TPUart
             else
                 _next[_tail[rank]] = node;
             _tail[rank] = node;
+            return true;
         }
     };
 
