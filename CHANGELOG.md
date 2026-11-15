@@ -1,7 +1,7 @@
 # Changes
 
 
-## ec/1.4.0-beta.3: 2026-11-03
+## ec/1.4.0-beta.3: 2026-11-15
 
 Busmonitor entry and exit fixes on top of the previous beta, and less RAM. Measured free heap: +7.3 to +8.0 KiB on ESP32 (largest block +8.0 KiB), +11.8 to +12.0 KiB on RP2350, flat over 50 min of load; about 40 octets of it per source the old repetition filter had seen.
 
