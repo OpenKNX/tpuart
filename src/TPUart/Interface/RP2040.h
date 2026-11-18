@@ -43,7 +43,6 @@ namespace TPUart
             int _dmaChannel;
             dma_channel_config _dmaConfig;
 
-            volatile TpuartDmaWord __attribute__((aligned(TPUART_RP2040_RING_BYTES))) _dmaBuffer[TPUART_RP2040_BUFFER_SIZE] = {};
             volatile uint _dmaReaderCount = 0;
             volatile uint _dmaRestartDiff = 0;
             bool _lastByteErrored = false; // FE|PE of the octet last handed out by read()
@@ -99,6 +98,10 @@ namespace TPUart
             void registerCallback(std::function<bool()> callback) override;
             void flush() override;
             void interrupt();
+
+          private:
+            // Last: its alignment then pads only up to the end of the members above, not a whole ring in front of them
+            volatile TpuartDmaWord __attribute__((aligned(TPUART_RP2040_RING_BYTES))) _dmaBuffer[TPUART_RP2040_BUFFER_SIZE] = {};
         };
     } // namespace Interface
 } // namespace TPUart
