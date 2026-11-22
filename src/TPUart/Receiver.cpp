@@ -90,6 +90,10 @@ void Receiver::handleVerifiedPause()
     {
         // Keine Antwort gekommen: ohne Quittungs-Flags melden. Den Sendeweg gibt der Wachhund frei.
         case RxState::FrameAck:
+            // A pending two-byte status without its value must not corrupt the outgoing frame.
+            // Count the missing status byte transparently; L_Data.con still times out normally.
+            if (_frameAckSystemStatusPending)
+                _dll._statistics.incrementRxDroppedBytes();
             completeSequence(0, RxState::Idle);
             return;
 
@@ -131,6 +135,19 @@ void Receiver::processByte(uint8_t value)
 
         // Die Antwort zum fertigen Telegramm - sie geht als Flag mit, nicht als Byte.
         case RxState::FrameAck:
+            // NCN512x: U_SystemStat.ind has exactly one following status byte.
+            // It is NOT an L_Data.con even if that byte happens to equal 0x0B/0x8B.
+            // Forward the two-byte control entry independently, keeping the TP echo intact.
+            if (_frameAckSystemStatusPending)
+            {
+                _frameAckSystemStatusPending = false;
+                const uint8_t status[2] = {U_SYSTEM_STAT_IND, value};
+                _dll._statistics.incrementRxControlBytes();
+                if (!pushEntry(status, sizeof(status), 0))
+                    _dll._statistics.incrementRxDroppedBytes(sizeof(status));
+                return;
+            }
+
             // Busmonitor: die Quittung vom Bus (Figure 35).
             if (_dll.isBusMonitor() && (value & L_ACKN_MASK) == L_ACKN_IND)
             {
@@ -154,6 +171,25 @@ void Receiver::processByte(uint8_t value)
                 completeSequence(flags, RxState::Idle);
 
                 _dll._transmitter.confirmed(); // Sendeweg frei, egal wie die Bestätigung ausfiel
+                return;
+            }
+
+            // A status request may have been queued while this own telegram was transmitted.
+            // Deliver the response as an independent control entry, without completing the
+            // TP echo or releasing the transmitter before the actual L_Data.con arrives.
+            // Only U_State.ind (including its error bits) and NCN512x U_SystemStat.ind
+            // are allowed to interleave. Other unexpected bytes retain the old handling.
+            if ((value & U_STATE_MASK) == U_STATE_IND)
+            {
+                _dll._statistics.incrementRxControlBytes();
+                if (!pushEntry(&value, 1, 0))
+                    _dll._statistics.incrementRxDroppedBytes();
+                return;
+            }
+            if (value == U_SYSTEM_STAT_IND && _dll.bcuType() == BcuType::Ncn5120)
+            {
+                _dll._statistics.incrementRxControlBytes();
+                _frameAckSystemStatusPending = true;
                 return;
             }
 
@@ -273,7 +309,6 @@ void Receiver::processPollByte(uint8_t value)
     _bufferPos++;
 
     _dll._statistics.incrementRxFrameBytes();
-
     if (!isChecksumByte) _crc ^= value;
 
     if (isChecksumByte)
@@ -378,11 +413,11 @@ void Receiver::resetSequence(RxState nextState)
     _frameSize = 0;
     _crc = 0;
     _flags = 0;
+    _frameAckSystemStatusPending = false;
     _state = nextState;
 }
 
-// Bricht eine laufende Sequenz ab. In Idle gibt es nichts abzubrechen - die folgenden Bytes (etwa die
-// Reset-Antwort) sind gültig und dürfen nicht im Resync landen.
+// Bricht eine laufende Sequenz ab (Busmonitor an, Reset) und geht in den Resync.
 void Receiver::forceResync()
 {
     if (_state == RxState::Idle || _state == RxState::Resync) return;

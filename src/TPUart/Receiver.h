@@ -58,6 +58,11 @@ class Receiver
     // Ein U_IntRegRd.req ist raus: das nächste Byte ist der Registerwert, ohne eigene Kennung.
     bool _awaitRegisterValue = false;
 
+    // Nur für die zwei Byte lange U_SystemStat.ind während eines laufenden L_Data.con-Wartens:
+    // das nächste empfangene Byte ist der Systemstatuswert, selbst falls es wie 0x8B aussieht.
+    // Das laufende Telegramm im _buffer bleibt dabei unangetastet.
+    bool _frameAckSystemStatusPending = false;
+
     // Flags der laufenden Sequenz, in der Form des Ringeintrags. ADDRESSED und ACK sind zwei Aussagen:
     // ADDRESSED entscheidet der Callback (auch wenn die Quittung unterdrückt wurde), ACK heißt "Quittung liegt vor".
     uint8_t _flags = 0;
@@ -71,7 +76,6 @@ class Receiver
     uint8_t _queue[TPUART_RX_QUEUE_SIZE];
     volatile uint32_t _queueHead = 0;
     volatile uint32_t _queueTail = 0;
-
 
     void processByte(uint8_t value);
     void processFrameByte(uint8_t value);
