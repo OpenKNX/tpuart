@@ -20,13 +20,12 @@ namespace TPUart
 // Größtes Frame: Extended mit 9 Byte Kopf + 254 Byte APDU (LG 255 ist reserviert).
 constexpr size_t TPUART_BUFFER_SIZE = 263;
 
-// Zustand des Empfangs. Fertige Sequenzen gehen sofort in den Ringpuffer.
+// Zustand des Empfangs. Fertige Sequenzen gehen sofort in den Ringpuffer. Steuersequenzen sind kein Zustand.
 enum class RxState : uint8_t
 {
     Idle,     // nichts angefangen
     Frame,    // Frame läuft ein
     FrameAck, // Frame ist da, es fehlt noch die Antwort (Quittung im Busmonitor bzw. L_Data.con)
-    Control,  // Steuerbyte-Sequenz läuft (einziger Fall: U_SystemStat.ind, 2. Byte fehlt noch)
     Poll,     // Poll-Telegramm läuft ein - Grenze aus dem Slot-Count, siehe L_POLL_DATA_IND
     Resync,   // Position im Bytestrom unbekannt - alles wird verworfen, bis eine verifizierte Pause kommt
 };

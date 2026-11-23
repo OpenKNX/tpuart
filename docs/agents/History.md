@@ -75,6 +75,17 @@ und erst am laufenden Bus auffiel - wer an denselben Stellen arbeitet, läuft in
   automatisch den richtigen Wirkungsbereich, und eine Änderung im RX-Datenpfad, die nur übersetzt, ist
   nicht getestet.
 
+- **Eine Steuersequenz zwischen Echo und `L_Data.con` beendete das Warten.** `FrameAck` nahm an, nach
+  dem Echo komme nur die Bestätigung oder ein Wiederholungsecho, und schloss bei jedem anderen Byte ab.
+  Die Antwort auf die sekündliche Zustandsabfrage landet aber regelmäßig genau dort (gemeldet in
+  OpenKNX/tpuart PR 2, am RP2040 mit NCN5130 gemessen: ~480µs vor dem `L_Data.con`). Das Telegramm
+  ging ohne `DATA_CON` hinaus - für den knx-Stack ein Sendefehler -, und das positive `L_Data.con`
+  dahinter landete als loses Steuerbyte. Derselbe Fehler steckte schon in 1.x
+  (`processSearchBufferAcknowledge()` nahm das erste Byte nach dem Echo unbesehen als Quittung).
+  Behoben, indem nur Bestätigung, Frist, Telegrammanfang und `U_Reset.ind` das Warten beenden und alles
+  andere durch den Steuerdecoder läuft (`Transmitter.md`, "Das Warten in `FrameAck` endet nur auf vier
+  Wegen").
+
 ## Offene Punkte / mögliche nächste Schritte
 
 - Echte Adressfilterung hinter `registerCheckAcknowledge()`. Ohne registrierten Callback wird nichts

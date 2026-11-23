@@ -40,7 +40,8 @@ Teil von `AGENTS.md`.
      nur die ändern, was der Bytestrom bedeutet (Bus-Quittungen erscheinen bzw. verschwinden).
      Andere Steuercodes lassen das Format unberührt, dort wäre ein Resync nur ein unnötig verworfenes
      Telegramm. Und `forceResync()` handelt selbst nur, wenn wirklich eine Sequenz im Gang war
-     (`RxState::Frame`, `Control` oder `FrameAck`). War `RxState` gleich `Idle`, tut es nichts: es
+     (`RxState::Frame`, `FrameAck` oder eine offene Steuersequenz). War `RxState` gleich `Idle` ohne
+     offene Steuersequenz, tut es nichts: es
      ist nichts unterwegs, das zu schützen wäre, und die nächsten Bytes sind schlicht die Antwort auf
      das, was wir gerade gesendet haben (z.B. `U_Reset.ind`). Eine frühere Fassung ging bedingungslos
      in den `Resync` und fraß damit nach jedem Moduswechsel stillschweigend diese Antwort plus das
@@ -147,8 +148,11 @@ Teil von `AGENTS.md`.
   eine Quittungstoleranz von **30 Bitzeiten** dokumentiert ("time-out after 30 bit times", S. 38) -
   ein Gerät, das diesen Spielraum ausschöpft, landete bei ~4,8ms und würde selbst vom 4000er Fenster
   verpasst.
-  Ein Byte in `FrameAck`, das keine Quittung ist, wird nicht erwartet; es wird defensiv behandelt
-  (Telegramm melden, dann Resync, da dieses Byte bereits verbraucht und der Puffer belegt ist).
+  Ein Byte in `FrameAck`, das keine Quittung ist, beendet das Warten im Busmonitor immer, sonst nur,
+  wenn es ein neues Telegramm oder ein `U_Reset.ind` beginnt. Alles andere ist eine Steuersequenz, die
+  der Chip zwischen Echo und `L_Data.con` schiebt, und das Warten geht weiter - Einzelheiten in
+  `Transmitter.md` unter "Das Warten in `FrameAck` endet nur auf vier Wegen". Die Frist beginnt dabei
+  mit jedem Byte neu.
   Ein CRC-ungültiges Telegramm wartet **nicht** auf eine Quittung - der Telegrammrand selbst ist an
   diesem Punkt nicht vertrauenswürdig.
 

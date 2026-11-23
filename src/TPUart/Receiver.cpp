@@ -19,6 +19,12 @@ static_assert(TPUART_RX_QUEUE_SIZE > TPUART_BUFFER_SIZE + TPUART_RX_QUEUE_HEADER
 
 Receiver::Receiver(DataLinkLayer &dll) : _dll(dll) {}
 
+// Erstes Byte eines L_Data-Telegramms, Standard oder Extended. Der Poll hat einen eigenen Weg.
+static bool isFrameStart(uint8_t value)
+{
+    return (value & L_DATA_MASK) == L_DATA_STANDARD_IND || (value & L_DATA_MASK) == L_DATA_EXTENDED_IND;
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Zeitkritische Seite - läuft aus dem Tick
 // ---------------------------------------------------------------------------------------------------
@@ -33,7 +39,8 @@ TPUART_IRAM void Receiver::process()
         return;
     }
 
-    if (_state != RxState::Idle) checkPause();
+    // Auch in Idle, solange das Folgebyte eines U_SystemStat.ind fehlt.
+    if (_state != RxState::Idle || _systemStatPending) checkPause();
 }
 
 void Receiver::receiveByte(size_t pending)
@@ -64,8 +71,8 @@ void Receiver::receiveByte(size_t pending)
 // Eine Pause gilt erst, wenn das Interface TPUART_FRAME_WAIT_US lang ununterbrochen leer war.
 void Receiver::checkPause()
 {
-    // In Idle hat eine Pause keine Wirkung - die Telegrammlänge kommt aus dem Längenbyte.
-    if (_state == RxState::Idle) return;
+    // In Idle wirkt eine Pause nur auf ein halbes U_SystemStat.ind - die Telegrammlänge kommt aus dem Längenbyte.
+    if (_state == RxState::Idle && !_systemStatPending) return;
 
     uint32_t now = micros();
 
@@ -86,6 +93,14 @@ void Receiver::checkPause()
 // Eine verifizierte Pause ist eine Frame-Grenze. Jeder Zweig endet in Idle - darauf verlässt sich checkPause().
 void Receiver::handleVerifiedPause()
 {
+    // Abgeschnittenes U_SystemStat.ind: halb melden, handleControlEntry() gibt es aus. Danach entscheidet der Zustand.
+    if (_systemStatPending)
+    {
+        _systemStatPending = false;
+        const uint8_t half = U_SYSTEM_STAT_IND;
+        if (!pushEntry(&half, 1, TP_FRAME_FLAG_INVALID)) _dll._statistics.incrementRxDroppedBytes();
+    }
+
     switch (_state)
     {
         // Keine Antwort gekommen: ohne Quittungs-Flags melden. Den Sendeweg gibt der Wachhund frei.
@@ -95,7 +110,6 @@ void Receiver::handleVerifiedPause()
 
         // Abgeschnitten: als kaputt melden. Kein Resync nötig, die Pause ist die Grenze.
         case RxState::Frame:
-        case RxState::Control:
             completeSequence(TP_FRAME_FLAG_INVALID, RxState::Idle);
             return;
 
@@ -115,18 +129,21 @@ void Receiver::handleVerifiedPause()
 
 void Receiver::processByte(uint8_t value)
 {
+    // Das Folgebyte eines U_SystemStat.ind ist Nutzlast, auch wenn es wie ein L_Data.con aussieht.
+    if (_systemStatPending)
+    {
+        _systemStatPending = false;
+        _dll._statistics.incrementRxControlBytes();
+        const uint8_t sequence[] = {U_SYSTEM_STAT_IND, value};
+        if (!pushEntry(sequence, sizeof(sequence), 0)) _dll._statistics.incrementRxDroppedBytes(sizeof(sequence));
+        return;
+    }
+
     switch (_state)
     {
         // Position unbekannt - verwerfen bis zur nächsten verifizierten Pause, aber zählen.
         case RxState::Resync:
             _dll._statistics.incrementRxDroppedBytes();
-            return;
-
-        case RxState::Control:
-            _buffer[1] = value;
-            _bufferPos = 2;
-            _dll._statistics.incrementRxControlBytes(); // das zweite Byte eines U_SystemStat.ind
-            completeSequence(0, RxState::Idle);
             return;
 
         // Die Antwort zum fertigen Telegramm - sie geht als Flag mit, nicht als Byte.
@@ -160,9 +177,17 @@ void Receiver::processByte(uint8_t value)
             // Im 8-Bit-UART-Modus geht dem L_Data.con ein U_FrameState.ind voraus (NCN5130 S. 42) - verwerfen.
             if ((value & U_FRAME_STATE_MASK) == U_FRAME_STATE_IND) return;
 
-            // Etwas anderes, meist der Anfang einer Wiederholung: Telegramm melden und das Byte neu verarbeiten.
-            completeSequence(0, RxState::Idle);
-            processByte(value);
+            // Keine Antwort mehr: im Busmonitor schiebt der Chip nichts dazwischen, ein neues Telegramm (meist das
+            // Wiederholungsecho) oder ein Reset beendet das Warten.
+            if (_dll.isBusMonitor() || isFrameStart(value) || value == L_POLL_DATA_IND || value == U_RESET_IND)
+            {
+                completeSequence(0, RxState::Idle);
+                processByte(value);
+                return;
+            }
+
+            // Alles andere schiebt der Chip dazwischen (z.B. U_State.ind) - auswerten und weiter warten.
+            processControlByte(value);
             return;
 
         case RxState::Frame:
@@ -183,9 +208,7 @@ void Receiver::processByte(uint8_t value)
                 return;
             }
 
-            bool isFrameStart = (value & L_DATA_MASK) == L_DATA_STANDARD_IND || (value & L_DATA_MASK) == L_DATA_EXTENDED_IND;
-
-            if (!isFrameStart)
+            if (!isFrameStart(value))
             {
                 processControlByte(value);
                 return;
@@ -336,13 +359,10 @@ void Receiver::sendAcknowledge()
     if (_dll.isBusyMode()) _dll.reportBusyModeCancelled();
 }
 
-// Steuerbytes sind 1 Byte lang - außer U_SystemStat.ind mit einem Folgebyte.
+// Steuerbyte aus Idle oder FrameAck. Es geht direkt in den Ring, _buffer hält in FrameAck noch das Echo.
 void Receiver::processControlByte(uint8_t value)
 {
-    _buffer[0] = value;
-    _bufferPos = 1;
-
-    // Anfang eines Poll-Telegramms, kein Steuerbyte.
+    // Anfang eines Poll-Telegramms, kein Steuerbyte. Kommt nur aus Idle - FrameAck beendet das Warten vorher.
     if (value == L_POLL_DATA_IND)
     {
         resetSequence(RxState::Poll);
@@ -353,10 +373,10 @@ void Receiver::processControlByte(uint8_t value)
     // Nach dem Poll-Zweig: der zählt sein Byte als Telegrammbyte.
     _dll._statistics.incrementRxControlBytes();
 
-    // Nur der NCN512x kennt U_SystemStat.ind; beim TPUART2 ist 0x4B etwas anderes.
+    // Nur der NCN512x kennt U_SystemStat.ind; beim TPUART2 ist 0x4B kein Dienst (Siemens TP-UART 2+ Fig. 25).
     if (value == U_SYSTEM_STAT_IND && _dll.bcuType() == BcuType::Ncn5120)
     {
-        _state = RxState::Control; // 2. Byte folgt noch
+        _systemStatPending = true; // 2. Byte folgt noch
         return;
     }
 
@@ -366,7 +386,7 @@ void Receiver::processControlByte(uint8_t value)
     // Hier im Tick freigeben: _txState hat nur einen Schreiber.
     if ((value & L_DATA_CON_MASK) == L_DATA_CON) _dll._transmitter.confirmed();
 
-    completeSequence(0, RxState::Idle);
+    if (!pushEntry(&value, 1, 0)) _dll._statistics.incrementRxDroppedBytes();
 }
 
 // Einzige Stelle, an der die Sequenzfelder zurückgesetzt werden.
@@ -378,23 +398,24 @@ void Receiver::resetSequence(RxState nextState)
     _frameSize = 0;
     _crc = 0;
     _flags = 0;
+    _systemStatPending = false;
     _state = nextState;
 }
 
-// Bricht eine laufende Sequenz ab. In Idle gibt es nichts abzubrechen - die folgenden Bytes (etwa die
-// Reset-Antwort) sind gültig und dürfen nicht im Resync landen.
+// Bricht eine laufende Sequenz ab. In Idle gibt es nichts abzubrechen, außer einem halben U_SystemStat.ind - die
+// folgenden Bytes (etwa die Reset-Antwort) sind gültig und dürfen nicht im Resync landen.
 void Receiver::forceResync()
 {
-    if (_state == RxState::Idle || _state == RxState::Resync) return;
+    if ((_state == RxState::Idle && !_systemStatPending) || _state == RxState::Resync) return;
 
-    _dll._statistics.incrementRxDroppedBytes((uint32_t)_bufferPos);
+    _dll._statistics.incrementRxDroppedBytes((uint32_t)(_bufferPos + _systemStatPending));
 
     resetSequence(RxState::Resync);
 }
 
 void Receiver::discardSequence()
 {
-    _dll._statistics.incrementRxDroppedBytes((uint32_t)_bufferPos);
+    _dll._statistics.incrementRxDroppedBytes((uint32_t)(_bufferPos + _systemStatPending));
 
     resetSequence(RxState::Idle);
 }

@@ -45,11 +45,15 @@ Teil von `AGENTS.md`.
   (`U_Reset.ind`, `U_State.ind`, `U_FrameState.ind`, `U_Configure.ind`, `U_FrameEnd.ind`,
   `U_StopMode.ind`, `L_Ackn.ind`, `L_Data.con`) **außer `U_SystemStat.ind`, das 2 Byte hat**. Es gibt
   also keine Typisierung `Reset`/`State`/`Configuration`/... - die Schicht behandelt die eine
-  2-Byte-Ausnahme intern (über den Zwischenzustand `RxState::Control`) und überlässt die Deutung dem
-  Aufrufer. `U_SystemStat.ind` ist zusätzlich an `BcuType::Ncn5120` gebunden, wie in der alten
-  Library - auf einem TPUART2 bedeutet `0x4B` etwas anderes und würde sonst das folgende Byte
-  verschlucken. Erreichbar ist der Zweig nur über `requestState()`, da der Chip es ausschließlich als
-  Antwort auf `U_SystemState.req` sendet.
+  2-Byte-Ausnahme intern und überlässt die Deutung dem Aufrufer. Fehlt das Folgebyte noch, merkt sich
+  der Empfänger das in `_systemStatPending` - ein Flag statt eines Zustands, weil das auch zwischen Echo
+  und `L_Data.con` passieren kann, wo `_buffer` noch das Echo hält. `U_SystemStat.ind` ist
+  an `BcuType::Ncn5120` gebunden, wie in der alten Library - auf einem TPUART2 ist `0x4B` kein
+  Dienst (Siemens TP-UART 2+ Fig. 25; als freier Wert käme es nur als ProductID.response, die diese
+  Library nie anfordert) und würde sonst das folgende Byte verschlucken. Erreichbar ist der Zweig nur
+  über `requestState()`, da der Chip es ausschließlich als Antwort auf `U_SystemState.req` sendet.
+  Bleibt das Folgebyte aus, beendet die Pause die Sequenz auch in `Idle` - `checkPause()` läuft dafür,
+  solange das Flag gesetzt ist -, und die halbe Sequenz geht als `INVALID` in den Ring.
   **`L_Poll_Data.ind` (`0xF0`) ist hier die Falle, und es hat einen eigenen Zustand.** Es gehört zur
   Gruppe *transparent DLL*, nicht zu den Steuerdiensten. Auf dem **Bus** ist ein Poll mehrbytig (Bild
   56, Siemens Bild 23: Steuerbyte, Quelle ×2, Polladresse ×2, Slotzahl, Prüfsumme, dann ein Byte je

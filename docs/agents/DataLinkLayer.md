@@ -163,8 +163,10 @@ der Header; bei 2-3µs je Tick gegen ein 500µs-Intervall ist das nicht messbar.
   die noch aussteht: einer, der nur aus dem Telegramm-Sendepfad geleert wird, lässt eine Quittung
   beliebig lange liegen und setzt sie dann weit außerhalb ihres ~1,7ms-Fensters ab. Eine Quittung ist
   entweder rechtzeitig oder sie gehört unterdrückt.
-- **`RxState` beschreibt nur, was gerade *eintrifft***: `Idle` / `Frame` / `FrameAck` / `Control` /
-  `Resync`. Es gibt bewusst **keine "fertig"-Zustände** - sobald etwas fertig ist, geht es in den
+- **`RxState` beschreibt nur, was gerade *eintrifft***: `Idle` / `Frame` / `FrameAck` / `Poll` /
+  `Resync`. Ein halbes `U_SystemStat.ind` ist bewusst kein Zustand, sondern ein Flag
+  (`_systemStatPending`): es kann in `Idle` und in `FrameAck` offen sein (früher `RxState::Control`,
+  das in `FrameAck` das Echo zerstört hätte). Es gibt bewusst **keine "fertig"-Zustände** - sobald etwas fertig ist, geht es in den
   Ringpuffer und der Zustand rückt sofort weiter. Frühere Entwürfe hatten
   `FrameComplete`/`ControlComplete`/`Invalid` als Übergangszustände, die innerhalb eines `tick()`
   gelesen werden mussten; der Ringpuffer macht das alles überflüssig, und `releaseBuffer()`,

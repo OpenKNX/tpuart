@@ -58,6 +58,9 @@ class Receiver
     // Ein U_IntRegRd.req ist raus: das nächste Byte ist der Registerwert, ohne eigene Kennung.
     bool _awaitRegisterValue = false;
 
+    // Ein U_SystemStat.ind ist da, sein Folgebyte fehlt noch - in Idle wie in FrameAck, daher kein RxState.
+    bool _systemStatPending = false;
+
     // Flags der laufenden Sequenz, in der Form des Ringeintrags. ADDRESSED und ACK sind zwei Aussagen:
     // ADDRESSED entscheidet der Callback (auch wenn die Quittung unterdrückt wurde), ACK heißt "Quittung liegt vor".
     uint8_t _flags = 0;

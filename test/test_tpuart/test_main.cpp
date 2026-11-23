@@ -940,6 +940,21 @@ static void test_system_state_is_a_two_byte_sequence()
     TEST_ASSERT_EQUAL(0, fx->_errors.size());
 }
 
+// Bleibt das Folgebyte aus, beendet die Pause die Sequenz auch in Idle.
+static void test_truncated_system_state_does_not_swallow_next_frame()
+{
+    fx->connect(BcuType::Ncn5120);
+
+    uint8_t half = U_SYSTEM_STAT_IND;
+    fx->feed(&half, 1, 1354, 5000); // Pause deutlich über TPUART_FRAME_WAIT_US
+    fx->append(standardFrame(0x2202, 0x0901));
+    fx->pump(25);
+
+    TEST_ASSERT_FALSE(fx->_dll.getSystemState().isValid());
+    TEST_ASSERT_EQUAL(1, fx->_frames.size());
+    TEST_ASSERT_TRUE(fx->_frames[0]._valid);
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Poll-Telegramme
 // ---------------------------------------------------------------------------------------------------
@@ -1202,6 +1217,23 @@ static void test_monitor_frame_with_nack()
 static void test_monitor_frame_with_busy()
 {
     expectMonitoredAcknowledge(0xC0, TP_FRAME_FLAG_ACK | TP_FRAME_FLAG_ACK_BUSY);
+}
+
+// Im Busmonitor schiebt der Chip nichts dazwischen: ein fremdes Byte beendet das Warten auf die Bus-Quittung.
+static void test_monitor_stray_byte_ends_acknowledge_wait()
+{
+    fx->connect();
+    TEST_ASSERT_TRUE(fx->_dll.startMonitoring());
+    fx->pump(5);
+
+    std::vector<uint8_t> stream = standardFrame();
+    stream.push_back(0xFF);
+    stream.push_back(0xCC);
+    fx->feed(stream);
+    fx->pump((uint32_t)((stream.size() * 1354) / 1000) + 8);
+
+    TEST_ASSERT_EQUAL(1, fx->_frames.size());
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_ACK) == 0);
 }
 
 // Im Busmonitor ist der Chip transparent - ein U_Ackn.req von uns hätte dort nichts verloren.
@@ -1533,7 +1565,9 @@ static void test_send_extended_maximal_uses_offsets_sparingly()
 // bestätigen. Zwischen den Wiederholungen liegt jeweils mehr als die halbe Wachhund-Frist - damit ist die
 // Auffrischung durch das Echo mitgeprüft und nicht nur behauptet: ohne sie liefe die Frist während der
 // Wiederholungen ab und der Wachhund würde mitten in eine laufende Übertragung greifen.
-static void sendWithEcho(const std::vector<uint8_t> &frame, uint8_t echoCount, int confirmByte)
+// beforeConfirm: was der Chip zwischen das letzte Echo und das L_Data.con schiebt.
+static void sendWithEcho(const std::vector<uint8_t> &frame, uint8_t echoCount, int confirmByte,
+                         const std::vector<uint8_t> &beforeConfirm = std::vector<uint8_t>())
 {
         TEST_ASSERT_TRUE(fx->_dll.pushTransmitQueue(frame.data(), frame.size()));
 
@@ -1558,13 +1592,16 @@ static void sendWithEcho(const std::vector<uint8_t> &frame, uint8_t echoCount, i
             fx->append(frame, 1354, trailing);
     }
 
+    if (!beforeConfirm.empty()) fx->append(beforeConfirm);
+
     if (confirmByte >= 0)
     {
         uint8_t con = (uint8_t)confirmByte;
         fx->append(&con, 1);
     }
 
-    uint32_t scriptMs = (uint32_t)((frame.size() * echoCount * 1354) / 1000) + (echoCount - 1) * (REPEAT_GAP_US / 1000);
+    uint32_t scriptMs = (uint32_t)((frame.size() * echoCount * 1354) / 1000) + (echoCount - 1) * (REPEAT_GAP_US / 1000) +
+                        (uint32_t)((beforeConfirm.size() * 1354) / 1000);
     fx->pump(scriptMs + 60);
 }
 
@@ -1685,6 +1722,142 @@ static void test_echo_and_negative_confirmation_flags_nack()
     TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_ACK_BUSY) == 0);
 
     TEST_ASSERT_EQUAL(TxState::Idle, fx->_dll.getTransmitter().state());
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Steuersequenzen zwischen Echo und L_Data.con - sie beenden das Warten nicht
+// ---------------------------------------------------------------------------------------------------
+
+// Der gemeldete Fall: die Antwort auf die Zustandsabfrage kommt vor dem L_Data.con (OpenKNX/tpuart PR 2).
+static void test_state_indication_between_echo_and_confirmation()
+{
+    fx->connect();
+    sendWithEcho(standardFrame(), 1, 0x8B, {U_STATE_IND});
+
+    TEST_ASSERT_EQUAL(1, fx->_frames.size());
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_TX) != 0);
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_DATA_CON) != 0);
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_ACK) != 0);
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_ACK_NACK) == 0);
+
+    TEST_ASSERT_EQUAL(TxState::Idle, fx->_dll.getTransmitter().state());
+    TEST_ASSERT_EQUAL(0, fx->_errors.size());
+}
+
+// Der TPUART2 schickt U_State.ind auch ungefragt, etwa bei einem Sendefehler (Siemens TP-UART 2+ 3.2.3.1.12.3).
+static void test_unsolicited_state_indication_keeps_confirmation_on_tpuart2()
+{
+    fx->connect(BcuType::Tpuart2);
+    sendWithEcho(standardFrame(), 1, 0x0B, {(uint8_t)(U_STATE_IND | U_STATE_TRANSMIT_ERROR)});
+
+    TEST_ASSERT_EQUAL(1, fx->_frames.size());
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_DATA_CON) != 0);
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_ACK_NACK) != 0);
+    TEST_ASSERT_EQUAL(1, fx->_dll.getStatistics().getChipTransmitErrors());
+
+    TEST_ASSERT_EQUAL(TxState::Idle, fx->_dll.getTransmitter().state());
+}
+
+// Das Folgebyte ist Nutzlast, auch wenn es wie ein negatives L_Data.con aussieht - sonst trüge das Telegramm NACK.
+static void test_system_state_between_echo_and_confirmation()
+{
+    fx->connect(BcuType::Ncn5120);
+    sendWithEcho(standardFrame(), 1, 0x8B, {U_SYSTEM_STAT_IND, 0x0B});
+
+    TEST_ASSERT_EQUAL(1, fx->_frames.size());
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_DATA_CON) != 0);
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_ACK) != 0);
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_ACK_NACK) == 0);
+
+    TEST_ASSERT_TRUE(fx->_dll.getSystemState().isValid());
+    TEST_ASSERT_EQUAL_HEX8(0x0B, fx->_dll.getSystemState().raw());
+    TEST_ASSERT_EQUAL(TxState::Idle, fx->_dll.getTransmitter().state());
+}
+
+// Auf dem TPUART2 ist 0x4B kein Zwei-Byte-Dienst: das L_Data.con dahinter ist die Bestätigung, keine Nutzlast.
+static void test_system_state_code_is_one_byte_on_tpuart2()
+{
+    fx->connect(BcuType::Tpuart2);
+    sendWithEcho(standardFrame(), 1, 0x8B, {U_SYSTEM_STAT_IND});
+
+    TEST_ASSERT_EQUAL(1, fx->_frames.size());
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_DATA_CON) != 0);
+    TEST_ASSERT_EQUAL(TxState::Idle, fx->_dll.getTransmitter().state());
+}
+
+// U_Configure.ind wird dazwischen genauso durchgereicht und weiterhin ausgewertet.
+static void test_configure_indication_between_echo_and_confirmation()
+{
+    fx->connect(BcuType::Ncn5120);
+    TEST_ASSERT_FALSE(fx->_dll.isAutoAcknowledge());
+
+    sendWithEcho(standardFrame(), 1, 0x8B, {(uint8_t)(U_CONFIGURE_IND | U_CONFIGURE_AUTO_ACKNOWLEDGE)});
+
+    TEST_ASSERT_EQUAL(1, fx->_frames.size());
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_DATA_CON) != 0);
+    TEST_ASSERT_TRUE(fx->_dll.isAutoAcknowledge());
+}
+
+// Im 8-Bit-UART-Modus geht jedem L_Data.con ein U_FrameState.ind voraus (NCN5130 S. 42).
+static void test_frame_state_before_confirmation()
+{
+    fx->connect();
+    sendWithEcho(standardFrame(), 1, 0x8B, {U_FRAME_STATE_IND});
+
+    TEST_ASSERT_EQUAL(1, fx->_frames.size());
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_DATA_CON) != 0);
+    TEST_ASSERT_EQUAL(0, fx->_errors.size());
+}
+
+// 0x0E passt auf keinen Steuerdienst: es wird als Fehler gemeldet, das L_Data.con dahinter zählt trotzdem.
+static void test_unknown_byte_does_not_end_confirmation_wait()
+{
+    fx->connect();
+    sendWithEcho(standardFrame(), 1, 0x8B, {0x0E});
+
+    TEST_ASSERT_EQUAL(1, fx->_frames.size());
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_DATA_CON) != 0);
+    TEST_ASSERT_EQUAL(1, fx->_errors.size());
+    TEST_ASSERT_EQUAL(TxState::Idle, fx->_dll.getTransmitter().state());
+}
+
+// Nach einem Reset kommt kein L_Data.con mehr: ohne Bestätigung melden, restart() schickt das Telegramm neu.
+static void test_reset_indication_ends_confirmation_wait()
+{
+    fx->connect();
+    std::vector<uint8_t> frame = standardFrame();
+    sendWithEcho(frame, 1, U_RESET_IND);
+
+    TEST_ASSERT_EQUAL(1, fx->_frames.size());
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_TX) != 0);
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_DATA_CON) == 0);
+
+    TEST_ASSERT_NOT_EQUAL(TxState::Idle, fx->_dll.getTransmitter().state());
+
+    const std::vector<uint8_t> &written = fx->_interface.writtenBytes();
+    bool restarted = false;
+    for (size_t i = 0; i + 1 < written.size(); i++)
+        if (written[i] == U_L_DATA_START_REQ && written[i + 1] == frame[0]) restarted = true;
+
+    TEST_ASSERT_TRUE_MESSAGE(restarted, "Telegramm wurde nach dem Reset nicht neu gesendet");
+}
+
+// Bleibt das Folgebyte aus, läuft die Frist ab - und das nächste Telegramm wird nicht als Nutzlast verschluckt.
+static void test_truncated_system_state_in_confirmation_wait()
+{
+    fx->connect(BcuType::Ncn5120);
+    sendWithEcho(standardFrame(), 1, -1, {U_SYSTEM_STAT_IND});
+
+    TEST_ASSERT_EQUAL(1, fx->_frames.size());
+    TEST_ASSERT_TRUE((fx->_frames[0]._flags & TP_FRAME_FLAG_DATA_CON) == 0);
+    TEST_ASSERT_EQUAL(RxState::Idle, fx->_dll.getReceiver().state());
+    TEST_ASSERT_FALSE(fx->_dll.getSystemState().isValid());
+
+    fx->feedAndSettle(standardFrame(0x2202, 0x0901));
+
+    TEST_ASSERT_EQUAL(2, fx->_frames.size());
+    TEST_ASSERT_TRUE(fx->_frames[1]._valid);
+    TEST_ASSERT_TRUE((fx->_frames[1]._flags & TP_FRAME_FLAG_TX) == 0);
 }
 
 // DREI WIEDERHOLUNGEN, also vier Echos insgesamt, und dazwischen jeweils mehr als die halbe Frist. Der
@@ -2746,6 +2919,7 @@ static int runAllTests()
 
     RUN_TEST(test_unknown_control_byte_is_reported_as_error);
     RUN_TEST(test_system_state_is_a_two_byte_sequence);
+    RUN_TEST(test_truncated_system_state_does_not_swallow_next_frame);
 
     RUN_TEST(test_poll_control_byte_only_is_not_invalid);
     RUN_TEST(test_poll_full_cycle_completes_without_pause);
@@ -2765,6 +2939,7 @@ static int runAllTests()
     RUN_TEST(test_monitor_frame_with_acknowledge);
     RUN_TEST(test_monitor_frame_with_nack);
     RUN_TEST(test_monitor_frame_with_busy);
+    RUN_TEST(test_monitor_stray_byte_ends_acknowledge_wait);
     RUN_TEST(test_monitor_rejects_send_frame);
     RUN_TEST(test_monitor_drops_queued_telegram);
     RUN_TEST(test_monitor_aborts_running_transmission);
@@ -2788,6 +2963,15 @@ static int runAllTests()
     RUN_TEST(test_foreign_frame_is_acknowledged_while_awaiting_confirmation);
     RUN_TEST(test_echo_and_positive_confirmation);
     RUN_TEST(test_echo_and_negative_confirmation_flags_nack);
+    RUN_TEST(test_state_indication_between_echo_and_confirmation);
+    RUN_TEST(test_unsolicited_state_indication_keeps_confirmation_on_tpuart2);
+    RUN_TEST(test_system_state_between_echo_and_confirmation);
+    RUN_TEST(test_system_state_code_is_one_byte_on_tpuart2);
+    RUN_TEST(test_configure_indication_between_echo_and_confirmation);
+    RUN_TEST(test_frame_state_before_confirmation);
+    RUN_TEST(test_unknown_byte_does_not_end_confirmation_wait);
+    RUN_TEST(test_reset_indication_ends_confirmation_wait);
+    RUN_TEST(test_truncated_system_state_in_confirmation_wait);
     RUN_TEST(test_echo_repetitions_keep_watchdog_quiet);
     RUN_TEST(test_confirmation_without_echo_still_releases_path);
     RUN_TEST(test_confirmation_after_broken_echo_is_lost_without_pause);

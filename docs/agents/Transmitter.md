@@ -90,11 +90,26 @@ Teil von `AGENTS.md`.
   Quittungsbyte durchkommt.
   Die Reihenfolge zählt dort: `completeSequence()` muss *vor* der Freigabe von `_txState` laufen, weil
   `isOwnEcho()` den Sendeweg noch belegt braucht, um `TX` zu setzen.
-  Was in `FrameAck` außer der erwarteten Antwort eintrifft, wird **neu verarbeitet, nicht verworfen**:
-  bei Wiederholungen spiegelt der Chip das Telegramm erneut, das nächste Byte ist also meist der
-  Anfang dieses Wiederholungsechos. Das alte Verhalten (melden, dann Resync) warf das gesamte
-  Wiederholungsecho weg. Ein `U_FrameState.ind` wird geschluckt - im 8-Bit-UART-Modus geht es dem
-  `L_Data.con` voraus (NCN5130 S. 42).
+  **Das Warten in `FrameAck` endet nur auf vier Wegen**: durch die Bestätigung selbst, durch die Frist,
+  durch den Anfang eines neuen Telegramms (Standard, Extended, Poll) oder durch ein `U_Reset.ind`. Nach
+  den letzten beiden kommt zu diesem Echo kein `L_Data.con` mehr - das Telegramm wird ohne Bestätigung
+  gemeldet und das Byte **neu verarbeitet, nicht verworfen**: bei Wiederholungen spiegelt der Chip das
+  Telegramm erneut, das nächste Byte ist also meist der Anfang dieses Wiederholungsechos (das alte
+  Verhalten, melden und dann Resync, warf das gesamte Wiederholungsecho weg), und den Reset wertet
+  danach der Steuerdecoder aus.
+  **Alles andere ist eine Steuersequenz, die der Chip zwischen Echo und `L_Data.con` schiebt**, und das
+  Warten geht weiter. Sie läuft durch denselben Decoder wie in `Idle` (`processControlByte()`), der sie
+  direkt in den Ring stellt - `_buffer` hält ja noch das Echo. Zwei Ausnahmen: `U_FrameState.ind` wird
+  wie bisher verworfen (8-Bit-Modus, geht dem `L_Data.con` voraus), und im Busmonitor beendet jedes
+  Byte, das keine Quittung ist, das Warten - dort beantwortet der Chip nichts. Gemessen am RP2040 mit NCN5130:
+  die Antwort auf die sekündliche Zustandsabfrage kam ~480µs vor dem `L_Data.con` - `processCtrlQueue()`
+  sendet Steuercodes auch in `TxState::Await`. Der TPUART2 schickt `U_State.ind` außerdem ungefragt,
+  etwa bei einem Sendefehler mitten im eigenen Telegramm (Siemens TP-UART 2+ 3.2.3.1.12.3).
+  **Eine Sendesperre für Steuercodes während `Await` wurde deshalb verworfen**: gegen die ungefragten
+  Meldungen hilft sie nicht, der Empfänger muss die Sequenzen also ohnehin vertragen - und dann löst
+  die Sperre nichts mehr, koppelt aber Steuerqueue und Verbindungsüberwachung an den Sendezustand.
+  Auch ein unbekanntes Byte beendet das Warten nicht: es wird wie überall als Fehler gemeldet, und ein
+  danach eintreffendes `L_Data.con` gehört weiter zum Telegramm. Die Frist beginnt mit jedem Byte neu.
   **`TPUART_TX_CONFIRM_TIMEOUT_MS` (10s) ist ein Wachhund, keine Protokollfrist.** Kommt überhaupt
   keine Bestätigung, ist unbekannt, was im Sendepuffer des Chips liegt, und der einzige Weg in einen
   definierten Zustand ist ein Reset - also sendet er `U_Reset.req`. Das Wiederaufnehmen hängt

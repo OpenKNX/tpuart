@@ -1,5 +1,10 @@
 # Changes
 
+## Unreleased
+
+* Fix: A telegram of our own could be reported as unconfirmed although the BCU confirmed it. The answer to the once-per-second state request regularly lands between the echo and the `L_Data.con`, and the receiver took it as the end of the wait - the telegram went out without `DATA_CON`, so the stack saw a failed transmission. Now only the confirmation, the timeout, a new telegram or a `U_Reset.ind` end the wait; any other control byte in between is evaluated and the wait goes on. This also covers the unsolicited `U_State.ind` of the TPUART2. (@mpl1337)
+* Change: `RxState::Control` is gone, a pending second byte of `U_SystemStat.ind` is no longer a receiver state.
+
 ## 2.0: 2026-11-13
 
 Complete rewrite of the datalink layer. Telegrams are no longer found by searching the byte stream but
