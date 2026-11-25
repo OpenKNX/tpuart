@@ -157,7 +157,7 @@ Upload ganz normal über USB, auch mehrfach hintereinander. Die J-Link-Env ist d
 
 ### `library.json`
 
-Version **2.0.0**. `frameworks`/`platforms` sind gesetzt, damit der LDF keine fremden Plattformen
+Version **2.0.1**. `frameworks`/`platforms` sind gesetzt, damit der LDF keine fremden Plattformen
 versucht. Einen `srcFilter` braucht es nicht: `src/` enthält ausschließlich Library-Code.
 **Legst du eine Datei in `src/`, die nicht Teil der Library ist, brauchst du den Filter wieder.**
 Testcode braucht hier keinen Eintrag - er liegt in `test/`, was ein Verbraucher nie sieht.
